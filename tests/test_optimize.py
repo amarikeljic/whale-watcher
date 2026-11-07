@@ -12,6 +12,7 @@ from conftest import DAY, act, market
 from whalewatcher.ledger import Buy
 from whalewatcher.optimize import (
     GRID,
+    SPEC_REQUIREMENTS,
     Fold,
     FoldIndex,
     FoldWallet,
@@ -23,8 +24,8 @@ from whalewatcher.optimize import (
     permutation_p,
     score_from_sums,
     score_set,
-    spec_requirements,
 )
+from whalewatcher.config import ScoringConfig
 from whalewatcher.scoring import WalletMetrics, apply_filters
 from whalewatcher.timing import Stopwatch
 
@@ -39,15 +40,15 @@ def metrics(**kw) -> WalletMetrics:
     return WalletMetrics("w", AS_OF, **base)
 
 
-def test_the_spec_requirements_filter_exactly_like_scoring(app):
+def test_the_spec_requirements_filter_exactly_like_scoring():
     rng = random.Random(3)
-    spec = spec_requirements(app)
+    spec, scoring = SPEC_REQUIREMENTS, ScoringConfig()   # the dataclass defaults are the spec's values
     for _ in range(500):
         m = metrics(settled_markets=rng.choice([10, 49, 50, 80]), profitable_months=rng.randint(0, 6),
                     roi=rng.choice([None, -0.1, 0.05, 0.3]), max_single_market_share=rng.choice([None, 0.1, 0.3, 0.9]),
                     avg_stake_usd=rng.choice([None, 50, 100, 900]), days_since_last_trade=rng.choice([None, 2, 30, 45]),
                     two_sided_ratio=rng.choice([None, 0.1, 0.4, 0.7]))
-        assert passes_all(m, spec) == (apply_filters(m, app.cfg.scoring) == []), m
+        assert passes_all(m, spec) == (apply_filters(m, scoring) == []), m
 
 
 def b(ts, usd, price):

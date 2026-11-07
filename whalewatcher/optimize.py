@@ -84,12 +84,14 @@ LOOSEST = {"min_settled_markets": 10, "min_profitable_months": 0, "min_roi": Non
            "max_two_sided_ratio": None, "max_days_since_last_trade": 30}
 
 
-def spec_requirements(app: App) -> dict[str, Any]:
-    s = app.cfg.scoring
-    return {"min_settled_markets": s.min_settled_markets, "min_profitable_months": s.min_profitable_months,
-            "min_roi": s.min_roi, "max_single_market_share": s.max_single_market_share,
-            "min_avg_stake_usd": s.min_avg_stake_usd, "min_clv": None, "min_win_rate": None,
-            "max_two_sided_ratio": s.max_two_sided_ratio, "max_days_since_last_trade": s.max_days_since_last_trade}
+# The spec's original thresholds, fixed here rather than read from the config: the
+# shipped config.yaml uses the profile this search recommended, and the "spec"
+# comparison must keep meaning the spec. They equal ScoringConfig's defaults.
+SPEC_REQUIREMENTS: dict[str, Any] = {
+    "min_settled_markets": 50, "min_profitable_months": 4, "min_roi": 0.05, "max_single_market_share": 0.30,
+    "min_avg_stake_usd": 100.0, "min_clv": None, "min_win_rate": None, "max_two_sided_ratio": 0.40,
+    "max_days_since_last_trade": 30.0,
+}
 
 
 def passes(m: WalletMetrics, key: str, value: Any) -> bool:
@@ -598,7 +600,7 @@ async def run_optimize(app: App, cutoffs: list[int], *, holdout_months: int = 2,
                               clv_min_settled=clv_min_settled, say=say, watch=watch)
     if dataset_path:
         save_folds(folds, dataset_path)
-    return evaluate(folds, min_wallets=min_wallets, min_alerts=min_alerts, spec=spec_requirements(app),
+    return evaluate(folds, min_wallets=min_wallets, min_alerts=min_alerts, spec=dict(SPEC_REQUIREMENTS),
                     watch=watch, samples=min(app.cfg.stats.bootstrap_samples, 3000), objective=objective)
 
 

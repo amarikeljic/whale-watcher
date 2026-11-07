@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 import random
-from collections.abc import Sequence
+from collections import defaultdict
+from collections.abc import Hashable, Sequence
 
 
 def mean(values: Sequence[float]) -> float | None:
@@ -68,6 +69,58 @@ def cluster_bootstrap_mean_ci(groups: Sequence[Sequence[float]], *, samples: int
     lo = means[int(math.floor(alpha / 2 * samples))]
     hi = means[min(samples - 1, int(math.ceil((1 - alpha / 2) * samples)) - 1)]
     return m, lo, hi
+
+
+def two_way_bootstrap_mean_ci(values: Sequence[float], rows: Sequence[Hashable], cols: Sequence[Hashable], *,
+                              samples: int = 10_000, alpha: float = 0.05,
+                              seed: int = 12345) -> tuple[float | None, float | None, float | None]:
+    """CI for the pooled mean of values that each belong to a row cluster and a column cluster.
+
+    Paper trades share a wallet and an event: one wallet's repeated buys, or several
+    wallets on the same event, are not independent results. This resamples the rows
+    (wallets) and the columns (events) independently and weights each value by how often
+    its row times its column was drawn: Owen's pigeonhole bootstrap (Annals of Applied
+    Statistics 1(2), 2007), mildly conservative. With one wallet it reduces to resampling
+    events, and with one wallet and one event there is no interval: nothing independent
+    to compare.
+    """
+    n = len(values)
+    if n == 0:
+        return None, None, None
+    m = sum(values) / n
+    row_ids = {k: i for i, k in enumerate(dict.fromkeys(rows))}
+    col_ids = {k: i for i, k in enumerate(dict.fromkeys(cols))}
+    if n == 1 or (len(row_ids) < 2 and len(col_ids) < 2):
+        return m, None, None
+    sums: dict[tuple[int, int], list[float]] = defaultdict(lambda: [0.0, 0.0])
+    for v, r, c in zip(values, rows, cols, strict=True):
+        cell = sums[(row_ids[r], col_ids[c])]
+        cell[0] += v
+        cell[1] += 1
+    cells = [(r, c, total, count) for (r, c), (total, count) in sums.items()]
+    n_rows, n_cols = len(row_ids), len(col_ids)
+    rng = random.Random(seed)
+    means = []
+    for _ in range(samples):
+        wr = [0] * n_rows
+        for _ in range(n_rows):
+            wr[rng.randrange(n_rows)] += 1
+        wc = [0] * n_cols
+        for _ in range(n_cols):
+            wc[rng.randrange(n_cols)] += 1
+        total = count = 0.0
+        for r, c, cell_total, cell_count in cells:
+            w = wr[r] * wc[c]
+            if w:
+                total += w * cell_total
+                count += w * cell_count
+        if count:
+            means.append(total / count)
+    if len(means) < 2:
+        return m, None, None
+    means.sort()
+    k = len(means)
+    return m, means[int(math.floor(alpha / 2 * k))], means[min(k - 1, int(math.ceil((1 - alpha / 2) * k)) - 1)]
 
 
 def _ranks(values: Sequence[float]) -> list[float]:

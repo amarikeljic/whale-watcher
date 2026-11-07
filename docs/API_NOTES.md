@@ -73,6 +73,13 @@ The OpenAPI schema text says the opposite; the guide
 live API. The code sorts explicitly. 404 = no book (closed/resolved).
 Limit: `/book` 1,500/10s.
 
+`GET /prices-history?market=<token id>&startTs=..&endTs=..&fidelity=1` returns
+`{"history": [{"t": unix seconds, "p": price}]}` at the requested fidelity in
+minutes. Used only by `backtest` for the price a delayed copy would have paid.
+Minute points were still served for markets five months old (checked
+2026-11-07), where the Data API's `/v2/prices-history` had thinned out.
+Limit: `/prices-history` 1,000/10s.
+
 ### Fees
 
 https://docs.polymarket.com/trading/fees.md and

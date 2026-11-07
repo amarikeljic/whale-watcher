@@ -4,16 +4,21 @@
 database_path: data/whalewatcher.sqlite3
 
 scoring:
+  # The requirements below come from `python -m whalewatcher optimize` (see README,
+  # "Which wallets to track"): the concentration rule was the only one positive in
+  # all three test periods and beat random wallet sets out of sample. The spec's
+  # original values are kept on the right, and in whalewatcher/optimize.py
+  # (SPEC_REQUIREMENTS) for the backtest's comparison.
   lookback_months: 6
-  min_settled_markets: 50
-  min_profitable_months: 4        # out of the calendar months in the lookback window
-  max_single_market_share: 0.30   # largest market's P&L / total P&L
-  min_avg_stake_usd: 100
+  min_settled_markets: 10         # spec: 50
+  min_profitable_months: 0        # spec: 4 (out of the calendar months in the lookback window)
+  max_single_market_share: 0.20   # spec: 0.30 (largest market's P&L / total P&L)
+  min_avg_stake_usd: 0            # spec: 100
   max_days_since_last_trade: 30
-  max_two_sided_ratio: 0.40
-  min_roi: 0.05
+  max_two_sided_ratio: 1.0        # spec: 0.40 (1.0 = off)
+  min_roi: -1.0                   # spec: 0.05 (-1.0 = off)
   top_k: 20                       # wallets to actively monitor
-  rank_by: clv                    # clv | clv_markout | roi | total_pnl
+  rank_by: roi                    # spec: clv. clv | clv_markout | roi | total_pnl
   # Additions not in the original spec (see README "Deviations"):
   entry_lookback_days: 180        # look this far before the window for entries in markets that settle inside it
   max_activity_rows: 20000        # busier wallets are bots/market makers; skipped before the full fetch

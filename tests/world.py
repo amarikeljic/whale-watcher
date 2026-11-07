@@ -59,6 +59,8 @@ class World:
         self.books: dict[str, dict[str, Any]] = {}
         self.leaderboard: list[dict[str, Any]] = []
         self.global_trades: list[dict[str, Any]] = []
+        # CLOB minute history: (token, startTs, endTs) -> [(t, p), ...]
+        self.clob_history: Callable[[str, int, int], list[tuple[int, float]]] = lambda token, s, e: [(s + 30, 0.5)]
         http.route("/v2/activity", self._activity)
         http.route("/markets", self._gamma_markets)
         http.route("/v2/resolutions", self._resolutions)
@@ -68,6 +70,11 @@ class World:
         http.route("/book", self._book)
         http.route("/v2/status", {"data": {"age_seconds": 3, "serving": {"lag_seconds": 2}}})
         http.route("/v2/positions", self._positions)
+        http.route("/prices-history", self._clob_prices)
+
+    def _clob_prices(self, params: dict[str, Any]) -> dict[str, Any]:
+        token, start, end = params["market"], int(params["startTs"]), int(params["endTs"])
+        return {"history": [{"t": t, "p": p} for t, p in self.clob_history(token, start, end)]}
 
     def _positions(self, params: dict[str, Any]) -> dict[str, Any]:
         user = params["user"]

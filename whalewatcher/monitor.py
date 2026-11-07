@@ -182,7 +182,8 @@ class Monitor:
         window = self.cfg.dedupe_window_seconds
         return self.app.db.one(
             "SELECT * FROM alerts WHERE wallet = ? AND token_id = ? AND ABS(first_fill_ts - ?) <= ? "
-            "ORDER BY first_fill_ts DESC LIMIT 1", (fill.wallet, fill.token_id, fill.ts, window))
+            "AND status != 'BACKTEST' ORDER BY first_fill_ts DESC LIMIT 1",
+            (fill.wallet, fill.token_id, fill.ts, window))
 
     async def _handle_buy(self, fill: Activity, counter: int, lag: int | None) -> str:
         app = self.app

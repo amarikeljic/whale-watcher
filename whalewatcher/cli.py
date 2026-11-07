@@ -216,23 +216,18 @@ async def _validate(args, cfg) -> int:
 
 async def _optimize(args, cfg) -> int:
     from .optimize import run_optimize
-    from .timeutil import add_months
     if args.max_candidates:
         cfg.candidates.max_candidates = args.max_candidates
-    if args.cutoffs:
-        cutoffs = [parse_as_of(c.strip()) for c in args.cutoffs.split(",") if c.strip()]
-    else:
-        end = start_of_day(now_ts())
-        cutoffs = [add_months(end, -args.holdout_months * k) for k in range(args.folds, 0, -1)]
+    cutoffs = _cutoffs(args)
     if len(cutoffs) < 2:
         print("error: need at least two cutoffs (one to choose on, one to test on)", file=sys.stderr)
         return 2
     if args.from_dataset:
-        from .optimize import evaluate, load_folds, spec_requirements
+        from .optimize import SPEC_REQUIREMENTS, evaluate, load_folds
         from .timing import Stopwatch
         async with open_app(cfg) as app:
             rep = evaluate(load_folds(args.from_dataset), min_wallets=args.min_wallets, min_alerts=args.min_alerts,
-                           spec=spec_requirements(app), watch=Stopwatch(None), objective=args.objective)
+                           spec=dict(SPEC_REQUIREMENTS), watch=Stopwatch(None), objective=args.objective)
         print_optimize(rep, holdout_months=args.holdout_months)
         return 0
     async with open_app(cfg) as app:
@@ -243,6 +238,49 @@ async def _optimize(args, cfg) -> int:
         print_optimize(rep, holdout_months=args.holdout_months)
         if args.dataset:
             print(f"\nPer-wallet dataset written to {args.dataset} (re-run the search on it with --from-dataset)")
+    return 0
+
+
+def _cutoffs(args) -> list[int]:
+    from .timeutil import add_months
+    if args.cutoffs:
+        return sorted(parse_as_of(c.strip()) for c in args.cutoffs.split(",") if c.strip())
+    end = start_of_day(now_ts())
+    return [add_months(end, -args.holdout_months * k) for k in range(args.folds, 0, -1)]
+
+
+async def _backtest(args, cfg) -> int:
+    from .backtest import describe, run_backtest
+    from .optimize import build_folds, load_folds, save_folds
+    from .stats import render
+    from .timing import Stopwatch
+    if args.max_candidates:
+        cfg.candidates.max_candidates = args.max_candidates
+
+    def say(m: str) -> None:
+        print(f"  .. {m}", file=sys.stderr)
+
+    async with open_app(cfg) as app:
+        watch = Stopwatch(app.http)
+        if args.from_dataset:
+            folds = load_folds(args.from_dataset)
+        else:
+            cutoffs = _cutoffs(args)
+            if len(cutoffs) < 2:
+                print("error: need at least two periods (the walk-forward rule is chosen on earlier ones)",
+                      file=sys.stderr)
+                return 2
+            folds = await build_folds(app, cutoffs, holdout_months=args.holdout_months, clv_sample=args.clv_sample,
+                                      clv_min_settled=20, say=say, watch=watch)
+            if args.dataset:
+                save_folds(folds, args.dataset)
+                say(f"per-wallet dataset written to {args.dataset} (reuse it with --from-dataset)")
+        report = await run_backtest(app, folds, delay=args.delay, ask_premium=args.ask_premium,
+                                    min_wallets=args.min_wallets, min_alerts=args.min_alerts,
+                                    objective=args.objective, progress=say, watch=watch)
+        print(describe(report))
+        print("\nWhere the time went:\n" + watch.table())
+        print("\n" + render(app, with_breakdowns=args.breakdowns))
     return 0
 
 
@@ -286,6 +324,22 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--objective", choices=("pooled", "worst"), default="pooled",
                    help="pooled: best lower bound over all folds together; worst: best lower bound in the worst fold")
 
+    bt = sub.add_parser("backtest", help="replay past periods as simulated paper trades (shown by `stats`)")
+    bt.add_argument("--cutoffs", help="comma-separated YYYY-MM-DD period starts (default: --folds back-to-back "
+                                      "periods ending today)")
+    bt.add_argument("--folds", type=int, default=3)
+    bt.add_argument("--holdout-months", type=int, default=2, help="length of each period")
+    bt.add_argument("--max-candidates", type=int)
+    bt.add_argument("--clv-sample", type=int, default=50, help="positions per wallet for CLV (0 = all)")
+    bt.add_argument("--dataset", default="exports/optimize-folds.json", help="where to write the per-wallet data")
+    bt.add_argument("--from-dataset", help="use a dataset written by optimize or backtest instead of rebuilding it")
+    bt.add_argument("--delay", type=int, default=90, help="seconds from the triggering fill to the copy's fill")
+    bt.add_argument("--ask-premium", type=float, default=0.01, help="added to the minute price for the spread")
+    bt.add_argument("--min-wallets", type=int, default=10)
+    bt.add_argument("--min-alerts", type=int, default=50)
+    bt.add_argument("--objective", choices=("pooled", "worst"), default="pooled")
+    bt.add_argument("--breakdowns", action="store_true", help="also print the per-month/category/wallet tables")
+
     for name, helptext in (("monitor", "run the live alert + paper trading loop"),
                            ("settle", "settle open paper trades once"),
                            ("stats", "print paper-trading statistics"),
@@ -324,5 +378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_validate(args, cfg))
     if args.command == "optimize":
         return asyncio.run(_optimize(args, cfg))
+    if args.command == "backtest":
+        return asyncio.run(_backtest(args, cfg))
     from . import service  # the live loop and stats, imported lazily
     return asyncio.run(service.run_command(args, cfg))

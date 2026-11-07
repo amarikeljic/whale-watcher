@@ -26,6 +26,7 @@ then polls every 60 seconds. Data lives in `./data/whalewatcher.sqlite3`.
 python -m whalewatcher score --as-of 2026-11-01      # Phase 1 table + stored snapshot
 python -m whalewatcher validate --as-of 2026-11-01   # select before the cutoff, measure after it
 python -m whalewatcher optimize                      # walk-forward search for the requirements worth tracking
+python -m whalewatcher backtest                      # simulated paper trades for the past 6 months, shown by `stats`
 python -m whalewatcher monitor [--no-post] [--cycles N]
 python -m whalewatcher settle
 python -m whalewatcher stats [--post]
