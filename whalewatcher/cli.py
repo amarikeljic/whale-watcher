@@ -31,9 +31,9 @@ def _f(value: float | None, spec: str, dash: str = "-") -> str:
 
 def table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
     widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(headers)]
-    line = "  ".join(h.rjust(w) for h, w in zip(headers, widths))
+    line = "  ".join(h.rjust(w) for h, w in zip(headers, widths, strict=True))
     out = [line, "  ".join("-" * w for w in widths)]
-    out += ["  ".join(c.rjust(w) for c, w in zip(r, widths)) for r in rows]
+    out += ["  ".join(c.rjust(w) for c, w in zip(r, widths, strict=True)) for r in rows]
     return "\n".join(out)
 
 
@@ -92,7 +92,7 @@ def print_validation(rep: ValidationReport) -> None:
                      _f(g.holdout_roi, "+.1%"), _f(g.mean_position_roi, "+.1%"), ci, _f(g.median_wallet_roi, "+.1%"),
                      _f(g.share_wallets_positive, ".0%"), _f(g.holdout_clv, "+.3f"), _f(g.holdout_markout, "+.3f")])
     print(table(headers, rows))
-    print(f"\n  Does the selection metric predict the holdout? Over wallets with >= 5 holdout positions:")
+    print("\n  Does the selection metric predict the holdout? Over wallets with >= 5 holdout positions:")
     print(f"    Spearman(selection {rep.rank_by}, holdout ROI) = {_f(rep.spearman_rank_metric, '+.2f')}"
           f"  (n={rep.rank_metric_n} wallets)")
     print(f"    Spearman(selection ROI, holdout ROI) = {_f(rep.spearman_selection_roi, '+.2f')}"

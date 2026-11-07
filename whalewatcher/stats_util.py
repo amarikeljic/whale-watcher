@@ -90,7 +90,7 @@ def spearman(xs: Sequence[float], ys: Sequence[float]) -> float | None:
         return None
     rx, ry = _ranks(xs), _ranks(ys)
     mx, my = sum(rx) / len(rx), sum(ry) / len(ry)
-    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry, strict=True))
     vx = sum((a - mx) ** 2 for a in rx)
     vy = sum((b - my) ** 2 for b in ry)
     if vx == 0 or vy == 0:
