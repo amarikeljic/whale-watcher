@@ -25,6 +25,7 @@ then polls every 60 seconds. Data lives in `./data/whalewatcher.sqlite3`.
 ```bash
 python -m whalewatcher score --as-of 2026-11-01      # Phase 1 table + stored snapshot
 python -m whalewatcher validate --as-of 2026-11-01   # select before the cutoff, measure after it
+python -m whalewatcher optimize                      # walk-forward search for the requirements worth tracking
 python -m whalewatcher monitor [--no-post] [--cycles N]
 python -m whalewatcher settle
 python -m whalewatcher stats [--post]
@@ -166,6 +167,64 @@ Each is one sample, not a conclusion.
   18% of paper trades were missed on slippage. Between the alert-time ask and
   the fill a minute later, the median move was 0. The 90th percentile was 7
   cents against the copier. 97% of alerts were live sports.
+
+## Which wallets to track: the requirement search (2026-11-07)
+
+`optimize` tried 216,000 combinations of the scoring requirements (plus win
+rate and CLV floors), walk-forward. The data came from three back-to-back
+two-month holdouts ending 2026-11-07, each with a 400-wallet leak-free pool.
+The outcome is what copying would have earned: every alert-worthy buy group,
+bought at the whale's price plus the taker fee and held to resolution. A
+requirement set is chosen on earlier periods and judged on the next one.
+
+ROI per copied alert, per holdout. Only the "chosen on earlier periods" rows of
+`optimize`'s output are honest tests; this table also shows rules on the
+periods they were chosen from.
+
+| Rule | May-Jul | Jul-Sep | Sep-Nov |
+|---|---|---|---|
+| Every eligible wallet | -0.4% (213 wallets) | -7.3% (202) | -3.5% (117) |
+| Spec thresholds | +4.6% (6) | -1.0% (1) | +5.9% (9) |
+| **Max single-market share <= 0.2** | **+5.9% (22)** | **+6.1% (15)** | **+6.5% (14)** |
+| 5+ profitable months and win rate >= 60% | +13.5% (23) | -2.6% (20) | +9.0% (12) |
+| Win rate >= 60% | +7.1% (93) | -3.1% (67) | -0.6% (48) |
+| Past ROI >= 5% | +0.6% (44) | -7.6% (71) | +4.9% (24) |
+| CLV >= 0.02 | +2.8% (30) | -9.5% (23) | +0.3% (10) |
+
+Honest tests, where the rule was chosen without seeing the test period:
+
+* Choose on May-Jul, test Jul-Sep: "5+ profitable months and win rate >= 60%"
+  gives -2.6%, 95% CI [-15.3%, +9.4%]. Random wallet sets did as well 14% of
+  the time.
+* Choose on May-Sep, test Sep-Nov: "max single-market share <= 0.2" gives
+  +6.5%, 95% CI [-3.9%, +16.0%]. Random wallet sets did as well 0.9% of the
+  time.
+
+What this supports:
+
+* Copying every large trader loses money, in all three periods.
+* Filtering on concentration ranks wallets better than chance.
+* No rule has yet shown, out of sample, that copying makes money: every
+  interval includes zero.
+* The automatic final pick flips with the objective (`--objective pooled`
+  or `worst`). That is what a weak signal looks like.
+
+The profile below is a judgment call, not a proven optimum. It is the only rule
+positive in all three periods, it passed its one honest test, and it keeps
+roughly 15-20 wallets to watch:
+
+```yaml
+scoring:
+  min_settled_markets: 10
+  min_profitable_months: 0
+  max_single_market_share: 0.20   # no market supplies more than 20% of the profit
+  min_avg_stake_usd: 0
+  max_days_since_last_trade: 30
+  max_two_sided_ratio: 1.0        # off
+  min_roi: -1.0                   # off
+  rank_by: roi
+  top_k: 20
+```
 
 ## Known limits
 

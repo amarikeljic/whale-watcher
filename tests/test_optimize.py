@@ -168,3 +168,32 @@ def test_an_empty_fold_is_reported_not_judged():
                    min_alerts=50, spec=LOOSE, watch=Stopwatch(None), samples=200)
     assert rep.verdict.startswith("Inconclusive"), rep.verdict
     assert any("has 0 wallets with alerts" in note for note in rep.skipped)
+
+
+def regime_fold(cutoff: int, rng: random.Random, b_edge: float) -> Fold:
+    """Low-concentration wallets earn +5% in every period; high win-rate wallets earn
+    ``b_edge``, which flips sign in one period."""
+    fold = Fold(cutoff, cutoff + 60 * DAY, 300, 0)
+    for i in range(300):
+        share = rng.uniform(0.05, 1.2)
+        # The two effects live in different wallets: low-concentration wallets never
+        # have the high win rate, so the steady rule is not contaminated by the other.
+        win = rng.uniform(0.3, 0.59) if share <= 0.2 else rng.uniform(0.3, 0.8)
+        m = WalletMetrics(f"0x{i:03d}", cutoff, settled_markets=60, total_pnl=100, total_cost=1000, roi=0.1,
+                          profitable_months=4, months_in_window=6, max_single_market_share=share,
+                          avg_stake_usd=500, days_since_last_trade=2, two_sided_ratio=0.1, win_rate=win)
+        edge = (0.05 if share <= 0.2 else -0.05) + (b_edge if win >= 0.6 else 0.0)
+        fold.wallets.append(FoldWallet(m.wallet, m, [edge + rng.gauss(0, 0.2) for _ in range(10)]))
+    return fold
+
+
+def test_the_worst_period_objective_prefers_the_rule_that_never_loses():
+    rng = random.Random(9)
+    folds = [regime_fold(AS_OF + k * 60 * DAY, rng, b) for k, b in enumerate((0.40, -0.30, 0.40))]
+    pooled = evaluate(folds, min_wallets=10, min_alerts=50, spec=LOOSE, watch=Stopwatch(None), samples=200,
+                      objective="pooled")
+    worst = evaluate(folds, min_wallets=10, min_alerts=50, spec=LOOSE, watch=Stopwatch(None), samples=200,
+                     objective="worst")
+    assert pooled.final.req["min_win_rate"] == 0.6, "pooled chases the high average"
+    assert worst.final.req["min_win_rate"] is None and worst.final.req["max_single_market_share"] == 0.2
+    assert min(s.mean for s in worst.final_per_fold) > 0

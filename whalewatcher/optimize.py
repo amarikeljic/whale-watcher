@@ -375,9 +375,27 @@ class Candidate:
     def complexity(self) -> int:
         return sum(1 for k, v in self.req.items() if v != LOOSEST[k])
 
+    def objective(self, kind: str) -> float | None:
+        """``pooled``: lower 95% bound of the mean over all training folds together.
+        ``worst``: the lowest per-fold lower bound, so a set that loses in any one
+        period ranks low however well it did elsewhere."""
+        if kind == "pooled":
+            return self.train.lcb
+        bounds = [f.lcb for f in self.per_fold]
+        return None if any(b is None for b in bounds) else min(bounds)
+
+    def objective_se(self, kind: str) -> float | None:
+        if kind == "pooled":
+            return self.train.se
+        worst = min(self.per_fold, key=lambda f: f.lcb if f.lcb is not None else -9e9)
+        return worst.se
+
+
+OBJECTIVES = ("pooled", "worst")
+
 
 def search(train: list[FoldIndex], *, min_wallets: int, min_alerts: int,
-           test: FoldIndex | None = None) -> list[Candidate]:
+           test: FoldIndex | None = None, objective: str = "pooled") -> list[Candidate]:
     """Every requirement set feasible on all training folds, best first."""
     out: list[Candidate] = []
 
@@ -403,12 +421,16 @@ def search(train: list[FoldIndex], *, min_wallets: int, min_alerts: int,
         del chosen[key]
 
     rec(0, [idx.all for idx in train], None if test is None else test.all, {})
-    out.sort(key=lambda c: (c.train.lcb if c.train.lcb is not None else -9e9, -c.complexity, c.train.alerts),
-             reverse=True)
+
+    def rank(c: Candidate) -> tuple:
+        value = c.objective(objective)
+        return (value if value is not None else -9e9, -c.complexity, c.train.alerts)
+
+    out.sort(key=rank, reverse=True)
     return out
 
 
-def choose(found: list[Candidate]) -> Candidate:
+def choose(found: list[Candidate], objective: str = "pooled") -> Candidate:
     """The one-standard-error rule: of the sets scoring within one standard error of
     the best, the simplest (fewest requirements tighter than the loosest value).
 
@@ -417,11 +439,12 @@ def choose(found: list[Candidate]) -> Candidate:
     good carries forward far better.
     """
     best = found[0]
-    if best.train.lcb is None or best.train.se is None:
+    value, se = best.objective(objective), best.objective_se(objective)
+    if value is None or se is None:
         return best
-    floor = best.train.lcb - best.train.se
-    near = [c for c in found if c.train.lcb is not None and c.train.lcb >= floor]
-    return min(near, key=lambda c: (c.complexity, -c.train.lcb, -c.train.alerts))
+    floor = value - se
+    near = [c for c in found if (c.objective(objective) or -9e9) >= floor]
+    return min(near, key=lambda c: (c.complexity, -(c.objective(objective) or -9e9), -c.train.alerts))
 
 
 def permutation_p(index: FoldIndex, chosen: frozenset[int], *, draws: int = 2000, seed: int = 7) -> float | None:
@@ -475,6 +498,7 @@ class OptimizeReport:
     watch: Stopwatch
     verdict: str = ""
     skipped: list[str] = field(default_factory=list)
+    objective: str = "pooled"
 
 
 def _ci(index: FoldIndex, chosen: frozenset[int], samples: int) -> tuple[float | None, float | None]:
@@ -483,7 +507,7 @@ def _ci(index: FoldIndex, chosen: frozenset[int], samples: int) -> tuple[float |
 
 
 def evaluate(folds: list[Fold], *, min_wallets: int, min_alerts: int, spec: dict[str, Any],
-             watch: Stopwatch, samples: int = 3000) -> OptimizeReport:
+             watch: Stopwatch, samples: int = 3000, objective: str = "pooled") -> OptimizeReport:
     indexes = [FoldIndex(f) for f in folds]
     configs = math.prod(len(v) for v in GRID.values())
     steps: list[Step] = []
@@ -496,12 +520,12 @@ def evaluate(folds: list[Fold], *, min_wallets: int, min_alerts: int, spec: dict
     for k in range(1, len(indexes)):
         train, test = indexes[:k], indexes[k]
         with watch.stage(f"search: train {k} fold(s), test {iso(folds[k].cutoff)[:10]}"):
-            found = search(train, min_wallets=min_wallets, min_alerts=min_alerts, test=test)
+            found = search(train, min_wallets=min_wallets, min_alerts=min_alerts, test=test, objective=objective)
         if not found:
             skipped.append(f"test on {iso(folds[k].cutoff)[:10]} skipped: {thin(train)} "
                            f"(need {min_wallets} wallets and {min_alerts} alerts per training fold)")
             continue
-        chosen = choose(found)
+        chosen = choose(found, objective)
         chosen_set = test.select(chosen.req)
         spec_set = test.select(spec)
         baseline = test.all
@@ -514,21 +538,22 @@ def evaluate(folds: list[Fold], *, min_wallets: int, min_alerts: int, spec: dict
         ]
         both = [c for c in found if c.test is not None and c.test.mean is not None
                 and c.test.wallets >= min_wallets and c.test.alerts >= min_alerts]
-        transfer = spearman([c.train.lcb for c in both], [c.test.mean for c in both]) if len(both) >= 3 else None
+        transfer = (spearman([c.objective(objective) or -9e9 for c in both], [c.test.mean for c in both])
+                    if len(both) >= 3 else None)
         oracle = max(both, key=lambda c: c.test.lcb if c.test.lcb is not None else -9e9) if both else None
         steps.append(Step([f.cutoff for f in folds[:k]], folds[k].cutoff, chosen, len(found), results,
                           transfer, oracle))
 
     with watch.stage("search: all folds (the recommendation)"):
-        found_all = search(indexes, min_wallets=min_wallets, min_alerts=min_alerts)
-    final = choose(found_all) if found_all else None
+        found_all = search(indexes, min_wallets=min_wallets, min_alerts=min_alerts, objective=objective)
+    final = choose(found_all, objective) if found_all else None
     final_per_fold = [score_set(idx, idx.select(final.req)) for idx in indexes] if final else []
     if final is None:
         skipped.append(f"no recommendation: {thin(indexes)}")
     report = OptimizeReport(
         folds, steps, final, final_per_fold,
         [score_set(idx, idx.select(spec)) for idx in indexes],
-        [score_set(idx, idx.all) for idx in indexes], configs, watch, skipped=skipped)
+        [score_set(idx, idx.all) for idx in indexes], configs, watch, skipped=skipped, objective=objective)
     report.verdict = verdict(report)
     return report
 
@@ -565,7 +590,7 @@ def save_folds(folds: list[Fold], path: str) -> None:
 
 async def run_optimize(app: App, cutoffs: list[int], *, holdout_months: int = 2, clv_sample: int = 50,
                        clv_min_settled: int = 20, min_wallets: int = 10, min_alerts: int = 50,
-                       dataset_path: str | None = None,
+                       dataset_path: str | None = None, objective: str = "pooled",
                        progress: Callable[[str], None] | None = None) -> OptimizeReport:
     say = progress or (lambda _m: None)
     watch = Stopwatch(app.http)
@@ -574,4 +599,16 @@ async def run_optimize(app: App, cutoffs: list[int], *, holdout_months: int = 2,
     if dataset_path:
         save_folds(folds, dataset_path)
     return evaluate(folds, min_wallets=min_wallets, min_alerts=min_alerts, spec=spec_requirements(app),
-                    watch=watch, samples=min(app.cfg.stats.bootstrap_samples, 3000))
+                    watch=watch, samples=min(app.cfg.stats.bootstrap_samples, 3000), objective=objective)
+
+
+def load_folds(path: str) -> list[Fold]:
+    """Read a dataset written by save_folds, to re-run the search without fetching."""
+    from .timeutil import parse_time
+    folds = []
+    for f in json.loads(Path(path).read_text()):
+        fold = Fold(parse_time(f["cutoff"]), parse_time(f["end"]), f["candidates"], f["too_active"])
+        for w in f["wallets"]:
+            fold.wallets.append(FoldWallet(w["wallet"], WalletMetrics(**w["metrics"]), w["alert_rois"]))
+        folds.append(fold)
+    return folds

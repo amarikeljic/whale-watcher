@@ -129,7 +129,7 @@ def _score_cells(sc) -> list[str]:
 def print_optimize(rep, *, holdout_months: int) -> None:
     from .optimize import GRID
     print(f"\nWalk-forward search for wallet requirements: {len(rep.folds)} folds, {holdout_months}-month holdouts, "
-          f"{rep.configs_tried:,} requirement sets per search.")
+          f"{rep.configs_tried:,} requirement sets per search, objective '{rep.objective}'.")
     print("Outcome: ROI per copied alert (buy group >= min_whale_trade_usd inside the price band, at the whale's "
           "VWAP plus taker fee, held to resolution).")
     print("\nFolds (each with a pool built only from trades before its cutoff):")
@@ -227,14 +227,22 @@ async def _optimize(args, cfg) -> int:
     if len(cutoffs) < 2:
         print("error: need at least two cutoffs (one to choose on, one to test on)", file=sys.stderr)
         return 2
+    if args.from_dataset:
+        from .optimize import evaluate, load_folds, spec_requirements
+        from .timing import Stopwatch
+        async with open_app(cfg) as app:
+            rep = evaluate(load_folds(args.from_dataset), min_wallets=args.min_wallets, min_alerts=args.min_alerts,
+                           spec=spec_requirements(app), watch=Stopwatch(None), objective=args.objective)
+        print_optimize(rep, holdout_months=args.holdout_months)
+        return 0
     async with open_app(cfg) as app:
         rep = await run_optimize(app, cutoffs, holdout_months=args.holdout_months, clv_sample=args.clv_sample,
                                  min_wallets=args.min_wallets, min_alerts=args.min_alerts,
-                                 dataset_path=args.dataset,
+                                 dataset_path=args.dataset, objective=args.objective,
                                  progress=lambda m: print(f"  .. {m}", file=sys.stderr))
         print_optimize(rep, holdout_months=args.holdout_months)
         if args.dataset:
-            print(f"\nPer-wallet dataset written to {args.dataset}")
+            print(f"\nPer-wallet dataset written to {args.dataset} (re-run the search on it with --from-dataset)")
     return 0
 
 
@@ -274,6 +282,9 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--min-wallets", type=int, default=10, help="wallets with alerts a set must keep in each fold")
     o.add_argument("--min-alerts", type=int, default=50, help="alerts a set must keep in each fold")
     o.add_argument("--dataset", default="exports/optimize-folds.json", help="where to write the per-wallet data")
+    o.add_argument("--from-dataset", help="re-run the search on a saved dataset, without fetching anything")
+    o.add_argument("--objective", choices=("pooled", "worst"), default="pooled",
+                   help="pooled: best lower bound over all folds together; worst: best lower bound in the worst fold")
 
     for name, helptext in (("monitor", "run the live alert + paper trading loop"),
                            ("settle", "settle open paper trades once"),
