@@ -200,6 +200,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except config_mod.ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+    if getattr(args, "as_of", None):
+        try:
+            parse_as_of(args.as_of)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     if args.command == "score":
         return asyncio.run(_score(args, cfg))
     if args.command == "validate":
