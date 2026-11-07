@@ -116,6 +116,64 @@ def print_validation(rep: ValidationReport) -> None:
         print(rep.watch.table())
 
 
+def _req_text(req: dict) -> str:
+    from .optimize import LOOSEST
+    parts = [f"{k}={'off' if v is None else v}" for k, v in req.items() if v != LOOSEST[k]]
+    return ", ".join(parts) if parts else "no requirements beyond the eligibility rules"
+
+
+def _score_cells(sc) -> list[str]:
+    return [str(sc.wallets), str(sc.alerts), _f(sc.mean, "+.1%")]
+
+
+def print_optimize(rep, *, holdout_months: int) -> None:
+    from .optimize import GRID
+    print(f"\nWalk-forward search for wallet requirements: {len(rep.folds)} folds, {holdout_months}-month holdouts, "
+          f"{rep.configs_tried:,} requirement sets per search.")
+    print("Outcome: ROI per copied alert (buy group >= min_whale_trade_usd inside the price band, at the whale's "
+          "VWAP plus taker fee, held to resolution).")
+    print("\nFolds (each with a pool built only from trades before its cutoff):")
+    rows = []
+    for f, base in zip(rep.folds, rep.baseline_per_fold, strict=True):
+        with_alerts = sum(1 for w in f.wallets if w.rois)
+        rows.append([iso(f.cutoff)[:10], iso(f.end)[:10], str(f.candidates), str(f.too_active), str(len(f.wallets)),
+                     str(with_alerts), str(base.alerts), _f(base.mean, "+.1%")])
+    print(table(("cutoff", "holdout to", "candidates", "too active", "measured", "w/ alerts", "alerts",
+                 "ROI/alert (all)"), rows))
+    for i, st in enumerate(rep.steps, start=1):
+        train = ", ".join(iso(c)[:10] for c in st.train_cutoffs)
+        print(f"\nStep {i}: choose on {train}, test on {iso(st.test_cutoff)[:10]} "
+              f"({st.feasible:,} requirement sets feasible in training)")
+        print(f"  chosen: {_req_text(st.chosen.req)}")
+        tr = st.chosen.train
+        print(f"  in training: {tr.wallets} wallets, {tr.alerts} alerts, mean {_f(tr.mean, '+.1%')} "
+              f"(lower 95% bound {_f(tr.lcb, '+.1%')})")
+        out = []
+        for r in st.results:
+            ci = "-" if r.ci[0] is None else f"[{r.ci[0]:+.1%}, {r.ci[1]:+.1%}]"
+            out.append([r.name, *_score_cells(r.score), ci, _f(r.p_random, ".3f")])
+        print(table(("on the unseen fold", "wallets", "alerts", "ROI/alert", "95% CI", "p vs random"), out))
+        print(f"  transfer: Spearman(training lower bound, test ROI) across requirement sets = "
+              f"{_f(st.transfer, '+.2f')}")
+        if st.oracle is not None and st.oracle.test is not None:
+            print(f"  hindsight: the best set chosen ON the test fold shows {_f(st.oracle.test.mean, '+.1%')} "
+                  f"({st.oracle.test.wallets} wallets) - what an in-sample search would have claimed")
+    if rep.final is not None:
+        print(f"\nRecommendation (chosen on all folds): {_req_text(rep.final.req)}")
+        print(f"  all folds pooled: {rep.final.train.wallets} wallet-folds, {rep.final.train.alerts} alerts, "
+              f"mean {_f(rep.final.train.mean, '+.1%')} (lower 95% bound {_f(rep.final.train.lcb, '+.1%')})")
+        rows = [[iso(f.cutoff)[:10], *_score_cells(a), *_score_cells(b), *_score_cells(c)]
+                for f, a, b, c in zip(rep.folds, rep.final_per_fold, rep.spec_per_fold, rep.baseline_per_fold,
+                                      strict=True)]
+        print(table(("fold", "rec wallets", "rec alerts", "rec ROI", "spec wallets", "spec alerts", "spec ROI",
+                     "all wallets", "all alerts", "all ROI"), rows))
+        print("  (these per-fold numbers are in-sample for the recommendation; the steps above are the honest test)")
+    print(f"\nVerdict: {rep.verdict}")
+    print(f"\nSearched: {', '.join(f'{k} {v}' for k, v in GRID.items())}")
+    print("\nWhere the time went:")
+    print(rep.watch.table())
+
+
 def _setup_logging() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%dT%H:%M:%SZ")
@@ -154,6 +212,30 @@ async def _validate(args, cfg) -> int:
     return 0
 
 
+async def _optimize(args, cfg) -> int:
+    from .optimize import run_optimize
+    from .timeutil import add_months
+    if args.max_candidates:
+        cfg.candidates.max_candidates = args.max_candidates
+    if args.cutoffs:
+        cutoffs = [parse_as_of(c.strip()) for c in args.cutoffs.split(",") if c.strip()]
+    else:
+        end = start_of_day(now_ts())
+        cutoffs = [add_months(end, -args.holdout_months * k) for k in range(args.folds, 0, -1)]
+    if len(cutoffs) < 2:
+        print("error: need at least two cutoffs (one to choose on, one to test on)", file=sys.stderr)
+        return 2
+    async with open_app(cfg) as app:
+        rep = await run_optimize(app, cutoffs, holdout_months=args.holdout_months, clv_sample=args.clv_sample,
+                                 min_wallets=args.min_wallets, min_alerts=args.min_alerts,
+                                 dataset_path=args.dataset,
+                                 progress=lambda m: print(f"  .. {m}", file=sys.stderr))
+        print_optimize(rep, holdout_months=args.holdout_months)
+        if args.dataset:
+            print(f"\nPer-wallet dataset written to {args.dataset}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m whalewatcher",
                                 description="Find skilled Polymarket wallets and paper trade their entries. "
@@ -179,6 +261,17 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--rank-by", choices=config_mod.RANK_KEYS)
     v.add_argument("--with-leaderboard", action="store_true",
                    help="also use today's leaderboards (leaks the holdout; for comparison only)")
+
+    o = sub.add_parser("optimize", help="walk-forward search for the wallet requirements worth tracking")
+    o.add_argument("--cutoffs", help="comma-separated YYYY-MM-DD cutoffs (default: --folds back-to-back "
+                                     "holdouts ending today)")
+    o.add_argument("--folds", type=int, default=3)
+    o.add_argument("--holdout-months", type=int, default=2)
+    o.add_argument("--max-candidates", type=int)
+    o.add_argument("--clv-sample", type=int, default=50, help="positions per wallet for CLV (0 = all)")
+    o.add_argument("--min-wallets", type=int, default=10, help="wallets with alerts a set must keep in each fold")
+    o.add_argument("--min-alerts", type=int, default=50, help="alerts a set must keep in each fold")
+    o.add_argument("--dataset", default="exports/optimize-folds.json", help="where to write the per-wallet data")
 
     for name, helptext in (("monitor", "run the live alert + paper trading loop"),
                            ("settle", "settle open paper trades once"),
@@ -216,5 +309,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_score(args, cfg))
     if args.command == "validate":
         return asyncio.run(_validate(args, cfg))
+    if args.command == "optimize":
+        return asyncio.run(_optimize(args, cfg))
     from . import service  # the live loop and stats, imported lazily
     return asyncio.run(service.run_command(args, cfg))

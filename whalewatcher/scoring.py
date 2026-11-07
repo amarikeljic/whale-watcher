@@ -327,39 +327,61 @@ def rows_from_db(app: App, wallet: str, end: int) -> list[Activity]:
 async def load_wallet_rows(app: App, wallet: str, start: int, end: int, *,
                            max_rows: int) -> tuple[list[Activity], bool]:
     """Activity rows for [start, end] (plus any older rows already stored), and whether
-    the wallet was too active to fetch. Fetches only what the database lacks."""
+    the wallet was too active to fetch.
+
+    Only the stretches the database lacks are fetched, before and/or after what
+    it already holds. "Too active" is a rate, ``max_rows`` over the length of the
+    requested window, judged on each stretch: a wider window scales the cap
+    instead of tripping it, and a hyperactive wallet is still cut off after one page.
+    """
     cov = app.db.one("SELECT start_ts, end_ts, truncated FROM wallet_fetches WHERE wallet = ?", (wallet,))
     if cov is not None and cov["truncated"] and cov["start_ts"] <= start and cov["end_ts"] >= end:
         return [], True
-    fetch_start, new_start = start, start
-    if cov is not None and not cov["truncated"] and cov["start_ts"] <= start:
-        if cov["end_ts"] >= end:
+    if cov is None or cov["truncated"]:
+        gaps = [(start, end)]
+        new_start, new_end = start, end
+    else:
+        gaps = []
+        if start < cov["start_ts"]:
+            gaps.append((start, cov["start_ts"] + 3600))
+        if end > cov["end_ts"]:
+            gaps.append((cov["end_ts"] - 3600, end))
+        if not gaps:
             return rows_from_db(app, wallet, end), False
-        fetch_start, new_start = max(start, cov["end_ts"] - 3600), cov["start_ts"]
+        new_start, new_end = min(start, cov["start_ts"]), max(end, cov["end_ts"])
+    rate = max_rows / max(1, end - start)   # rows per second the cap allows
 
-    def too_busy(first_page: list[dict]) -> bool:
-        # Rows are newest first. If one page covers only a sliver of the window,
-        # the whole window holds far more rows than any person trading by hand.
-        if not first_page:
-            return False
-        oldest = min(int(r.get("timestamp") or end) for r in first_page)
-        span = max(1, end - oldest)
-        return len(first_page) * (end - fetch_start) / span > max_rows
+    fetched: list[Activity] = []
+    for gap_start, gap_end in gaps:
+        gap_rows = max(1000, int(rate * (gap_end - gap_start)))
 
-    rows, truncated = await app.data.activity(wallet, types=ACTIVITY_TYPES, start=fetch_start, end=end,
-                                              max_rows=max_rows, stop_after_first=too_busy)
-    rows = [r for r in rows if r.type in ACTIVITY_TYPES]
-    if not truncated:  # a capped wallet is never scored, so its rows are not worth the disk
-        assign_fill_keys(rows)
-        _store_rows(app, rows)
-    now = app.clock()
+        def too_busy(first_page: list[dict], gap_start: int = gap_start, gap_end: int = gap_end,
+                     gap_rows: int = gap_rows) -> bool:
+            # Rows are newest first. If one page covers only a sliver of the stretch,
+            # the stretch holds far more rows than any person trading by hand.
+            if not first_page:
+                return False
+            oldest = min(int(r.get("timestamp") or gap_end) for r in first_page)
+            span = max(1, gap_end - oldest)
+            return len(first_page) * (gap_end - gap_start) / span > gap_rows
+
+        rows, truncated = await app.data.activity(wallet, types=ACTIVITY_TYPES, start=gap_start, end=gap_end,
+                                                  max_rows=gap_rows, stop_after_first=too_busy)
+        if truncated:  # a capped wallet is never scored, so its rows are not worth the disk
+            _record_fetch(app, wallet, start, end, 0, truncated=True)
+            return [], True
+        fetched.extend(r for r in rows if r.type in ACTIVITY_TYPES)
+    assign_fill_keys(fetched)
+    _store_rows(app, fetched)
+    _record_fetch(app, wallet, new_start, new_end, len(fetched), truncated=False)
+    return rows_from_db(app, wallet, end), False
+
+
+def _record_fetch(app: App, wallet: str, start: int, end: int, rows: int, *, truncated: bool) -> None:
     app.db.execute("DELETE FROM wallet_fetches WHERE wallet = ?", (wallet,))
     app.db.execute(
         "INSERT INTO wallet_fetches (wallet, start_ts, end_ts, rows, truncated, fetched_at) VALUES (?,?,?,?,?,?)",
-        (wallet, new_start if not truncated else fetch_start, end, len(rows), int(truncated), now))
-    if truncated:
-        return [], True
-    return rows_from_db(app, wallet, end), False
+        (wallet, start, end, rows, int(truncated), app.clock()))
 
 
 async def complete_history(app: App, wallet: str, condition_ids: list[str], end: int,

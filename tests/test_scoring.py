@@ -245,3 +245,18 @@ async def test_clv_lookups_respect_the_sample_and_skip_unwanted_metrics(app, fak
     assert n == 50 and markout is None and mn == 0
     assert fake_http.count("/v2/prices-history") == 50, "one lookup per sampled position, no markout lookups"
     assert clv == pytest.approx(0.1)
+
+
+async def test_an_earlier_window_fetches_only_the_missing_older_stretch(app, fake_http):
+    world = World(fake_http)
+    world.trade("0xw", AS_OF - 150 * DAY, "0xold")
+    world.trade("0xw", AS_OF - 10 * DAY, "0xnew")
+    rows, _ = await load_wallet_rows(app, "0xw", AS_OF - 100 * DAY, AS_OF, max_rows=20000)
+    assert [r.condition_id for r in rows] == ["0xnew"]
+    rows, _ = await load_wallet_rows(app, "0xw", AS_OF - 200 * DAY, AS_OF, max_rows=20000)
+    assert sorted(r.condition_id for r in rows) == ["0xnew", "0xold"]
+    last = fake_http.calls[-1][2]
+    assert last["start"] == AS_OF - 200 * DAY and last["end"] == AS_OF - 100 * DAY + 3600, "only the gap"
+    calls = fake_http.count("/v2/activity")
+    await load_wallet_rows(app, "0xw", AS_OF - 180 * DAY, AS_OF - 5 * DAY, max_rows=20000)
+    assert fake_http.count("/v2/activity") == calls, "inside the stored range: no request"
