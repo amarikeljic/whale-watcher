@@ -365,6 +365,40 @@ price, at 50 cents), is 1.4 to 2.3 times Polymarket's on these markets (rates
 0.05 and 0.03, 11% fee-free). What is left of the edge after an instant copy does
 not cover it.
 
+## Is the wallet selection too strict? (2026-11-07)
+
+No. Copying every wallet in the candidate pool, with no requirements at all and
+the same 90 s delay (a seeded sample of 1,500 alerts per period, wallets and
+events resampled together in the CIs):
+
+| Period | At the whale's price | Copied 90 s later |
+|---|---|---|
+| May-Jul | +1.9% [-9.2%, +13.9%], n=1,478 | +3.7% [-8.6%, +16.9%], n=1,352 |
+| Jul-Sep | -5.6% [-15.4%, +5.2%], n=1,481 | -7.2% [-17.8%, +3.7%], n=1,323 |
+| Sep-Nov | -2.4% [-10.8%, +6.0%], n=1,461 | -4.0% [-13.0%, +5.5%], n=1,258 |
+| All | -2.0% [-8.0%, +4.2%], n=4,420 | -2.4% [-8.3%, +4.2%], n=3,933 |
+
+Large traders as a group have no edge to copy. The selected wallets do have one
+at their own price (+3.4% to +4.8%), but it is the kind that is gone within a
+minute: the delay costs the selected wallets 6 to 11 points and the unselected
+pool less than half a point. Selecting on past profit picks the fastest in-play
+traders, and speed is the one thing a copier cannot copy.
+
+Where the delay cost sits (every distinct copied alert from the backtest, by
+time from the alert to the market's resolution):
+
+| Resolves | Alerts | Sports | At the whale's price | Copied 90 s later | Slippage misses |
+|---|---|---|---|---|---|
+| Within 3 h | 1,834 | 96% | +4.3% [-6.3%, +15.5%] | -8.7% [-19.7%, +1.9%] | 36% |
+| 3 to 24 h | 1,215 | 91% | +0.3% [-12.1%, +14.3%] | -1.1% [-14.4%, +13.5%] | 12% |
+| 1 to 7 days | 518 | 22% | +16.0% [-2.7%, +32.9%] | +15.9% [-0.6%, +34.7%] | 6% |
+| Over 7 days | 397 | 4% | -15.9% [-53.7%, +8.2%] | -17.6% [-53.1%, +5.9%] | 5% |
+
+The returns per bucket are noise: the buckets were drawn after seeing the data,
+and +16% sits next to -16%. The delay cost is not noise: all of it is in markets
+that resolve within hours, nearly all in-play sports. Where a market resolves
+days later, a copy gets about what the whale got.
+
 ## Known limits
 
 * Detection is polling (60 s) plus the Data API's indexing lag, which
