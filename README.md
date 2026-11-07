@@ -351,13 +351,14 @@ already moved, so fewer fills look like slippage. That is buying the winners
 after their price moved, the same trade as the uncapped Polymarket row above,
 and it earns about nothing.
 
-How much was there on Kalshi at all (the Kalshi shadows over the same copies):
+How much was there on Kalshi at all (mean ROI per copy after Kalshi's fee, 95% CI;
+the first two rows are shadow fills over every settled copy, missed ones included):
 
 | Kalshi fill | Spec rule | Walk-forward rule |
 |---|---|---|
-| Instant: Kalshi's ask in the minute of the whale's trade | +$84.50 on 1,593 copies (+0.5% each) | +$138.04 on 1,008 (+1.4% each) |
-| At alert time (33 s) | -$111.08 | -$15.78 |
-| 90-150 s (this service) | -$96.12 | -$195.62 |
+| Instant: Kalshi's ask in the minute of the whale's trade | +0.5% [-9.5%, +10.8%], n=1,593 | +1.3% [-10.7%, +12.2%], n=1,008 |
+| At alert time (33 s) | -0.7% [-10.4%, +9.4%], n=1,593 | -0.1% [-11.5%, +10.2%], n=1,008 |
+| 90-150 s (this service) | -0.7% [-11.7%, +10.9%], n=1,416 | -2.1% [-15.6%, +9.4%], n=897 |
 
 Kalshi's taker fee, 0.07 x P x (1 - P) a contract (1.75 cents, 3.5% of the
 price, at 50 cents), is 1.4 to 2.3 times Polymarket's on these markets (rates
