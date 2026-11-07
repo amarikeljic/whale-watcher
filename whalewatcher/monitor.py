@@ -129,6 +129,7 @@ class Monitor:
                 continue
             stats.new_fills += len(new)
             buys.extend(r for r in new if r.side == "BUY")
+        self._prune_small_groups()
         for fill in sorted(buys, key=lambda r: r.ts):
             outcome = await self._handle_buy(fill, counter, stats.data_lag)
             if outcome == "alert":
@@ -138,6 +139,19 @@ class Monitor:
             elif outcome == "edit":
                 stats.edits += 1
         return stats
+
+    def _prune_small_groups(self) -> None:
+        """Drop groups that never reached the threshold once their window has closed.
+
+        They are not alerts (the spec ignores trades below min_whale_trade_usd),
+        and an active wallet leaves hundreds of them an hour. Their fills stay in
+        wallet_trades.
+        """
+        cutoff = self.app.clock() - 2 * self.cfg.dedupe_window_seconds
+        with self.app.db.tx() as conn:
+            conn.execute("DELETE FROM alert_fills WHERE alert_id IN "
+                         "(SELECT id FROM alerts WHERE status = 'BELOW_THRESHOLD' AND first_fill_ts < ?)", (cutoff,))
+            conn.execute("DELETE FROM alerts WHERE status = 'BELOW_THRESHOLD' AND first_fill_ts < ?", (cutoff,))
 
     async def _poll_wallet(self, w) -> list[Activity]:
         app = self.app

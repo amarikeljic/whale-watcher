@@ -181,3 +181,14 @@ async def test_score_line_says_when_a_wallet_could_not_be_scored(live_app, fake_
                "months_in_window, passed, fail_reasons) VALUES (9, '0xok', 0, 71, 0.18, 0.06, 5, 6, 1, '[]')")
     assert "not scored (too active to score)" in score_line(live_app, "0xbot", 9)
     assert score_line(live_app, "0xok", 9).startswith("Wallet score: CLV +0.06 | ROI 18% | 71 settled | 5/6")
+
+
+async def test_groups_that_never_reach_the_threshold_are_pruned_after_their_window(live_app, fake_http, clock):
+    world, monitor, sink = setup(live_app, fake_http)
+    world.trade(WHALE, NOW - 20, COND, size=100, price=0.42, usdc=42)
+    await monitor.poll_once()
+    assert live_app.db.one("SELECT COUNT(*) n FROM alerts WHERE status = 'BELOW_THRESHOLD'")["n"] == 1
+    clock.advance(700)
+    await monitor.poll_once()
+    assert live_app.db.one("SELECT COUNT(*) n FROM alerts")["n"] == 0
+    assert live_app.db.one("SELECT COUNT(*) n FROM wallet_trades")["n"] == 1, "the fill itself is kept"
