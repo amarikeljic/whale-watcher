@@ -114,6 +114,38 @@ that was current when it fired.
 10. **Kalshi is deferred.** The verified Kalshi notes, including real UFC
     name-matching edge cases, are in `docs/API_NOTES.md` for when it returns.
 
+## First live results (2026-11-07)
+
+These are single runs on live data, kept here so later runs have a baseline.
+Each is one sample, not a conclusion.
+
+* **Scoring, `--as-of 2026-11-01`, spec filters.** 1 of the 150 largest
+  historical traders passes. 87 (58%) exceed the activity cap as bots or market
+  makers. The rest fail mostly on `max_single_market_share` and
+  `profitable_months`. Example: the #2 wallet on the monthly leaderboard made
+  $5.3M on 22 markets, profitable in 1 month of 6.
+* **Nightly rescore with today's leaderboards, spec filters.** 0 wallets pass,
+  so the service monitors nothing until the filters change.
+* **Validation, cutoff 2026-09-01, holdout to 2026-11-01.** With spec filters,
+  no wallet passes at the cutoff. With relaxed filters (20 settled, 3
+  profitable months, 0.5 max share, ROI >= 0), 16 wallets are selected. Their
+  holdout ROI is -0.4% overall, with a mean per position of +5.1% and a 95% CI
+  of [-0.3%, +56.5%]. The CI resamples wallets, and one wallet holds 69% of the
+  positions. Over the 28 wallets with at least 5 holdout positions:
+  * selection ROI vs holdout ROI: Spearman +0.04
+  * spec CLV vs holdout ROI: +0.15
+  * 24h markout vs holdout ROI: **+0.48 (n=27)**
+
+  The markout predicted best, but on one holdout after three metrics were
+  tried. Replicate it at other cutoffs before switching `rank_by`.
+* **Alert pipeline, 25 actively trading wallets (hand-picked to exercise the
+  plumbing, not selected by the strategy).** Detection is about 28 s from the
+  triggering fill to the alert, and the paper fill lands about 83 s after that
+  fill. Duplicates: none (no fill in two alerts, one paper trade per alert).
+  18% of paper trades were missed on slippage. Between the alert-time ask and
+  the fill a minute later, the median move was 0. The 90th percentile was 7
+  cents against the copier. 97% of alerts were live sports.
+
 ## Known limits
 
 * Detection is polling (60 s) plus the Data API's indexing lag, which
