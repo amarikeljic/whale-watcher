@@ -62,7 +62,7 @@ class Service:
         app, cfg = self.app, self.app.cfg
         if not self.monitor.wallets():
             log.info("no monitored wallets yet: scoring now")
-            await rescore(app)
+            await self._rescore()
             # That was today's rescore; do not run another one after the first poll.
             app.db.set_state("last_rescore_day", from_ts(app.clock()).strftime("%Y-%m-%d"))
         done = 0
@@ -89,6 +89,24 @@ class Service:
                 pass
         log.info("stopped after %d cycles", done)
 
+    async def _rescore(self) -> None:
+        """Rescore, and say so once if that leaves nothing to monitor: silence would
+        otherwise look exactly like a broken service."""
+        app = self.app
+        run_id = await rescore(app)
+        if self.monitor.wallets():
+            app.db.set_state("empty_notice_run", None)
+            return
+        if app.db.get_state("empty_notice_run") is not None:
+            return
+        app.db.set_state("empty_notice_run", run_id)
+        run = app.db.one("SELECT n_candidates FROM score_runs WHERE id = ?", (run_id,))
+        n = run["n_candidates"] if run else 0
+        await (self.stats_sink or self.sink).post(
+            f"⚠ Whale Watcher: no wallet passed the scoring filters (snapshot #{run_id}, {n} candidates), "
+            "so nothing is being monitored and no alerts will fire. Loosen the filters in config.yaml or "
+            "wait for a wallet to qualify; see `python -m whalewatcher score` for why each one failed.")
+
     async def _periodic(self) -> None:
         app, cfg = self.app, self.app.cfg
         now = app.clock()
@@ -102,7 +120,7 @@ class Service:
         if (cfg.rescore.enabled and app.db.get_state("last_rescore_day") != today
                 and (dt.hour, dt.minute) >= (cfg.rescore.hour_utc, cfg.rescore.minute_utc)):
             app.db.set_state("last_rescore_day", today)
-            await rescore(app)
+            await self._rescore()
         if (self.stats_sink is not None and app.db.get_state("last_summary_day") != today
                 and dt.hour >= cfg.stats.daily_summary_hour_utc):
             app.db.set_state("last_summary_day", today)

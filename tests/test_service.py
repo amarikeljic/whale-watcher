@@ -116,3 +116,17 @@ async def test_a_failing_wallet_does_not_stop_the_cycle(live_app, fake_http, clo
     svc = Service(live_app, MemorySink())
     stats = await svc.monitor.poll_once()
     assert stats.errors == 1 and stats.wallets == 2
+
+
+async def test_an_empty_monitored_set_is_announced_once(live_app, fake_http, clock):
+    loosen(live_app.cfg)
+    live_app.cfg.scoring.min_settled_markets = 999   # nobody can pass
+    world = World(fake_http)
+    world.leaderboard = [{"rank": 1, "user_id": "0xaaaa", "pnl": 1000, "volume": 1, "user_name": "a"}]
+    history(world, "0xaaaa", win=True, start=NOW - 20 * DAY)
+    sink = MemorySink()
+    svc = Service(live_app, sink)
+    await svc.run(cycles=1)
+    await svc._rescore()          # the next night: still nobody
+    notices = [t for _, t in sink.posts if "no wallet passed" in t]
+    assert len(notices) == 1 and "nothing is being monitored" in notices[0]
