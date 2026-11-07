@@ -502,11 +502,14 @@ class Gamma:
         return [row for rows in results for row in rows]
 
     # GET /markets ordered by volume within an end-date window (closed markets).
-    async def top_markets(self, *, end_min: str, end_max: str, limit: int, closed: bool = True) -> list[dict]:
+    # Pages hold at most 100 rows whatever `limit` asks for (checked 2026-11-07);
+    # page with `offset`.
+    async def top_markets(self, *, end_min: str, end_max: str, limit: int = 100, offset: int = 0,
+                          closed: bool = True) -> list[dict]:
         payload = await self.http.get_json(
             f"{self.base}/markets",
-            {"closed": closed, "end_date_min": end_min, "end_date_max": end_max,
-             "order": "volumeNum", "ascending": False, "limit": limit, "include_tag": True},
+            {"closed": closed, "end_date_min": end_min, "end_date_max": end_max, "order": "volumeNum",
+             "ascending": False, "limit": min(limit, 100), "offset": offset, "include_tag": True},
         )
         return payload or []
 

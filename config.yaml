@@ -28,7 +28,8 @@ candidates:
   leaderboard_limit: 100          # per period x category
   recent_trades_min_usd: 1000     # "large traders seen in recent trade data"
   recent_trades_pages: 5          # pages of 1000 trades from the global feed
-  historical_markets: 60          # leak-free pool for past as_of dates: top markets by volume
+  historical_markets: 150         # leak-free pool for past as_of dates: top markets by volume...
+  historical_per_event: 3         # ...at most this many per event, so one mega-event cannot fill the pool
   historical_min_trade_usd: 1000
   max_candidates: 400
 

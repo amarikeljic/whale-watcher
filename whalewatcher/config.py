@@ -48,7 +48,12 @@ class CandidateConfig:
     leaderboard_limit: int = 100
     recent_trades_min_usd: float = 1000.0
     recent_trades_pages: int = 5
-    historical_markets: int = 60
+    # Leak-free pool for a past as_of: large trades placed before it in the
+    # top-volume markets, at most historical_per_event markets per event so one
+    # mega-event (42 of the top 60 markets before 2026-07-07 were World Cup
+    # winner markets) cannot fill the pool with one-off bettors.
+    historical_markets: int = 150
+    historical_per_event: int = 3
     historical_min_trade_usd: float = 1000.0
     max_candidates: int = 400
 

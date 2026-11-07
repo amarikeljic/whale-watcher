@@ -28,11 +28,14 @@ class FakeMarket:
     accepting_orders: bool = True
     question: str = ""
 
+    event: str | None = None
+
     def gamma(self) -> dict[str, Any]:
         closed = self.resolved_at is not None or self.closed_time is not None
+        event = self.event or f"e-{self.cond}"
         return {
             "conditionId": self.cond, "question": self.question or f"Will {self.cond} happen?",
-            "slug": f"m-{self.cond}", "events": [{"slug": f"e-{self.cond}", "title": f"Event {self.cond}"}],
+            "slug": f"m-{self.cond}", "events": [{"slug": event, "title": f"Event {event}"}],
             "tags": [{"slug": t, "label": t.title()} for t in self.tags],
             "outcomes": json.dumps(["Yes", "No"]), "clobTokenIds": json.dumps([f"{self.cond}-t0", f"{self.cond}-t1"]),
             "endDate": iso(self.end_date).replace(" ", "T") if self.end_date else None,
@@ -124,7 +127,8 @@ class World:
         if ids is not None:
             ids = ids if isinstance(ids, list) else [ids]
             return [self.markets[c].gamma() for c in ids if c in self.markets]
-        return [m.gamma() for m in self.markets.values()][: int(params.get("limit") or 100)]
+        offset, limit = int(params.get("offset") or 0), min(100, int(params.get("limit") or 100))
+        return [m.gamma() for m in self.markets.values()][offset:offset + limit]
 
     def _resolutions(self, params: dict[str, Any]) -> dict[str, Any]:
         out = []

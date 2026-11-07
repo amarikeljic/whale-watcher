@@ -474,6 +474,7 @@ class OptimizeReport:
     configs_tried: int
     watch: Stopwatch
     verdict: str = ""
+    skipped: list[str] = field(default_factory=list)
 
 
 def _ci(index: FoldIndex, chosen: frozenset[int], samples: int) -> tuple[float | None, float | None]:
@@ -486,11 +487,19 @@ def evaluate(folds: list[Fold], *, min_wallets: int, min_alerts: int, spec: dict
     indexes = [FoldIndex(f) for f in folds]
     configs = math.prod(len(v) for v in GRID.values())
     steps: list[Step] = []
+    skipped: list[str] = []
+
+    def thin(idxs: list[FoldIndex]) -> str:
+        return ", ".join(f"{iso(i.fold.cutoff)[:10]} has {len(i.has)} wallets with alerts" for i in idxs
+                         if len(i.has) < min_wallets) or "no set keeps enough wallets and alerts in every fold"
+
     for k in range(1, len(indexes)):
         train, test = indexes[:k], indexes[k]
         with watch.stage(f"search: train {k} fold(s), test {iso(folds[k].cutoff)[:10]}"):
             found = search(train, min_wallets=min_wallets, min_alerts=min_alerts, test=test)
         if not found:
+            skipped.append(f"test on {iso(folds[k].cutoff)[:10]} skipped: {thin(train)} "
+                           f"(need {min_wallets} wallets and {min_alerts} alerts per training fold)")
             continue
         chosen = choose(found)
         chosen_set = test.select(chosen.req)
@@ -514,18 +523,24 @@ def evaluate(folds: list[Fold], *, min_wallets: int, min_alerts: int, spec: dict
         found_all = search(indexes, min_wallets=min_wallets, min_alerts=min_alerts)
     final = choose(found_all) if found_all else None
     final_per_fold = [score_set(idx, idx.select(final.req)) for idx in indexes] if final else []
+    if final is None:
+        skipped.append(f"no recommendation: {thin(indexes)}")
     report = OptimizeReport(
         folds, steps, final, final_per_fold,
         [score_set(idx, idx.select(spec)) for idx in indexes],
-        [score_set(idx, idx.all) for idx in indexes], configs, watch)
+        [score_set(idx, idx.all) for idx in indexes], configs, watch, skipped=skipped)
     report.verdict = verdict(report)
     return report
 
 
 def verdict(rep: OptimizeReport) -> str:
     if not rep.steps:
-        return "No requirement set kept enough wallets in every training fold; widen the pools or lower --min-wallets."
-    tests = [s.results[0] for s in rep.steps]
+        return ("Inconclusive: no requirement set kept enough wallets in every training fold, so nothing could be "
+                "tested. Widen the candidate pools or lower --min-wallets.")
+    tests = [s.results[0] for s in rep.steps if s.results[0].score.mean is not None and s.results[0].score.wallets >= 3]
+    if not tests:
+        return ("Inconclusive: the chosen requirements kept fewer than 3 wallets with alerts on every unseen fold, "
+                "so there is nothing to judge them on.")
     beat_random = [t for t in tests if t.p_random is not None and t.p_random < 0.05]
     positive = [t for t in tests if t.ci[0] is not None and t.ci[0] > 0]
     if positive and len(beat_random) == len(tests):

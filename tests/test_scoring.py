@@ -260,3 +260,23 @@ async def test_an_earlier_window_fetches_only_the_missing_older_stretch(app, fak
     calls = fake_http.count("/v2/activity")
     await load_wallet_rows(app, "0xw", AS_OF - 180 * DAY, AS_OF - 5 * DAY, max_rows=20000)
     assert fake_http.count("/v2/activity") == calls, "inside the stored range: no request"
+
+
+async def test_one_mega_event_cannot_fill_the_historical_pool(app, fake_http):
+    """Before 2026-07-07, 42 of the top 60 markets were World Cup winner markets, and
+    ranking by volume filled the pool with one-off World Cup bettors."""
+    world = World(fake_http)
+    app.cfg.candidates.historical_per_event = 3
+    app.cfg.candidates.max_candidates = 2
+    for k in range(10):   # one event, ten markets, ten tourists with one huge bet each
+        world.add_market(FakeMarket(f"0xwc{k}", resolved_at=AS_OF - DAY, event="world-cup-winner"))
+        world.trade(f"0xtourist{k}", AS_OF - 5 * DAY, f"0xwc{k}", size=400_000, price=0.5)
+    for k in range(4):    # four separate events; one regular trades in all of them
+        world.add_market(FakeMarket(f"0xreg{k}", resolved_at=AS_OF - DAY))
+        world.trade("0xregular", AS_OF - 5 * DAY, f"0xreg{k}", size=4000, price=0.5)
+        world.trade(f"0xone{k}", AS_OF - 5 * DAY, f"0xreg{k}", size=3000, price=0.5)
+    pool, _ = await candidate_pool(app, AS_OF, historical=True)
+    assert "0xregular" in pool, "breadth beats a single huge bet"
+    scanned = {t for _, path, params in fake_http.calls if path == "/v2/trades"
+               for t in str(params.get("condition", "")).split(",") if t}
+    assert len([c for c in scanned if c.startswith("0xwc")]) == 3, "at most three markets per event"

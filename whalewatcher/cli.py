@@ -158,6 +158,8 @@ def print_optimize(rep, *, holdout_months: int) -> None:
         if st.oracle is not None and st.oracle.test is not None:
             print(f"  hindsight: the best set chosen ON the test fold shows {_f(st.oracle.test.mean, '+.1%')} "
                   f"({st.oracle.test.wallets} wallets) - what an in-sample search would have claimed")
+    for note in rep.skipped:
+        print(f"\n  NOTE: {note}")
     if rep.final is not None:
         print(f"\nRecommendation (chosen on all folds): {_req_text(rep.final.req)}")
         print(f"  all folds pooled: {rep.final.train.wallets} wallet-folds, {rep.final.train.alerts} alerts, "

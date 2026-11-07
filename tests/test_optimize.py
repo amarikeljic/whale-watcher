@@ -157,3 +157,14 @@ def test_permutation_p_value():
     assert permutation_p(idx, worst) > 0.9
     assert permutation_p(idx, idx.all) is None, "all wallets is not a selection"
     assert score_set(idx, best).mean > score_set(idx, idx.all).mean
+
+
+def test_an_empty_fold_is_reported_not_judged():
+    rng = random.Random(4)
+    good = synthetic_fold(AS_OF, rng, signal=True)
+    empty = Fold(AS_OF + 60 * DAY, AS_OF + 120 * DAY, 400, 0,
+                 [FoldWallet(f"0xe{i}", WalletMetrics(f"0xe{i}", AS_OF, settled_markets=0), []) for i in range(400)])
+    rep = evaluate([good, empty, synthetic_fold(AS_OF + 120 * DAY, rng, signal=True)], min_wallets=10,
+                   min_alerts=50, spec=LOOSE, watch=Stopwatch(None), samples=200)
+    assert rep.verdict.startswith("Inconclusive"), rep.verdict
+    assert any("has 0 wallets with alerts" in note for note in rep.skipped)

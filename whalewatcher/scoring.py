@@ -403,9 +403,11 @@ async def candidate_pool(app: App, as_of: int, *, historical: bool) -> tuple[dic
     """Wallets worth scoring, each with where it came from, plus warnings."""
     cfg = app.cfg.candidates
     pool: dict[str, set[str]] = defaultdict(set)
-    # How much each wallet moved in the trades that brought it in: the cap below
-    # keeps the biggest traders, not whichever addresses sort first.
+    # The cap below keeps wallets in more sources first, then those that traded
+    # large in more distinct markets (a regular, not a one-event tourist), then
+    # the biggest by volume, never whichever addresses sort first.
     weight: dict[str, float] = defaultdict(float)
+    breadth: dict[str, set[str]] = defaultdict(set)
     notes: list[str] = []
     if not historical:
         if as_of < app.clock() - 2 * DAY:
@@ -421,11 +423,9 @@ async def candidate_pool(app: App, as_of: int, *, historical: bool) -> tuple[dic
             if t.ts <= as_of and t.wallet:
                 pool[t.wallet].add("recent_large_trades")
                 weight[t.wallet] += t.usdc_size
+                breadth[t.wallet].add(t.condition_id)
     else:
-        markets = await app.gamma.top_markets(end_min=_gamma_date(as_of - 90 * DAY),
-                                              end_max=_gamma_date(as_of + 14 * DAY),
-                                              limit=cfg.historical_markets)
-        conds = [str(m.get("conditionId") or "").lower() for m in markets if m.get("conditionId")]
+        conds = await _diverse_top_markets(app, as_of)
         for i in range(0, len(conds), 20):
             trades = await app.data.trades(conditions=conds[i:i + 20], min_usd=cfg.historical_min_trade_usd,
                                            max_pages=3)
@@ -433,10 +433,38 @@ async def candidate_pool(app: App, as_of: int, *, historical: bool) -> tuple[dic
                 if t.ts < as_of and t.wallet:
                     pool[t.wallet].add("historical_large_trades")
                     weight[t.wallet] += t.usdc_size
-    ranked = sorted(pool, key=lambda w: (-len(pool[w]), -weight[w], w))[: cfg.max_candidates]
+                    breadth[t.wallet].add(t.condition_id)
+    ranked = sorted(pool, key=lambda w: (-len(pool[w]), -len(breadth[w]), -weight[w], w))[: cfg.max_candidates]
     if len(pool) > len(ranked):
         notes.append(f"candidate pool capped at {len(ranked)} of {len(pool)} wallets")
     return {w: pool[w] for w in ranked}, notes
+
+
+async def _diverse_top_markets(app: App, as_of: int) -> list[str]:
+    """Top-volume markets ending around as_of, at most historical_per_event per event."""
+    cfg = app.cfg.candidates
+    chosen: list[str] = []
+    per_event: dict[str, int] = defaultdict(int)
+    seen: set[str] = set()
+    for page in range(10):
+        batch = await app.gamma.top_markets(end_min=_gamma_date(as_of - 90 * DAY),
+                                            end_max=_gamma_date(as_of + 14 * DAY), offset=page * 100)
+        for m in batch:
+            cid = str(m.get("conditionId") or "").lower()
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            events = m.get("events") or [{}]
+            event = (events[0] or {}).get("slug") or m.get("slug") or cid
+            if per_event[event] >= cfg.historical_per_event:
+                continue
+            per_event[event] += 1
+            chosen.append(cid)
+            if len(chosen) >= cfg.historical_markets:
+                return chosen
+        if len(batch) < 100:
+            break
+    return chosen
 
 
 def _gamma_date(ts: int) -> str:
