@@ -58,6 +58,10 @@ def score_line(app: App, wallet: str, run_id: int | None) -> str:
     r = app.db.one("SELECT * FROM wallet_score_snapshots WHERE run_id = ? AND wallet = ?", (run_id, wallet))
     if r is None:
         return "Wallet score: n/a"
+    if not r["settled_markets"]:
+        reasons = json.loads(r["fail_reasons"] or "[]")
+        why = "too active to score" if any("too_active" in x for x in reasons) else "no settled markets"
+        return f"Wallet score: not scored ({why})  (snapshot #{run_id})"
     clv = "n/a" if r["clv"] is None else f"{r['clv']:+.2f}"
     roi = "n/a" if r["roi"] is None else f"{r['roi']:.0%}"
     return (f"Wallet score: CLV {clv} | ROI {roi} | {r['settled_markets']} settled | "
@@ -91,7 +95,7 @@ class Monitor:
         self.sink = sink
         self.paper = paper
         self.cfg = app.cfg.alerts
-        self.max_alert_age = max_alert_age_seconds or max(600, 2 * self.cfg.dedupe_window_seconds)
+        self.max_alert_age = max_alert_age_seconds or self.cfg.max_alert_age_seconds
 
     @property
     def run_id(self) -> int | None:

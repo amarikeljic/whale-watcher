@@ -168,3 +168,16 @@ async def test_rotation_follows_the_new_snapshot(live_app):
     assert added == ["0xa", "0xb"] and removed == ["0xold"]
     active = [r["wallet"] for r in db.query("SELECT wallet FROM monitored_wallets WHERE active = 1 ORDER BY rank")]
     assert active == ["0xa", "0xb"] and db.get_state("monitored_run_id") == 7
+
+
+async def test_score_line_says_when_a_wallet_could_not_be_scored(live_app, fake_http, clock):
+    from whalewatcher.monitor import score_line
+    db = live_app.db
+    db.execute("INSERT INTO score_runs (id, as_of, kind, created_at, config_json, sources_json, n_candidates, n_passed) "
+               "VALUES (9, 0, 'nightly', 0, '{}', '{}', 2, 1)")
+    db.execute("INSERT INTO wallet_score_snapshots (run_id, wallet, as_of, settled_markets, passed, fail_reasons) "
+               "VALUES (9, '0xbot', 0, 0, 0, '[\"too_active(>20000 rows: bot or market maker)\"]')")
+    db.execute("INSERT INTO wallet_score_snapshots (run_id, wallet, as_of, settled_markets, roi, clv, profitable_months, "
+               "months_in_window, passed, fail_reasons) VALUES (9, '0xok', 0, 71, 0.18, 0.06, 5, 6, 1, '[]')")
+    assert "not scored (too active to score)" in score_line(live_app, "0xbot", 9)
+    assert score_line(live_app, "0xok", 9).startswith("Wallet score: CLV +0.06 | ROI 18% | 71 settled | 5/6")

@@ -56,6 +56,9 @@ class AlertsConfig:
     dedupe_window_seconds: int = 300
     min_price: float = 0.05
     max_price: float = 0.95
+    # A fill older than this when first seen (API lag, or the backlog read on
+    # start-up) is stored as SKIPPED "stale" instead of alerting.
+    max_alert_age_seconds: int = 600
 
 
 @dataclass
