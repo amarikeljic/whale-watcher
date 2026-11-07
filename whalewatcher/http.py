@@ -132,7 +132,20 @@ class HttpClient:
         self.user_agent = user_agent
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.semaphore = asyncio.Semaphore(max_concurrency)
-        self.limiters = {host: RateLimiter(rate) for host, rate in (rate_limits or {}).items()}
+        # Keys are a host ("data-api.polymarket.com") or a host plus path prefix
+        # ("data-api.polymarket.com/v2/activity"). A request waits on its host's
+        # limiter and on the most specific prefix that matches its path, so a slow
+        # endpoint's cap does not throttle the host's other endpoints.
+        self.limiters: dict[str, RateLimiter] = {}
+        self._prefix_limiters: list[tuple[str, str, RateLimiter]] = []
+        for key, rate in (rate_limits or {}).items():
+            limiter = RateLimiter(rate)
+            host, slash, path = key.partition("/")
+            if slash:
+                self._prefix_limiters.append((host, "/" + path, limiter))
+            else:
+                self.limiters[host] = limiter
+        self._prefix_limiters.sort(key=lambda item: -len(item[1]))
         self.attempts = attempts
         self.health: dict[str, HostHealth] = {}
         self._cache: OrderedDict[str, tuple[float, int, Any]] = OrderedDict()
@@ -229,11 +242,12 @@ class HttpClient:
     async def _request(self, method: str, url: str, *, body: dict[str, Any] | None = None) -> Any:
         if self._session is None:
             await self.start()
-        host = urlsplit(url).netloc
-        limiter = self.limiters.get(host)
+        parts = urlsplit(url)
+        host = parts.netloc
+        limiters = [lim for lim in (self._prefix_limiter(host, parts.path), self.limiters.get(host)) if lim]
         last_error = ""
         for attempt in range(self.attempts):
-            if limiter is not None:
+            for limiter in limiters:
                 await limiter.acquire()
             headers: dict[str, str] = {}
             etag = self._etags.get(url) if method == "GET" else None
@@ -284,6 +298,12 @@ class HttpClient:
                 self._etags[url] = (new_etag, payload)
             return payload
         raise HttpError(f"failed after {self.attempts} attempts: {url}: {last_error}")
+
+    def _prefix_limiter(self, host: str, path: str) -> RateLimiter | None:
+        for h, prefix, limiter in self._prefix_limiters:
+            if h == host and path.startswith(prefix):
+                return limiter
+        return None
 
     @staticmethod
     def _backoff(attempt: int, retry_after: float | None) -> float:

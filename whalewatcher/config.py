@@ -35,6 +35,10 @@ class ScoringConfig:
     max_unreliable_market_share: float = 0.25
     markout_hours: float = 24.0
     min_clv_positions: int = 10
+    # CLV needs one price lookup per position (two with the markout). A seeded
+    # sample of this many positions per wallet estimates the mean closely at a
+    # fraction of the requests; 0 means use every position.
+    clv_sample_positions: int = 150
 
 
 @dataclass
@@ -92,14 +96,20 @@ class ApiConfig:
     clob_api: str = "https://clob.polymarket.com"
     user_agent: str = "whale-watcher/0.1 (read-only research)"
     timeout_seconds: float = 20.0
-    max_concurrency: int = 8
-    # Requests per second we allow ourselves, per host. Well under the published
-    # limits (Data API v2: 800 req/10s overall, 200/10s on /v2/activity and
-    # /v2/prices-history; Gamma /markets 300/10s; CLOB /book 1500/10s).
+    max_concurrency: int = 16
+    # Requests per second we allow ourselves: about 80% of each published limit,
+    # per host and per endpoint (a key with a path applies to that prefix only).
+    # Published: Data API v2 800 req/10s overall, 200/10s on /v2/activity,
+    # /v2/positions and /v2/prices-history, 300/10s on /v2/trades; Gamma /markets
+    # 300/10s; CLOB /book 1500/10s.
     rate_limits: dict[str, float] = field(
         default_factory=lambda: {
-            "data-api.polymarket.com": 12.0,
-            "gamma-api.polymarket.com": 15.0,
+            "data-api.polymarket.com": 60.0,
+            "data-api.polymarket.com/v2/activity": 16.0,
+            "data-api.polymarket.com/v2/positions": 16.0,
+            "data-api.polymarket.com/v2/prices-history": 16.0,
+            "data-api.polymarket.com/v2/trades": 24.0,
+            "gamma-api.polymarket.com": 24.0,
             "clob.polymarket.com": 40.0,
         }
     )

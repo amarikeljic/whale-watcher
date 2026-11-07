@@ -116,3 +116,25 @@ async def test_ttl_cache_avoids_a_second_request():
     await c.get_json("https://h/x", ttl=60)
     await c.get_json("https://h/x", ttl=60)
     assert len(session.requests) == 1
+
+
+async def test_a_request_waits_on_its_endpoint_limiter_and_its_host_limiter():
+    c, _ = client([FakeResponse(200, "{}")] * 3, rate_limits={
+        "data-api.polymarket.com": 60.0,
+        "data-api.polymarket.com/v2/activity": 16.0,
+        "data-api.polymarket.com/v2/prices-history": 16.0,
+    })
+    assert c._prefix_limiter("data-api.polymarket.com", "/v2/activity").rate == 16.0
+    assert c._prefix_limiter("data-api.polymarket.com", "/v2/resolutions") is None, "falls to the host cap only"
+    assert c._prefix_limiter("gamma-api.polymarket.com", "/v2/activity") is None
+    assert c.limiters["data-api.polymarket.com"].rate == 60.0
+    used = []
+    for lim in [c.limiters["data-api.polymarket.com"], c._prefix_limiter("data-api.polymarket.com", "/v2/activity")]:
+        original = lim.acquire
+
+        async def spy(original=original, lim=lim):
+            used.append(lim.rate)
+            await original()
+        lim.acquire = spy
+    await c.get_json("https://data-api.polymarket.com/v2/activity", {"user": "0x1"})
+    assert sorted(used) == [16.0, 60.0]

@@ -214,3 +214,34 @@ async def test_the_pool_cap_keeps_the_biggest_traders_not_the_first_addresses(ap
     pool, notes = await candidate_pool(app, AS_OF, historical=True)
     assert list(pool) == ["0xffffbig"]
     assert any("capped at 1 of 2" in n for n in notes)
+
+
+async def test_a_multi_page_wallet_is_fetched_once_page_by_page(app, fake_http):
+    world = World(fake_http)
+    for i in range(2500):   # 2,500 fills spread over 100 days: three pages, an ordinary active trader
+        world.trade("0xbusy", AS_OF - i * 3456, "0xc1", size=1, price=0.5)
+    rows, truncated = await load_wallet_rows(app, "0xbusy", AS_OF - 365 * DAY, AS_OF, max_rows=20000)
+    assert len(rows) == 2500 and not truncated
+    assert fake_http.count("/v2/activity") == 3, "the first page is not fetched twice"
+
+
+def test_clv_sample_is_capped_and_the_same_every_run():
+    from whalewatcher.scoring import ClvPosition, sample_positions
+    positions = [ClvPosition(f"0x{i:03d}", f"t{i}", 0.5, 1, 0.5, 10) for i in range(400)]
+    a = sample_positions(positions, 150, "0xwallet")
+    b = sample_positions(list(reversed(positions)), 150, "0xwallet")
+    assert len(a) == 150 and a == b, "deterministic regardless of input order"
+    assert sample_positions(positions, 150, "0xother") != a, "different wallets, different samples"
+    assert sample_positions(positions, 0, "x") is positions and sample_positions(positions[:10], 150, "x") == positions[:10]
+
+
+async def test_clv_lookups_respect_the_sample_and_skip_unwanted_metrics(app, fake_http):
+    from whalewatcher.scoring import ClvPosition
+    world = World(fake_http)
+    world.price_fn = lambda token, at: 0.6
+    positions = [ClvPosition(f"0x{i:03d}", f"t{i}", 0.5, AS_OF - 30 * DAY, 0.5, AS_OF - DAY) for i in range(300)]
+    clv, n, markout, mn = await compute_clv(positions, app.prices, AS_OF, 24, sample=50, seed="w",
+                                            want_markout=False)
+    assert n == 50 and markout is None and mn == 0
+    assert fake_http.count("/v2/prices-history") == 50, "one lookup per sampled position, no markout lookups"
+    assert clv == pytest.approx(0.1)

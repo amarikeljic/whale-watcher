@@ -28,7 +28,7 @@ import hashlib
 import json
 import logging
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -339,8 +339,14 @@ class DataApi:
         self.base = base.rstrip("/")
 
     async def _pages(self, path: str, params: dict[str, Any], *, max_rows: int | None = None,
-                     max_pages: int | None = None) -> tuple[list[dict], bool]:
-        """Follow ``pagination.next_cursor``; returns (rows, truncated)."""
+                     max_pages: int | None = None,
+                     stop_after_first: Callable[[list[dict]], bool] | None = None) -> tuple[list[dict], bool]:
+        """Follow ``pagination.next_cursor``; returns (rows, truncated).
+
+        ``stop_after_first`` sees the first page when more pages exist; True
+        stops there (truncated), so a caller can decide from one page whether
+        the rest is worth fetching without fetching that page twice.
+        """
         rows: list[dict] = []
         cursor: str | None = None
         pages = 0
@@ -355,6 +361,8 @@ class DataApi:
             cursor = ((payload or {}).get("pagination") or {}).get("next_cursor")
             if not cursor:
                 return rows, False
+            if pages == 1 and stop_after_first is not None and stop_after_first(data):
+                return rows, True
             if (max_rows is not None and len(rows) >= max_rows) or (max_pages is not None and pages >= max_pages):
                 return rows, True
 
@@ -385,7 +393,9 @@ class DataApi:
     async def activity(self, user: str, *, types: Iterable[str] = ("TRADE",), start: int | None = None,
                        end: int | None = None, side: str | None = None,
                        conditions: list[str] | None = None, direction: str = "DESC",
-                       max_rows: int | None = None, page_size: int = 1000) -> tuple[list[Activity], bool]:
+                       max_rows: int | None = None, page_size: int = 1000,
+                       stop_after_first: Callable[[list[dict]], bool] | None = None,
+                       ) -> tuple[list[Activity], bool]:
         params: dict[str, Any] = {
             "user": user, "type": ",".join(types), "limit": page_size,
             "sort_by": "TIMESTAMP", "sort_direction": direction,
@@ -398,7 +408,8 @@ class DataApi:
             params["side"] = side
         if conditions:
             params["condition"] = ",".join(conditions)
-        raw, truncated = await self._pages("/v2/activity", params, max_rows=max_rows)
+        raw, truncated = await self._pages("/v2/activity", params, max_rows=max_rows,
+                                           stop_after_first=stop_after_first)
         rows = [Activity.from_api(r, wallet=user) for r in raw]
         return rows, truncated
 

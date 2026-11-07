@@ -46,7 +46,19 @@ async def test_selection_and_holdout(app, fake_http):
     loosen(app.cfg)
     world = World(fake_http)
     populate(world)
+    loads = []
+    original_ensure = app.markets.ensure
+
+    async def counting_ensure(ids, **kw):
+        loads.append(len(set(ids)))
+        return await original_ensure(ids, **kw)
+
+    app.markets.ensure = counting_ensure
     rep = await run_validation(app, AS_OF, holdout_months=2, min_holdout_positions=3)
+    assert len(loads) == 2, "one market load for the selection, one for the whole holdout"
+    stages = [st.name for st in rep.watch.stages]
+    assert "holdout: markets" in stages and "selection: wallet activity" in stages
+    assert "total" in rep.watch.table()
     by_wallet = {r.wallet: r for r in rep.rows}
     skilled, lucky = by_wallet["0xskilled"], by_wallet["0xlucky"]
     # Selection, at the cutoff: both made money; skilled has the higher ROI (1.5 vs 1.0).

@@ -31,6 +31,7 @@ from .scoring import (
 )
 from .stats_util import cluster_bootstrap_mean_ci, median, spearman
 from .timeutil import add_months
+from .timing import Progress, Stopwatch
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ class ValidationReport:
     selection_roi_n: int
     notes: list[str]
     verdict: str
+    watch: Stopwatch | None = None
 
 
 async def run_validation(app: App, as_of: int, *, holdout_months: int = 2, with_leaderboard: bool = False,
@@ -91,46 +93,70 @@ async def run_validation(app: App, as_of: int, *, holdout_months: int = 2, with_
                          progress: Callable[[str], None] | None = None) -> ValidationReport:
     cfg = app.cfg.scoring
     say = progress or (lambda _m: None)
+    watch = Stopwatch(app.http)
     cutoff = add_months(as_of, -holdout_months)
     notes = []
-    pool, pool_notes = await candidate_pool(app, cutoff, historical=True)
-    notes.extend(pool_notes)
-    if with_leaderboard:
-        live, _ = await candidate_pool(app, cutoff, historical=False)
-        for w, tags in live.items():
-            pool.setdefault(w, set()).update(tags)
-        notes.append("LEAKAGE: --with-leaderboard adds wallets from today's leaderboards, which already "
-                     "reflect the holdout period. Treat the result as optimistic.")
+    with watch.stage("candidate pool"):
+        pool, pool_notes = await candidate_pool(app, cutoff, historical=True)
+        notes.extend(pool_notes)
+        if with_leaderboard:
+            live, _ = await candidate_pool(app, cutoff, historical=False)
+            for w, tags in live.items():
+                pool.setdefault(w, set()).update(tags)
+            notes.append("LEAKAGE: --with-leaderboard adds wallets from today's leaderboards, which already "
+                         "reflect the holdout period. Treat the result as optimistic.")
     say(f"selection at cutoff, {len(pool)} candidates")
     selection = await run_scoring(app, cutoff, kind="validate-selection", pool=pool, extra_notes=notes,
-                                  progress=say)
+                                  progress=say, watch=watch, stage_prefix="selection: ")
 
     scored = [m for m in selection.metrics if not m.truncated]
-    rows: list[HoldoutRow] = []
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(8)
     fetch_start = add_months(cutoff, -cfg.lookback_months) - cfg.entry_lookback_days * DAY
 
-    async def holdout(m: WalletMetrics) -> HoldoutRow:
+    # Holdout rows for every wallet first, then ONE market load for all of them:
+    # per-wallet loads fetched the same new markets once per wallet.
+    say(f"measuring {len(scored)} wallets on the holdout")
+    ticker = Progress(say, "holdout activity", len(scored))
+
+    async def fetch(m: WalletMetrics):
+        async with sem:
+            try:
+                wallet_rows, truncated = await load_wallet_rows(app, m.wallet, fetch_start, as_of,
+                                                                max_rows=cfg.max_activity_rows)
+            except Exception as exc:
+                log.warning("holdout fetch failed for %s: %s", m.wallet, exc)
+                wallet_rows, truncated = [], True
+        ticker.tick()
+        return m, wallet_rows, truncated
+
+    with watch.stage("holdout: wallet activity"):
+        fetched = await asyncio.gather(*(fetch(m) for m in scored))
+    with watch.stage("holdout: markets"):
+        markets = await app.markets.ensure({r.condition_id for _, wr, t in fetched if not t for r in wr})
+
+    rows: list[HoldoutRow] = []
+    clv_jobs: list[tuple[HoldoutRow, list]] = []
+    for m, wallet_rows, truncated in fetched:
         group = "selected" if m.selected else ("passed_rest" if m.passed else "rest")
         row = HoldoutRow(m.wallet, group, m)
-        async with sem:
-            wallet_rows, truncated = await load_wallet_rows(app, m.wallet, fetch_start, as_of,
-                                                            max_rows=cfg.max_activity_rows)
+        rows.append(row)
         if truncated:
-            return row
-        markets = await app.markets.ensure({r.condition_id for r in wallet_rows})
+            continue
         a = analyse(m.wallet, wallet_rows, markets, as_of, cfg, window_start=cutoff, entry_after=cutoff)
         row.n, row.pnl, row.cost = a.metrics.settled_markets, a.metrics.total_pnl, a.metrics.total_cost
         row.roi, row.win_rate = a.metrics.roi, a.metrics.win_rate
         row.market_rois = [s.pnl / s.cost for s in a.settled if s.cost > 0]
         if group in ("selected", "passed_rest") and a.clv_positions:
-            async with sem:
-                row.clv, row.clv_n, row.markout, row.markout_n = await compute_clv(
-                    a.clv_positions, app.prices, as_of, cfg.markout_hours)
-        return row
+            clv_jobs.append((row, a.clv_positions))
 
-    say(f"measuring {len(scored)} wallets on the holdout")
-    rows = list(await asyncio.gather(*(holdout(m) for m in scored)))
+    async def holdout_clv(row: HoldoutRow, positions: list) -> None:
+        async with sem:
+            row.clv, row.clv_n, row.markout, row.markout_n = await compute_clv(
+                positions, app.prices, as_of, cfg.markout_hours, sample=cfg.clv_sample_positions,
+                seed=row.wallet)
+
+    with watch.stage(f"holdout: CLV ({len(clv_jobs)} wallets)"):
+        await asyncio.gather(*(holdout_clv(r, pos) for r, pos in clv_jobs))
 
     groups = [
         _summarise("selected", [r for r in rows if r.group == "selected"], app),
@@ -141,25 +167,35 @@ async def run_validation(app: App, as_of: int, *, holdout_months: int = 2, with_
     if cfg.rank_by in ("clv", "clv_markout"):
         # CLV is only computed for wallets that passed the filters, so a correlation
         # over those alone would test a handful of wallets. Fill it in for every
-        # wallet with holdout data, from selection-period data only.
+        # wallet with holdout data, from selection-period data only, computing only
+        # the metric being tested, on the same seeded sample of positions.
         missing = [r for r in paired if r.selection.rank_value(cfg.rank_by) is None and r.wallet in selection.analyses]
         if missing:
-            say(f"selection-period CLV for {len(missing)} more wallets")
+            say(f"selection-period {cfg.rank_by} for {len(missing)} more wallets")
+            backfill = Progress(say, f"selection {cfg.rank_by}", len(missing))
 
             async def fill(r: HoldoutRow) -> None:
                 async with sem:
                     m = r.selection
-                    m.clv, m.clv_n, m.clv_markout, m.clv_markout_n = await compute_clv(
-                        selection.analyses[r.wallet].clv_positions, app.prices, cutoff, cfg.markout_hours)
+                    clv, clv_n, mk, mk_n = await compute_clv(
+                        selection.analyses[r.wallet].clv_positions, app.prices, cutoff, cfg.markout_hours,
+                        sample=cfg.clv_sample_positions, seed=r.wallet,
+                        want_clv=cfg.rank_by == "clv", want_markout=cfg.rank_by == "clv_markout")
+                    if cfg.rank_by == "clv":
+                        m.clv, m.clv_n = clv, clv_n
+                    else:
+                        m.clv_markout, m.clv_markout_n = mk, mk_n
+                backfill.tick()
 
-            await asyncio.gather(*(fill(r) for r in missing))
+            with watch.stage(f"selection {cfg.rank_by} backfill ({len(missing)} wallets)"):
+                await asyncio.gather(*(fill(r) for r in missing))
     rank_pairs = [(r.selection.rank_value(cfg.rank_by), r.roi) for r in paired
                   if r.selection.rank_value(cfg.rank_by) is not None]
     roi_pairs = [(r.selection.roi, r.roi) for r in paired if r.selection.roi is not None]
     rho_rank = spearman([a for a, _ in rank_pairs], [b for _, b in rank_pairs]) if rank_pairs else None
     rho_roi = spearman([a for a, _ in roi_pairs], [b for _, b in roi_pairs]) if roi_pairs else None
     report = ValidationReport(as_of, cutoff, selection.run_id, cfg.rank_by, groups, rows, rho_rank, rho_roi,
-                              len(rank_pairs), len(roi_pairs), selection.notes, "")
+                              len(rank_pairs), len(roi_pairs), selection.notes, "", watch)
     report.verdict = verdict(report)
     return report
 

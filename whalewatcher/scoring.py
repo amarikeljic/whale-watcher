@@ -17,8 +17,10 @@ Leakage rules, enforced here rather than trusted to callers:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import random
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
@@ -28,6 +30,7 @@ from .config import ScoringConfig
 from .ledger import MarketLedger, build_ledgers, entry_vwap
 from .polymarket import Activity, MarketInfo, assign_fill_keys
 from .timeutil import add_months, iso, month_key, months_in_window
+from .timing import Progress, Stopwatch
 
 log = logging.getLogger(__name__)
 
@@ -195,22 +198,37 @@ def _clv_positions(led: MarketLedger, market: MarketInfo, as_of: int) -> list[Cl
     return out
 
 
+def sample_positions(positions: list[ClvPosition], limit: int, seed: str) -> list[ClvPosition]:
+    """At most ``limit`` positions, the same ones every run for the same wallet (0 = all)."""
+    if limit <= 0 or len(positions) <= limit:
+        return positions
+    ordered = sorted(positions, key=lambda p: (p.condition_id, p.token_id))
+    rng = random.Random(int(hashlib.sha1(seed.encode()).hexdigest()[:12], 16))
+    return rng.sample(ordered, limit)
+
+
 async def compute_clv(positions: list[ClvPosition], prices: PriceLookup, as_of: int,
-                      markout_hours: float) -> tuple[float | None, int, float | None, int]:
+                      markout_hours: float, *, sample: int = 0, seed: str = "",
+                      want_clv: bool = True, want_markout: bool = True,
+                      ) -> tuple[float | None, int, float | None, int]:
     """(clv, n, markout, n) averaged equally across positions.
 
     clv: closing price (last price before the close reference) minus entry VWAP.
     markout: price ``markout_hours`` after the first buy minus that buy's price,
     only where that instant is before both the close reference and ``as_of``.
+    Each costs one price lookup per position, so ``sample`` caps the positions
+    used (a seeded sample) and ``want_*`` skips a metric nobody will read.
     """
     horizon = int(markout_hours * 3600)
+    positions = sample_positions(positions, sample, seed)
 
     async def one(pos: ClvPosition) -> tuple[float | None, float | None]:
-        close = await prices.at(pos.token_id, pos.close_ref_ts - 1)
-        clv = close.price - pos.entry_price if close is not None else None
-        markout = None
+        clv = markout = None
+        if want_clv:
+            close = await prices.at(pos.token_id, pos.close_ref_ts - 1)
+            clv = close.price - pos.entry_price if close is not None else None
         target = pos.first_buy_ts + horizon
-        if target < pos.close_ref_ts and target <= as_of:
+        if want_markout and target < pos.close_ref_ts and target <= as_of:
             point = await prices.at(pos.token_id, target)
             if point is not None:
                 markout = point.price - pos.first_buy_price
@@ -319,22 +337,17 @@ async def load_wallet_rows(app: App, wallet: str, start: int, end: int, *,
             return rows_from_db(app, wallet, end), False
         fetch_start, new_start = max(start, cov["end_ts"] - 3600), cov["start_ts"]
 
-    first, more = await app.data.activity(wallet, types=ACTIVITY_TYPES, start=fetch_start, end=end,
-                                          max_rows=1000)
-    truncated = False
-    if more and first:
+    def too_busy(first_page: list[dict]) -> bool:
         # Rows are newest first. If one page covers only a sliver of the window,
         # the whole window holds far more rows than any person trading by hand.
-        span = max(1, end - min(r.ts for r in first))
-        estimate = len(first) * (end - fetch_start) / span
-        if estimate > max_rows:
-            truncated = True
-            rows = first
-        else:
-            rows, truncated = await app.data.activity(wallet, types=ACTIVITY_TYPES, start=fetch_start,
-                                                      end=end, max_rows=max_rows)
-    else:
-        rows = first
+        if not first_page:
+            return False
+        oldest = min(int(r.get("timestamp") or end) for r in first_page)
+        span = max(1, end - oldest)
+        return len(first_page) * (end - fetch_start) / span > max_rows
+
+    rows, truncated = await app.data.activity(wallet, types=ACTIVITY_TYPES, start=fetch_start, end=end,
+                                              max_rows=max_rows, stop_after_first=too_busy)
     rows = [r for r in rows if r.type in ACTIVITY_TYPES]
     if not truncated:  # a capped wallet is never scored, so its rows are not worth the disk
         assign_fill_keys(rows)
@@ -419,6 +432,7 @@ class ScoreRun:
     notes: list[str]
     sources: dict[str, int]
     analyses: dict[str, WalletAnalysis] = field(default_factory=dict)
+    watch: Stopwatch | None = None
 
     @property
     def selected(self) -> list[WalletMetrics]:
@@ -435,24 +449,27 @@ async def run_scoring(
     extra_notes: Iterable[str] = (),
     save: bool = True,
     progress: Callable[[str], None] | None = None,
+    watch: Stopwatch | None = None,
+    stage_prefix: str = "",
 ) -> ScoreRun:
     cfg = app.cfg.scoring
     say = progress or (lambda _msg: None)
+    watch = watch or Stopwatch(app.http)
     notes = list(extra_notes)
     if pool is None:
-        historical = historical_pool if historical_pool is not None else as_of < app.clock() - 2 * DAY
-        pool, pool_notes = await candidate_pool(app, as_of, historical=historical)
+        with watch.stage(f"{stage_prefix}candidate pool"):
+            historical = historical_pool if historical_pool is not None else as_of < app.clock() - 2 * DAY
+            pool, pool_notes = await candidate_pool(app, as_of, historical=historical)
         notes.extend(pool_notes)
     say(f"candidate pool: {len(pool)} wallets")
     _remember_wallets(app, pool)
 
     window_start = add_months(as_of, -cfg.lookback_months)
     fetch_start = window_start - cfg.entry_lookback_days * DAY
-    sem = asyncio.Semaphore(4)
-    done = 0
+    sem = asyncio.Semaphore(8)
+    ticker = Progress(say, "wallet activity", len(pool))
 
     async def fetch(wallet: str) -> tuple[str, list[Activity], bool]:
-        nonlocal done
         async with sem:
             try:
                 rows, truncated = await load_wallet_rows(app, wallet, fetch_start, as_of,
@@ -460,52 +477,72 @@ async def run_scoring(
             except Exception as exc:  # one wallet failing must not sink the run
                 log.warning("fetch failed for %s: %s", wallet, exc)
                 rows, truncated = [], False
-            done += 1
-            if done % 25 == 0:
-                say(f"fetched {done}/{len(pool)} wallets")
+            ticker.tick()
             return wallet, rows, truncated
 
-    fetched = await asyncio.gather(*(fetch(w) for w in pool))
+    with watch.stage(f"{stage_prefix}wallet activity"):
+        fetched = await asyncio.gather(*(fetch(w) for w in pool))
     conditions = {r.condition_id for _, rows, _ in fetched for r in rows}
     say(f"loading {len(conditions)} markets")
-    markets = await app.markets.ensure(conditions)
+    with watch.stage(f"{stage_prefix}markets"):
+        markets = await app.markets.ensure(conditions)
 
-    analyses: dict[str, WalletAnalysis] = {}
+    rows_by_wallet = {w: rows for w, rows, truncated in fetched if not truncated}
+    analyses: dict[str, WalletAnalysis] = {w: analyse(w, rows, markets, as_of, cfg)
+                                           for w, rows in rows_by_wallet.items()}
+    # Positions opened before the fetched window show up as incomplete markets;
+    # fetch those markets' full histories for every wallet at once, then redo them.
+    incomplete = {w: a.incomplete for w, a in analyses.items() if a.incomplete}
+    if incomplete:
+        say(f"completing older history for {len(incomplete)} wallets")
+        with watch.stage(f"{stage_prefix}older history"):
+            async def complete(wallet: str, conds: list[str]) -> None:
+                async with sem:
+                    try:
+                        await complete_history(app, wallet, conds, as_of)
+                    except Exception as exc:
+                        log.warning("history completion failed for %s: %s", wallet, exc)
+
+            await asyncio.gather(*(complete(w, c) for w, c in incomplete.items()))
+            for w in incomplete:
+                rows_by_wallet[w] = rows_from_db(app, w, as_of)
+            extra = {r.condition_id for w in incomplete for r in rows_by_wallet[w]} - set(markets)
+            if extra:
+                markets.update(await app.markets.ensure(extra))
+            for w in incomplete:
+                analyses[w] = analyse(w, rows_by_wallet[w], markets, as_of, cfg)
+
     metrics: list[WalletMetrics] = []
-    for wallet, rows, truncated in fetched:
+    for wallet, _rows, truncated in fetched:
         if truncated:
             m = WalletMetrics(wallet=wallet, as_of=as_of, truncated=True)
             m.fail_reasons = apply_filters(m, cfg)
             metrics.append(m)
             continue
-        a = analyse(wallet, rows, markets, as_of, cfg)
-        if a.incomplete:
-            await complete_history(app, wallet, a.incomplete, as_of)
-            rows = rows_from_db(app, wallet, as_of)
-            extra = {r.condition_id for r in rows} - set(markets)
-            if extra:
-                markets.update(await app.markets.ensure(extra))
-            a = analyse(wallet, rows, markets, as_of, cfg)
+        a = analyses[wallet]
         a.metrics.fail_reasons = apply_filters(a.metrics, cfg)
         a.metrics.passed = not a.metrics.fail_reasons
-        analyses[wallet] = a
         metrics.append(a.metrics)
 
     survivors = [m for m in metrics if m.passed]
     say(f"{len(survivors)} wallets pass the filters; computing CLV")
+    clv_ticker = Progress(say, "CLV", len(survivors))
 
     async def clv(m: WalletMetrics) -> None:
         async with sem:
             m.clv, m.clv_n, m.clv_markout, m.clv_markout_n = await compute_clv(
-                analyses[m.wallet].clv_positions, app.prices, as_of, cfg.markout_hours)
+                analyses[m.wallet].clv_positions, app.prices, as_of, cfg.markout_hours,
+                sample=cfg.clv_sample_positions, seed=m.wallet)
+        clv_ticker.tick()
 
-    await asyncio.gather(*(clv(m) for m in survivors))
+    with watch.stage(f"{stage_prefix}CLV ({len(survivors)} wallets)"):
+        await asyncio.gather(*(clv(m) for m in survivors))
     ordered = rank_wallets(metrics, cfg)
     sources: dict[str, int] = defaultdict(int)
     for tags in pool.values():
         for tag in tags:
             sources[tag] += 1
-    run = ScoreRun(None, as_of, ordered, notes, dict(sources), analyses)
+    run = ScoreRun(None, as_of, ordered, notes, dict(sources), analyses, watch)
     if save:
         run.run_id = save_run(app, run, kind)
     return run

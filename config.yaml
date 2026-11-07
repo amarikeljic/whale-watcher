@@ -20,6 +20,7 @@ scoring:
   max_unreliable_market_share: 0.25  # markets we cannot account for (neg-risk conversions, transfers)
   markout_hours: 24               # horizon for clv_markout
   min_clv_positions: 10           # fewer CLV data points than this and the wallet cannot be ranked by CLV
+  clv_sample_positions: 150       # seeded sample per wallet for CLV lookups (0 = every position)
 
 candidates:
   leaderboard_periods: [week, month, all]
@@ -59,4 +60,5 @@ rescore:
 api:
   user_agent: "whale-watcher/0.1 (read-only research)"
   timeout_seconds: 20
-  max_concurrency: 8
+  max_concurrency: 16
+  # rate_limits: per host and per endpoint, ~80% of the published limits (see config.py)

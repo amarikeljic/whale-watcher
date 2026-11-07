@@ -71,6 +71,9 @@ def print_score(run, *, show: int, as_of: int) -> None:
         print("\nWhy wallets failed (a wallet can fail several):")
         for reason, count in reasons.most_common():
             print(f"  {reason:28s} {count}")
+    if run.watch is not None and run.watch.stages:
+        print("\nWhere the time went:")
+        print(run.watch.table())
     print("\nclv = closing price minus entry VWAP (spec definition: pre-game for sports, market close otherwise);"
           "\nmarkout24h = price 24h after the first buy minus that buy's price. Outside sports the spec's"
           "\nclosing price is the outcome itself, so clv there mostly repeats realized ROI.")
@@ -108,6 +111,9 @@ def print_validation(rep: ValidationReport) -> None:
                       _f(r.pnl, ",.0f"), _f(r.roi, "+.1%"), _f(r.win_rate, ".0%"), _f(r.clv, "+.3f")]
                      for r in sorted(selected, key=lambda r: r.selection.rank or 0)]))
     print(f"\nVerdict: {rep.verdict}")
+    if rep.watch is not None and rep.watch.stages:
+        print("\nWhere the time went:")
+        print(rep.watch.table())
 
 
 def _setup_logging() -> None:
