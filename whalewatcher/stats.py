@@ -209,7 +209,7 @@ def _render_summary(s: Summary) -> list[str]:
         lines.append("  no settled trades yet, so no P&L.")
     lines.append(f"  avg CLV of paper fills {'-' if s.avg_clv is None else f'{s.avg_clv:+.3f}'} | "
                  f"detection delay {_secs(s.avg_detection_delay)} | fill delay {_secs(s.avg_fill_delay)} "
-                 f"(both from the whale's trade) | latency cost "
+                 f"(from the fill that triggered the alert) | latency cost "
                  f"{'-' if s.avg_latency_cost is None else f'{s.avg_latency_cost:+.3f}'} per share")
     if s.shadow_n:
         lines.append(f"  shadow comparison over {s.shadow_n} settled alerts (missed included): zero-latency "
