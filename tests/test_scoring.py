@@ -280,3 +280,22 @@ async def test_one_mega_event_cannot_fill_the_historical_pool(app, fake_http):
     scanned = {t for _, path, params in fake_http.calls if path == "/v2/trades"
                for t in str(params.get("condition", "")).split(",") if t}
     assert len([c for c in scanned if c.startswith("0xwc")]) == 3, "at most three markets per event"
+
+
+async def test_live_pool_pages_past_trades_newer_than_as_of_and_adds_diverse_markets(app, fake_http):
+    world = World(fake_http)
+    app.cfg.candidates.recent_trades_pages = 1
+    app.cfg.candidates.leaderboard_periods = []
+    # The global feed's first 1,000 large trades are all after as_of (run at midday)...
+    world.global_trades = [{"proxy_wallet": f"0xtoday{i % 50}", "timestamp": AS_OF + 3600 + i, "condition_id": "0xc1",
+                            "side": "BUY", "size": 4000, "price": 0.5, "usdc_size": 2000, "token_id": "t",
+                            "outcome_index": 0} for i in range(1000)]
+    # ...and the ones before as_of are on the next page.
+    world.global_trades += [{"proxy_wallet": "0xyesterday", "timestamp": AS_OF - 3600, "condition_id": "0xc1",
+                             "side": "BUY", "size": 4000, "price": 0.5, "usdc_size": 2000, "token_id": "t",
+                             "outcome_index": 0}]
+    world.add_market(FakeMarket("0xtop", resolved_at=AS_OF - DAY))
+    world.trade("0xdiverse", AS_OF - 5 * DAY, "0xtop", size=4000, price=0.5)
+    pool, _ = await candidate_pool(app, AS_OF, historical=False)
+    assert "0xyesterday" in pool and not any(w.startswith("0xtoday") for w in pool)
+    assert "top_market_large_trades" in pool["0xdiverse"]

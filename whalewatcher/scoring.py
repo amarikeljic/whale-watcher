@@ -418,22 +418,32 @@ async def candidate_pool(app: App, as_of: int, *, historical: bool) -> tuple[dic
                 for e in await app.data.leaderboard(period, category=category, limit=cfg.leaderboard_limit):
                     pool[e.wallet].add(f"leaderboard:{period}:{category}")
                     weight[e.wallet] += abs(e.pnl)
-        trades = await app.data.trades(min_usd=cfg.recent_trades_min_usd, max_pages=cfg.recent_trades_pages)
-        for t in trades:
-            if t.ts <= as_of and t.wallet:
-                pool[t.wallet].add("recent_large_trades")
-                weight[t.wallet] += t.usdc_size
-                breadth[t.wallet].add(t.condition_id)
-    else:
-        conds = await _diverse_top_markets(app, as_of)
-        for i in range(0, len(conds), 20):
-            trades = await app.data.trades(conditions=conds[i:i + 20], min_usd=cfg.historical_min_trade_usd,
-                                           max_pages=3)
-            for t in trades:
-                if t.ts < as_of and t.wallet:
-                    pool[t.wallet].add("historical_large_trades")
+        # The feed is newest first and cannot seek by time. Run during the day with
+        # as_of at midnight, its first pages are all after as_of; keep paging until
+        # recent_trades_pages pages' worth of trades at or before as_of are in.
+        wanted, seen_before = cfg.recent_trades_pages * 1000, 0
+        async for page in app.data.trade_pages(min_usd=cfg.recent_trades_min_usd,
+                                               max_pages=cfg.recent_trades_pages * 4):
+            for t in page:
+                if t.ts <= as_of and t.wallet:
+                    seen_before += 1
+                    pool[t.wallet].add("recent_large_trades")
                     weight[t.wallet] += t.usdc_size
                     breadth[t.wallet].add(t.condition_id)
+            if seen_before >= wanted:
+                break
+    # Large traders across diverse top markets: the historical pool's source, used
+    # live too, so live scoring draws from the same kind of pool `optimize` validated.
+    tag = "historical_large_trades" if historical else "top_market_large_trades"
+    conds = await _diverse_top_markets(app, as_of)
+    for i in range(0, len(conds), 20):
+        trades = await app.data.trades(conditions=conds[i:i + 20], min_usd=cfg.historical_min_trade_usd,
+                                       max_pages=3)
+        for t in trades:
+            if t.ts < as_of and t.wallet:
+                pool[t.wallet].add(tag)
+                weight[t.wallet] += t.usdc_size
+                breadth[t.wallet].add(t.condition_id)
     ranked = sorted(pool, key=lambda w: (-len(pool[w]), -len(breadth[w]), -weight[w], w))[: cfg.max_candidates]
     if len(pool) > len(ranked):
         notes.append(f"candidate pool capped at {len(ranked)} of {len(pool)} wallets")

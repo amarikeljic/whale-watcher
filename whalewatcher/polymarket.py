@@ -433,6 +433,25 @@ class DataApi:
         raw, _ = await self._pages("/v2/trades", params, max_pages=max_pages)
         return [Activity.from_api({**r, "type": "TRADE"}) for r in raw]
 
+    async def trade_pages(self, *, min_usd: float | None = None, taker_only: bool = True,
+                          max_pages: int = 20, page_size: int = 1000):
+        """Pages of the global /v2/trades feed, newest first, for callers that stop
+        once they have seen enough (the feed cannot seek by time)."""
+        params: dict[str, Any] = {"limit": page_size, "taker_only": taker_only}
+        if min_usd:
+            params["filter_type"] = "CASH"
+            params["filter_amount"] = min_usd
+        cursor: str | None = None
+        for _ in range(max_pages):
+            query = dict(params)
+            if cursor:
+                query["cursor"] = cursor
+            payload = await self.http.get_json(f"{self.base}/v2/trades", query)
+            yield [Activity.from_api({**r, "type": "TRADE"}) for r in (payload or {}).get("data") or []]
+            cursor = ((payload or {}).get("pagination") or {}).get("next_cursor")
+            if not cursor:
+                return
+
     # GET /v2/resolutions: condition accepts at most 20 ids. Condition-keyed rows
     # carry resolved_at (RFC3339) and payouts (micro-USDC per share per outcome);
     # UMA rows carry status, last_update_timestamp (epoch string) and price
