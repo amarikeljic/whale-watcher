@@ -34,6 +34,11 @@ python -m whalewatcher health                        # Docker healthcheck
 
 In Docker: `docker compose exec whale-watcher python -m whalewatcher stats`.
 
+Run time: a default `validate` (400 candidates) takes about 12 minutes on an
+empty database and under a minute to re-run once the cache is warm. Both end
+with a table of time and requests per stage. Most of a cold run is price
+lookups for CLV; `scoring.clv_sample_positions` trades precision for speed.
+
 Tests (every network call mocked): `pip install -r requirements-dev.txt && pytest`.
 
 ## How it works
@@ -148,6 +153,12 @@ Each is one sample, not a conclusion.
   |---|---|---|---|
   | 2026-09-01 | +0.04 (n=28) | +0.15 (n=28) | +0.48 (n=27) |
   | 2026-08-01 | +0.09 (n=34) | -0.25 (n=34) | -0.26 (n=30) |
+  | 2026-09-07 (400 candidates) | +0.11 (n=91) | -0.07 (n=91) | - |
+* **Default `validate` on 2026-11-07 (cutoff 2026-09-07, 400 candidates, spec
+  filters).** 3 wallets pass and lose 12.3% overall in the holdout. All 302
+  scored candidates have a mean holdout ROI of **-4.8% per position, 95% CI
+  [-7.4%, -2.0%]**. Large traders as a group lost money before any copying
+  delay, and neither metric picked the exceptions.
 * **Alert pipeline, 25 actively trading wallets (hand-picked to exercise the
   plumbing, not selected by the strategy).** Detection is about 28 s from the
   triggering fill to the alert, and the paper fill lands about 83 s after that
