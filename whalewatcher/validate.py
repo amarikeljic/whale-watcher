@@ -29,7 +29,7 @@ from .scoring import (
     load_wallet_rows,
     run_scoring,
 )
-from .stats_util import bootstrap_mean_ci, median, spearman
+from .stats_util import cluster_bootstrap_mean_ci, median, spearman
 from .timeutil import add_months
 
 log = logging.getLogger(__name__)
@@ -67,6 +67,7 @@ class GroupSummary:
     share_wallets_positive: float | None
     holdout_clv: float | None
     holdout_markout: float | None
+    top_wallet_share: float | None = None   # largest single wallet's share of the group's positions
 
 
 @dataclass
@@ -79,7 +80,8 @@ class ValidationReport:
     rows: list[HoldoutRow]
     spearman_rank_metric: float | None
     spearman_selection_roi: float | None
-    correlation_n: int
+    rank_metric_n: int
+    selection_roi_n: int
     notes: list[str]
     verdict: str
 
@@ -136,13 +138,28 @@ async def run_validation(app: App, as_of: int, *, holdout_months: int = 2, with_
         _summarise("all_scored", rows, app),
     ]
     paired = [r for r in rows if r.n >= min_holdout_positions and r.roi is not None]
+    if cfg.rank_by in ("clv", "clv_markout"):
+        # CLV is only computed for wallets that passed the filters, so a correlation
+        # over those alone would test a handful of wallets. Fill it in for every
+        # wallet with holdout data, from selection-period data only.
+        missing = [r for r in paired if r.selection.rank_value(cfg.rank_by) is None and r.wallet in selection.analyses]
+        if missing:
+            say(f"selection-period CLV for {len(missing)} more wallets")
+
+            async def fill(r: HoldoutRow) -> None:
+                async with sem:
+                    m = r.selection
+                    m.clv, m.clv_n, m.clv_markout, m.clv_markout_n = await compute_clv(
+                        selection.analyses[r.wallet].clv_positions, app.prices, cutoff, cfg.markout_hours)
+
+            await asyncio.gather(*(fill(r) for r in missing))
     rank_pairs = [(r.selection.rank_value(cfg.rank_by), r.roi) for r in paired
                   if r.selection.rank_value(cfg.rank_by) is not None]
     roi_pairs = [(r.selection.roi, r.roi) for r in paired if r.selection.roi is not None]
     rho_rank = spearman([a for a, _ in rank_pairs], [b for _, b in rank_pairs]) if rank_pairs else None
     rho_roi = spearman([a for a, _ in roi_pairs], [b for _, b in roi_pairs]) if roi_pairs else None
     report = ValidationReport(as_of, cutoff, selection.run_id, cfg.rank_by, groups, rows, rho_rank, rho_roi,
-                              len(paired), selection.notes, "")
+                              len(rank_pairs), len(roi_pairs), selection.notes, "")
     report.verdict = verdict(report)
     return report
 
@@ -150,7 +167,10 @@ async def run_validation(app: App, as_of: int, *, holdout_months: int = 2, with_
 def _summarise(name: str, rows: list[HoldoutRow], app: App) -> GroupSummary:
     with_data = [r for r in rows if r.n > 0]
     position_rois = [x for r in with_data for x in r.market_rois]
-    mean, lo, hi = bootstrap_mean_ci(position_rois, samples=min(app.cfg.stats.bootstrap_samples, 5000))
+    # Resample wallets, not positions: positions of one wallet are not independent.
+    mean, lo, hi = cluster_bootstrap_mean_ci([r.market_rois for r in with_data],
+                                             samples=min(app.cfg.stats.bootstrap_samples, 5000))
+    top_share = (max(len(r.market_rois) for r in with_data) / len(position_rois)) if position_rois else None
     pnl, cost = sum(r.pnl for r in with_data), sum(r.cost for r in with_data)
     sel_pnl = sum(r.selection.total_pnl for r in rows)
     sel_cost = sum(r.selection.total_cost for r in rows)
@@ -165,6 +185,7 @@ def _summarise(name: str, rows: list[HoldoutRow], app: App) -> GroupSummary:
         share_wallets_positive=(sum(1 for x in wallet_rois if x > 0) / len(wallet_rois)) if wallet_rois else None,
         holdout_clv=sum(clvs) / len(clvs) if clvs else None,
         holdout_markout=sum(marks) / len(marks) if marks else None,
+        top_wallet_share=top_share,
     )
 
 
@@ -177,11 +198,17 @@ def verdict(report: ValidationReport) -> str:
     if sel.positions < 30:
         return (f"Not enough data to draw conclusions: the selected wallets opened and settled only "
                 f"{sel.positions} positions in the holdout.")
+    caveat = ""
+    if sel.top_wallet_share is not None and sel.top_wallet_share > 0.5:
+        caveat = (f" One wallet supplies {sel.top_wallet_share:.0%} of the selected group's holdout positions, "
+                  "so the group result is mostly that wallet.")
     if sel.ci_low is not None and sel.ci_low > 0 and (base.mean_position_roi is None
                                                      or sel.mean_position_roi > base.mean_position_roi):
         return ("The selected wallets kept outperforming: their mean holdout ROI per position is above zero "
-                "with 95% confidence and above the all-candidates average.")
-    if sel.ci_low is not None and sel.ci_low <= 0 <= (sel.ci_high or 0):
+                "with 95% confidence (wallet-clustered bootstrap) and above the all-candidates average." + caveat)
+    if sel.ci_low is None:
+        return "Too few wallets with holdout data for a confidence interval." + caveat
+    if sel.ci_low <= 0 <= (sel.ci_high or 0):
         return ("The 95% confidence interval for the selected wallets' holdout ROI includes zero: no evidence "
-                "the selection picked wallets that keep winning. Treat it as regression to average.")
-    return "The selected wallets did not outperform in the holdout."
+                "the selection picked wallets that keep winning. Treat it as regression to average." + caveat)
+    return "The selected wallets did not outperform in the holdout." + caveat

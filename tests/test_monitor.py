@@ -192,3 +192,16 @@ async def test_groups_that_never_reach_the_threshold_are_pruned_after_their_wind
     await monitor.poll_once()
     assert live_app.db.one("SELECT COUNT(*) n FROM alerts")["n"] == 0
     assert live_app.db.one("SELECT COUNT(*) n FROM wallet_trades")["n"] == 1, "the fill itself is kept"
+
+
+async def test_an_error_while_alerting_records_the_alert_as_failed(live_app, fake_http, clock):
+    world, monitor, sink = setup(live_app, fake_http)
+
+    def broken(_params):
+        raise RuntimeError("gamma is down")
+
+    fake_http.route("/markets", broken)
+    world.trade(WHALE, NOW - 20, COND, size=1500, price=0.42, usdc=630)
+    await monitor.poll_once()
+    (a,) = alerts(live_app)
+    assert a["status"] == "FAILED" and "gamma is down" in a["skip_reason"] and a["detected_at"] == NOW

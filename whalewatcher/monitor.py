@@ -215,7 +215,15 @@ class Monitor:
         if alert["status"] == "BELOW_THRESHOLD":
             if alert["whale_usd"] < self.cfg.min_whale_trade_usd:
                 return "below"
-            return await self._trigger(alert, fill, counter, lag)
+            try:
+                return await self._trigger(alert, fill, counter, lag)
+            except Exception as exc:
+                # The fill will not come round again, so record the alert rather than lose it.
+                log.warning("alert %s failed: %s", alert_id, exc)
+                app.db.execute(
+                    "UPDATE alerts SET status = 'FAILED', skip_reason = ?, detected_at = ?, trigger_fill_ts = ?, "
+                    "updated_at = ? WHERE id = ?", (f"error: {exc}"[:300], now, fill.ts, now, alert_id))
+                return "failed"
         if alert["status"] == "POSTED" and alert["discord_message_id"]:
             market = app.markets.get(alert["condition_id"])
             message = format_alert(app, alert, market, run_id=alert["snapshot_run_id"], lag=lag)

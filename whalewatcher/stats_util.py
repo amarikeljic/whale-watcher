@@ -41,6 +41,35 @@ def bootstrap_mean_ci(values: Sequence[float], *, samples: int = 10_000, alpha: 
     return m, lo, hi
 
 
+def cluster_bootstrap_mean_ci(groups: Sequence[Sequence[float]], *, samples: int = 10_000, alpha: float = 0.05,
+                              seed: int = 12345) -> tuple[float | None, float | None, float | None]:
+    """CI for the pooled mean when values come in clusters (positions within wallets).
+
+    Resamples whole clusters, so one wallet with hundreds of positions cannot
+    make the interval look tighter than the handful of wallets behind it.
+    """
+    groups = [list(g) for g in groups if g]
+    pooled = [x for g in groups for x in g]
+    if not pooled:
+        return None, None, None
+    m = sum(pooled) / len(pooled)
+    if len(groups) < 2:
+        return m, None, None
+    rng = random.Random(seed)
+    means = []
+    for _ in range(samples):
+        total = count = 0
+        for _ in range(len(groups)):
+            g = groups[rng.randrange(len(groups))]
+            total += sum(g)
+            count += len(g)
+        means.append(total / count)
+    means.sort()
+    lo = means[int(math.floor(alpha / 2 * samples))]
+    hi = means[min(samples - 1, int(math.ceil((1 - alpha / 2) * samples)) - 1)]
+    return m, lo, hi
+
+
 def _ranks(values: Sequence[float]) -> list[float]:
     order = sorted(range(len(values)), key=lambda i: values[i])
     ranks = [0.0] * len(values)

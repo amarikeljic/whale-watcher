@@ -82,18 +82,22 @@ def print_validation(rep: ValidationReport) -> None:
     print(f"  ranked by {rep.rank_by}; selection snapshot run #{rep.selection_run_id}")
     for note in rep.notes:
         print(f"  NOTE: {note}")
-    headers = ("group", "wallets", "w/ data", "positions", "sel_roi", "hold_roi", "mean_pos_roi",
+    headers = ("group", "wallets", "w/ data", "positions", "top_wallet", "sel_roi", "hold_roi", "mean_pos_roi",
                "95% CI", "med_wallet", "%wallets+", "hold_clv", "hold_mk24")
     rows = []
     for g in rep.groups:
         ci = "-" if g.ci_low is None else f"[{g.ci_low:+.1%}, {g.ci_high:+.1%}]"
-        rows.append([g.name, str(g.wallets), str(g.wallets_with_data), str(g.positions), _f(g.selection_roi, "+.1%"),
+        rows.append([g.name, str(g.wallets), str(g.wallets_with_data), str(g.positions),
+                     _f(g.top_wallet_share, ".0%"), _f(g.selection_roi, "+.1%"),
                      _f(g.holdout_roi, "+.1%"), _f(g.mean_position_roi, "+.1%"), ci, _f(g.median_wallet_roi, "+.1%"),
                      _f(g.share_wallets_positive, ".0%"), _f(g.holdout_clv, "+.3f"), _f(g.holdout_markout, "+.3f")])
     print(table(headers, rows))
-    print(f"\n  Spearman(selection {rep.rank_by}, holdout ROI) = {_f(rep.spearman_rank_metric, '+.2f')}   "
-          f"Spearman(selection ROI, holdout ROI) = {_f(rep.spearman_selection_roi, '+.2f')}   "
-          f"(wallets with >= 5 holdout positions: {rep.correlation_n})")
+    print(f"\n  Does the selection metric predict the holdout? Over wallets with >= 5 holdout positions:")
+    print(f"    Spearman(selection {rep.rank_by}, holdout ROI) = {_f(rep.spearman_rank_metric, '+.2f')}"
+          f"  (n={rep.rank_metric_n} wallets)")
+    print(f"    Spearman(selection ROI, holdout ROI) = {_f(rep.spearman_selection_roi, '+.2f')}"
+          f"  (n={rep.selection_roi_n} wallets)")
+    print("    95% CIs resample whole wallets (a wallet's positions are not independent).")
     selected = [r for r in rep.rows if r.group == "selected"]
     if selected:
         print("\nSelected wallets, selection vs holdout:")

@@ -77,3 +77,13 @@ def test_spearman_and_drawdown():
     assert spearman([1, 2, 3, 4], [10, 20, 30, 40]) == pytest.approx(1.0)
     assert spearman([1, 2, 3, 4], [4, 3, 2, 1]) == pytest.approx(-1.0)
     assert max_drawdown([5, -3, -4, 2, 10, -1]) == pytest.approx(7)
+
+
+def test_cluster_bootstrap_is_wider_than_pretending_positions_are_independent():
+    from whalewatcher.stats_util import cluster_bootstrap_mean_ci
+    # One wallet with 200 small wins, three wallets with a few big losses.
+    groups = [[0.05] * 200, [-0.5] * 3, [-0.4] * 2, [-0.6] * 3]
+    m, lo, hi = cluster_bootstrap_mean_ci(groups, samples=3000)
+    flat = bootstrap_mean_ci([x for g in groups for x in g], samples=3000)
+    assert m == pytest.approx(flat[0])
+    assert (hi - lo) > 3 * (flat[2] - flat[1])
