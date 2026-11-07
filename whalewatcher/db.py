@@ -261,6 +261,30 @@ CREATE TABLE IF NOT EXISTS kalshi_quotes (
     PRIMARY KEY (ticker, ts)
 );
 
+-- The fresh-wallet test (fresh.py): large fills per market and each wallet's first trade.
+CREATE TABLE IF NOT EXISTS market_fills (
+    condition_id TEXT NOT NULL,
+    wallet       TEXT NOT NULL,
+    ts           INTEGER NOT NULL,
+    side         TEXT NOT NULL,
+    usdc         REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS market_fills_cond ON market_fills (condition_id);
+
+CREATE TABLE IF NOT EXISTS market_fill_fetches (
+    condition_id TEXT PRIMARY KEY,
+    min_usd      REAL NOT NULL,
+    rows         INTEGER NOT NULL,
+    truncated    INTEGER NOT NULL,
+    fetched_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS wallet_first_trades (
+    wallet      TEXT PRIMARY KEY,
+    first_ts    INTEGER,               -- NULL: no trade found when checked
+    checked_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS kalshi_quote_windows (
     ticker   TEXT NOT NULL,
     start_ts INTEGER NOT NULL,

@@ -284,6 +284,21 @@ async def _backtest(args, cfg) -> int:
     return 0
 
 
+async def _fresh(args, cfg) -> int:
+    from .fresh import describe, run_fresh_wallet_test
+    from .stats import render
+    start = parse_as_of(args.start)
+    end = parse_as_of(args.end) if args.end else start_of_day(now_ts())
+    async with open_app(cfg) as app:
+        rep = await run_fresh_wallet_test(app, start, end, max_age_days=args.max_age_days, min_usd=args.min_usd,
+                                          detect_usd=args.detect_usd, delay=args.delay, write=not args.no_write,
+                                          progress=lambda m: print(f"  .. {m}", file=sys.stderr))
+        print(describe(rep, samples=cfg.stats.bootstrap_samples))
+        if not args.no_write:
+            print("\n" + render(app, with_breakdowns=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m whalewatcher",
                                 description="Find skilled Polymarket wallets and paper trade their entries. "
@@ -342,6 +357,15 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--kalshi", action="store_true",
                     help="also copy each alert on a game Kalshi lists, at Kalshi's own ask (public data, no key)")
 
+    fr = sub.add_parser("fresh-wallets", help="test copying large buys by brand-new wallets in non-sports markets")
+    fr.add_argument("--start", default="2026-05-07", help="markets resolved from this date (UTC)")
+    fr.add_argument("--end", help="...until this date; default: today 00:00 UTC")
+    fr.add_argument("--max-age-days", type=int, default=14, help="a wallet is fresh this long after its first trade")
+    fr.add_argument("--min-usd", type=float, default=1000.0, help="buy group size that counts as a signal")
+    fr.add_argument("--detect-usd", type=float, default=500.0, help="smallest fill read when looking for wallets")
+    fr.add_argument("--delay", type=int, default=90)
+    fr.add_argument("--no-write", action="store_true", help="print only; keep the overview as it is")
+
     for name, helptext in (("monitor", "run the live alert + paper trading loop"),
                            ("settle", "settle open paper trades once"),
                            ("stats", "print paper-trading statistics"),
@@ -382,5 +406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_optimize(args, cfg))
     if args.command == "backtest":
         return asyncio.run(_backtest(args, cfg))
+    if args.command == "fresh-wallets":
+        return asyncio.run(_fresh(args, cfg))
     from . import service  # the live loop and stats, imported lazily
     return asyncio.run(service.run_command(args, cfg))

@@ -542,15 +542,20 @@ def same_alert_comparison(trades: list[SimTrade], markets: dict[str, MarketInfo]
     return lines
 
 
-def write_trades(app: App, trades: list[SimTrade], *, run: dict[str, Any] | None = None) -> None:
-    """Replace every previous backtest row with these, in one transaction."""
+REPLAY_STRATEGIES = (f"{STRATEGY_PREFIX}walk-forward", f"{STRATEGY_PREFIX}spec")
+
+
+def write_trades(app: App, trades: list[SimTrade], *, strategies: tuple[str, ...] = REPLAY_STRATEGIES,
+                 run: dict[str, Any] | None = None, state_key: str = BACKTEST_STATE_KEY) -> None:
+    """Replace the previous rows of ``strategies`` (and only those) with these, in one transaction."""
     now = app.clock()
     with app.db.tx() as conn:
-        conn.execute("DELETE FROM paper_trades WHERE strategy LIKE ?", (f"{STRATEGY_PREFIX}%",))
-        conn.execute("DELETE FROM alert_fills WHERE alert_id IN (SELECT id FROM alerts WHERE status = 'BACKTEST')")
-        conn.execute("DELETE FROM alerts WHERE status = 'BACKTEST'")
+        conn.executemany("DELETE FROM paper_trades WHERE strategy = ?", [(s,) for s in strategies])
+        orphans = "SELECT id FROM alerts WHERE status = 'BACKTEST' AND id NOT IN (SELECT alert_id FROM paper_trades)"
+        conn.execute(f"DELETE FROM alert_fills WHERE alert_id IN ({orphans})")
+        conn.execute(f"DELETE FROM alerts WHERE id IN ({orphans})")
         conn.execute("INSERT OR REPLACE INTO service_state (key, value) VALUES (?, ?)",
-                     (BACKTEST_STATE_KEY, json.dumps({**(run or {}), "written_at": iso(now), "trades": len(trades)})))
+                     (state_key, json.dumps({**(run or {}), "written_at": iso(now), "trades": len(trades)})))
         alert_ids: dict[tuple[str, str, int], int] = {}
         for t in trades:
             e = t.event

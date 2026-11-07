@@ -38,6 +38,7 @@ python -m whalewatcher validate --as-of 2026-11-01   # select before the cutoff,
 python -m whalewatcher optimize                      # walk-forward search for the requirements worth tracking
 python -m whalewatcher backtest                      # simulated paper trades for the past 6 months, shown by `stats`
 python -m whalewatcher backtest --kalshi             # ...and the same alerts copied on Kalshi, where it lists the game
+python -m whalewatcher fresh-wallets                # test copying large buys by brand-new wallets (non-sports)
 python -m whalewatcher monitor [--no-post] [--cycles N]
 python -m whalewatcher settle
 python -m whalewatcher stats [--post]
@@ -398,6 +399,41 @@ The returns per bucket are noise: the buckets were drawn after seeing the data,
 and +16% sits next to -16%. The delay cost is not noise: all of it is in markets
 that resolve within hours, nearly all in-play sports. Where a market resolves
 days later, a copy gets about what the whale got.
+
+## Fresh wallets: copying likely insiders (2026-11-07)
+
+**Also no.** The tracker can never pick a brand-new wallet, and new wallets betting
+big in non-sports markets are the pattern public insider trackers watch. Their
+information could last hours or days, long enough to survive a delay. So
+`python -m whalewatcher fresh-wallets` tests that pattern, under a rule fixed
+before any result was seen (`whalewatcher/fresh.py`):
+- markets: every non-sports market that resolved between 2026-05-07 and
+  2026-11-07 among Gamma's 2,000 highest-volume closed markets per week of end
+  date, plus closed markets with later end dates (they resolved early); chosen by
+  volume and dates, never by outcome;
+- signal: a buy group of $1,000+ within 5 minutes by a wallet whose first
+  Polymarket trade was at most 14 days earlier;
+- copy: 90 s later at the CLOB minute price plus a cent and the fee, held to
+  resolution;
+- verdict: counts only if the 95% CI is above zero.
+
+| | Mean ROI per copy, 95% CI | n |
+|---|---|---|
+| Copied 90 s later (the test) | **-3.1% [-13.3%, +7.7%]** | 13,432 copies, 4,191 wallets, 2,835 events |
+| At the fresh wallet's own price | +0.2% [-7.4%, +8.3%] | 17,182 |
+
+It fails. 15,952 markets, 1.45 million fills of $500+, and 41,226 first-trade
+lookups found 17,800 wallets that were fresh at a large buy and 38,702 signals
+(17,182 inside the 0.05-0.95 price band). As a group, new wallets have no edge
+even at their own price. Whatever insiders are among them are diluted by
+ordinary new accounts and bots. No category's interval is above zero (politics
+-3.5%, crypto -4.3%, geopolitics -5.0%, all with n > 3,000). The few positive
+categories (tech, culture, finance, 55 to 264 copies each) have intervals that
+span zero widely and are not evidence.
+
+The replay prices a copy at the minute price plus a cent. Right after a $1,000+
+buy in a thin market the real ask is often higher, so the true result is likely
+worse.
 
 ## Known limits
 
