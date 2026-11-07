@@ -7,7 +7,8 @@ copying them make money after a realistic reaction delay?
 
 Research tool. It **never places orders**, never asks for or stores wallet keys,
 seed phrases or trading credentials, and publishes no ports. It covers whale
-trades in every market category. Kalshi matching is deferred (see below).
+trades in every market category. Kalshi is used only to test copying the same
+alerts there (`backtest --kalshi`), with public market data and no key.
 
 ## Quick start (home server)
 
@@ -36,6 +37,7 @@ python -m whalewatcher score --as-of 2026-11-01      # Phase 1 table + stored sn
 python -m whalewatcher validate --as-of 2026-11-01   # select before the cutoff, measure after it
 python -m whalewatcher optimize                      # walk-forward search for the requirements worth tracking
 python -m whalewatcher backtest                      # simulated paper trades for the past 6 months, shown by `stats`
+python -m whalewatcher backtest --kalshi             # ...and the same alerts copied on Kalshi, where it lists the game
 python -m whalewatcher monitor [--no-post] [--cycles N]
 python -m whalewatcher settle
 python -m whalewatcher stats [--post]
@@ -136,8 +138,11 @@ that was current when it fired.
 9. **Wallet P&L can be off by taker fees.** Activity rows do not say maker or
    taker. The error is at most about 1.75% of notional. Paper trades compute
    fees exactly.
-10. **Kalshi is deferred.** The verified Kalshi notes, including real UFC
-    name-matching edge cases, are in `docs/API_NOTES.md` for when it returns.
+10. **Kalshi is a backtest venue only.** Live alerts and paper trades are
+    Polymarket's. `backtest --kalshi` matches each copied game-winner alert to
+    the same game on Kalshi and replays the copy there (see "Copying on Kalshi
+    instead"). Only public market-data endpoints are called, so no Kalshi key
+    is needed or stored. The verified notes are in `docs/API_NOTES.md`.
 
 ## First live results (2026-11-07)
 
@@ -311,6 +316,53 @@ What the replay cannot capture: real order books (a minute midpoint plus a
 cent understates the cost of thin books, so the real result is likely worse),
 nightly re-picking (here a period's wallets are fixed), and the true alert-time
 ask. The live paper trades measure all three.
+
+## Copying on Kalshi instead (2026-11-07)
+
+**Also no.** If Kalshi's prices lagged Polymarket's, a copy placed on Kalshi
+could keep the edge that Polymarket prices in within a minute. They do not lag
+enough: even an instant copy at Kalshi's own ask barely clears Kalshi's fee.
+
+`backtest --kalshi` takes every copy from the replay above whose market is a
+game winner, finds the same game on Kalshi (league, date, both teams by code or
+name), and replays the copy there under the same rule, fixed before the run:
+- buy the matching Kalshi contract 90 s after the triggering fill, at Kalshi's
+  real minute ask (Kalshi publishes bid and ask per minute, so no spread is
+  assumed), plus Kalshi's taker fee, held to Kalshi's settlement;
+- skip the copy if the Kalshi market was not trading at alert time or its ask
+  was outside 0.05-0.95;
+- MISSED if the ask rose more than 3 cents between alert time and the fill.
+
+The matcher was checked against settlement before any price was read: of the
+2,764 matched game-winner copies, Kalshi's result agreed with Polymarket's on
+every one. Kalshi took 1,593 of the 3,007 spec-rule copies and 1,008 of the
+1,813 walk-forward copies. Most of the rest are not game-winner markets.
+
+Same alerts, both venues (mean ROI per settled copy, 95% CI, wallets and events
+resampled together):
+
+| Rule | Polymarket copy | Kalshi copy |
+|---|---|---|
+| Walk-forward | -4.7% [-21.1%, +9.7%], n=681 | -2.1% [-15.6%, +9.4%], n=897 |
+| Spec thresholds | -2.1% [-14.9%, +11.1%], n=1,169 | -0.7% [-11.8%, +10.5%], n=1,416 |
+
+Kalshi loses less mostly because it misses fewer copies: its alert-time ask has
+already moved, so fewer fills look like slippage. That is buying the winners
+after their price moved, the same trade as the uncapped Polymarket row above,
+and it earns about nothing.
+
+How much was there on Kalshi at all (the Kalshi shadows over the same copies):
+
+| Kalshi fill | Spec rule | Walk-forward rule |
+|---|---|---|
+| Instant: Kalshi's ask in the minute of the whale's trade | +$84.50 on 1,593 copies (+0.5% each) | +$138.04 on 1,008 (+1.4% each) |
+| At alert time (33 s) | -$111.08 | -$15.78 |
+| 90-150 s (this service) | -$96.12 | -$195.62 |
+
+Kalshi's taker fee, 0.07 x P x (1 - P) a contract (1.75 cents, 3.5% of the
+price, at 50 cents), is 1.4 to 2.3 times Polymarket's on these markets (rates
+0.05 and 0.03, 11% fee-free). What is left of the edge after an instant copy does
+not cover it.
 
 ## Known limits
 

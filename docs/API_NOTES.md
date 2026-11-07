@@ -108,26 +108,50 @@ published webhook API (Execute Webhook with `?wait=true` to get the message id;
 Edit Webhook Message via `PATCH {url}/messages/{id}`; 429s carry `retry_after`
 in the body). Verify on first deployment.
 
-## Kalshi (deferred)
+## Kalshi (backtest cross-venue copies only)
 
-Kalshi matching and paper trading are deferred on request. What was verified,
-for when it comes back (https://docs.kalshi.com/llms.txt, OpenAPI
-https://docs.kalshi.com/openapi.yaml, Trade API v3.36.0):
+Used by `backtest --kalshi` to copy Polymarket alerts on the same game on Kalshi.
+Public market data only, no key, no order/portfolio/account endpoint anywhere
+(https://docs.kalshi.com/llms.txt, OpenAPI https://docs.kalshi.com/openapi.yaml,
+Trade API v3.36.0, verified 2026-11-07).
 
-* Base URL: `https://external-api.kalshi.com/trade-api/v2` (recommended) or
-  `https://api.elections.kalshi.com/trade-api/v2`. Market data needs no auth.
-* `GET /events?series_ticker=KXUFCFIGHT&with_nested_markets=true`,
-  `GET /markets/{ticker}`, `GET /markets/{ticker}/orderbook`.
-* Order book: `orderbook_fp.yes_dollars` / `no_dollars`, `[price, count]`
-  strings, ascending, **bids only**: a YES ask is `1 - best NO bid`.
-* Settlement: `result` in `yes|no|scalar|""`, `settlement_value_dollars`;
-  finalized markets have status `finalized`. UFC draws/no contests settle at
-  $0.50; cancelled fights at "a fair price" (not a refund).
-* Fees: series `fee_type` (`quadratic`, `quadratic_with_maker_fees`, ...) and
-  `fee_multiplier` (1 on most series, 0.5 on some). The base coefficient (0.07)
-  is in https://kalshi.com/docs/kalshi-fee-schedule.pdf, which sits behind a bot
-  check and could not be read; fee rounding is documented at
-  https://docs.kalshi.com/getting_started/fee_rounding.md.
-* Live UFC edge cases: Kalshi dated a card Nov 6 that Polymarket dated Nov 7;
-  "Jose Delano" vs "Jose Mauro Delano"; "Jose Henrique" vs "Jose Henrique
-  Souza"; "Lorenço" vs "Lorenco"; fighter order swapped between venues.
+* Base URL `https://api.elections.kalshi.com/trade-api/v2` (also
+  `https://external-api.kalshi.com/trade-api/v2`).
+* **Live and historical tiers.** Markets (and their candlesticks) settled before
+  `GET /historical/cutoff` -> `market_settled_ts` (2026-09-08T00:00:00Z when
+  checked) exist only under `/historical/...`.
+  https://docs.kalshi.com/getting_started/historical_data.md
+* `GET /historical/markets?series_ticker=..` (limit <= 1000, cursor). On this
+  endpoint `series_ticker`, `tickers`, `event_ticker` and `mve_filter` are
+  mutually exclusive: combining them is a 400.
+* `GET /markets?series_ticker=..&min_close_ts=..` for the live set.
+* `GET /series/{ticker}`: `fee_type`, `fee_multiplier` (1 on most game series,
+  0.5 on `KXMLBGAME`).
+* `GET /historical/markets/{ticker}/candlesticks?start_ts&end_ts&period_interval=1`
+  and, for live markets, `GET /series/{series}/markets/{ticker}/candlesticks`.
+  One candle per minute, every minute, with OHLC of the best **bid and ask**
+  (`yes_bid.close` / `yes_ask.close` archived, `..close_dollars` live), dollar
+  strings. A NO ask is `1 - yes_bid`. Bid `0.0000` / ask `1.0000` mean an empty
+  side.
+* Tickers: event `KXNFLGAME-26OCT04DALHOU` (date as `YYMONDD`, then team codes),
+  market `...-DAL` (team code) or `...-TIE` in soccer. MLB events add the start
+  time and a doubleheader tag: `KXMLBGAME-26SEP251305CHCBOSG1`. Codes often
+  differ from Polymarket's (`LFC`/`CFC` vs `liv`/`che`, `JAC` vs `jax`), and US
+  teams are named by city ("New York G") where Polymarket uses the nickname.
+* Settlement: `result` (`yes`/`no`), `settlement_value_dollars` = what one YES
+  contract paid. Suspended or postponed games can settle at a fractional "fair
+  price" (0.29, 0.47, 0.50 seen) where Polymarket paid in full.
+* Markets trade in-play and close a few minutes after the game ends.
+* Rate limits are token buckets (Basic: 200 tokens/s read, 10 tokens per request,
+  https://docs.kalshi.com/getting_started/rate_limits.md). Unauthenticated reads
+  answered `429 {"error":{"code":"too_many_requests"}}` on bursts of large pages;
+  3 requests/s sustained was fine.
+* Fees: taker fee = round up(fee_multiplier x 0.07 x contracts x P x (1 - P)).
+  The coefficient is in https://kalshi.com/docs/kalshi-fee-schedule.pdf, which
+  answers 429 behind a bot check and was not read. It matches secondary sources
+  and the API's own description of maker fees as 0.25 (or 0.5) of it. Rounding:
+  https://docs.kalshi.com/getting_started/fee_rounding.md (the code rounds up to
+  the cent, the most a member pays).
+* Older UFC edge cases from the first check: Kalshi dated a card Nov 6 that
+  Polymarket dated Nov 7; "Jose Delano" vs "Jose Mauro Delano"; "Lorenço" vs
+  "Lorenco"; fighter order swapped between venues.

@@ -256,11 +256,11 @@ def render(app: App, *, with_breakdowns: bool = True, brief_backtest: bool = Fal
     if simulated:
         lines.append("")
         lines += _backtest_header(app)
-        for (_venue, strategy), group in _per_strategy(simulated):
-            s = summarise(f"{strategy} (SIMULATED)", group, samples=samples)
+        for (venue, strategy), group in _per_strategy(simulated):
+            s = summarise(f"{venue} / {strategy} (SIMULATED)", group, samples=samples)
             lines += _brief_summary(s, threshold) if brief_backtest else _render_summary(s, threshold)
             if with_breakdowns:
-                lines += _breakdown_lines(group, f" ({strategy}, SIMULATED)",
+                lines += _breakdown_lines(group, f" ({venue} / {strategy}, SIMULATED)",
                                           ("month", "category", "entry price", "wallet"))
     lines.append("")
     lines.append("Research and education only. Not financial advice.")

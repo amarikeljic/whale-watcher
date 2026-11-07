@@ -277,7 +277,7 @@ async def _backtest(args, cfg) -> int:
                 say(f"per-wallet dataset written to {args.dataset} (reuse it with --from-dataset)")
         report = await run_backtest(app, folds, delay=args.delay, ask_premium=args.ask_premium,
                                     min_wallets=args.min_wallets, min_alerts=args.min_alerts,
-                                    objective=args.objective, progress=say, watch=watch)
+                                    objective=args.objective, kalshi=args.kalshi, progress=say, watch=watch)
         print(describe(report))
         print("\nWhere the time went:\n" + watch.table())
         print("\n" + render(app, with_breakdowns=args.breakdowns))
@@ -339,6 +339,8 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--min-alerts", type=int, default=50)
     bt.add_argument("--objective", choices=("pooled", "worst"), default="pooled")
     bt.add_argument("--breakdowns", action="store_true", help="also print the per-month/category/wallet tables")
+    bt.add_argument("--kalshi", action="store_true",
+                    help="also copy each alert on a game Kalshi lists, at Kalshi's own ask (public data, no key)")
 
     for name, helptext in (("monitor", "run the live alert + paper trading loop"),
                            ("settle", "settle open paper trades once"),

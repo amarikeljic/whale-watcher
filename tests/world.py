@@ -29,15 +29,22 @@ class FakeMarket:
     question: str = ""
 
     event: str | None = None
+    slug: str | None = None
+    outcomes: tuple[str, str] = ("Yes", "No")
+    sports_market_type: str | None = None
+    event_title: str | None = None
 
     def gamma(self) -> dict[str, Any]:
         closed = self.resolved_at is not None or self.closed_time is not None
         event = self.event or f"e-{self.cond}"
         return {
             "conditionId": self.cond, "question": self.question or f"Will {self.cond} happen?",
-            "slug": f"m-{self.cond}", "events": [{"slug": event, "title": f"Event {event}"}],
+            "slug": self.slug or f"m-{self.cond}",
+            "events": [{"slug": event, "title": self.event_title or f"Event {event}"}],
             "tags": [{"slug": t, "label": t.title()} for t in self.tags],
-            "outcomes": json.dumps(["Yes", "No"]), "clobTokenIds": json.dumps([f"{self.cond}-t0", f"{self.cond}-t1"]),
+            "sportsMarketType": self.sports_market_type,
+            "outcomes": json.dumps(list(self.outcomes)),
+            "clobTokenIds": json.dumps([f"{self.cond}-t0", f"{self.cond}-t1"]),
             "endDate": iso(self.end_date).replace(" ", "T") if self.end_date else None,
             "closed": closed,
             "closedTime": iso(self.closed_time or self.resolved_at).replace("Z", "+00") if closed else None,

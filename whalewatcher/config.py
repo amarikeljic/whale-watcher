@@ -99,6 +99,8 @@ class ApiConfig:
     data_api: str = "https://data-api.polymarket.com"
     gamma_api: str = "https://gamma-api.polymarket.com"
     clob_api: str = "https://clob.polymarket.com"
+    # Kalshi public market data (no key): https://docs.kalshi.com/openapi.yaml servers
+    kalshi_api: str = "https://api.elections.kalshi.com/trade-api/v2"
     user_agent: str = "whale-watcher/0.1 (read-only research)"
     timeout_seconds: float = 20.0
     max_concurrency: int = 16
@@ -116,6 +118,10 @@ class ApiConfig:
             "data-api.polymarket.com/v2/trades": 24.0,
             "gamma-api.polymarket.com": 24.0,
             "clob.polymarket.com": 40.0,
+            # Kalshi meters requests in tokens (Basic tier: 200/s at 10 per request,
+            # https://docs.kalshi.com/getting_started/rate_limits.md). Unauthenticated
+            # reads answered 429 on bursts in testing, so stay well below that.
+            "api.elections.kalshi.com": 3.0,
         }
     )
 

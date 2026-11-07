@@ -49,6 +49,8 @@ from typing import Any
 from .app import App
 from .config import ScoringConfig
 from .fees import fee_model
+from .kalshi import KalshiMarket, KalshiStore, Quote, match, poly_game, quote_at, taker_fee
+from .stats_util import two_way_bootstrap_mean_ci
 from .optimize import LOOSEST, SPEC_REQUIREMENTS, Fold, FoldIndex, FoldWallet, choose, passes_all, search
 from .paper import result_label
 from .polymarket import Activity, MarketInfo
@@ -147,6 +149,8 @@ class SimTrade:
     event: AlertEvent
     strategy: str
     status: str                    # FILLED | MISSED
+    venue: str = VENUE
+    contract: str | None = None    # Kalshi: "<ticker>:<yes|no>"; Polymarket: the token id
     miss_reason: str | None = None
     fill_ts: int | None = None
     fill_price: float | None = None
@@ -241,6 +245,68 @@ async def price_after(app: App, token_id: str, at: int, *, horizon: int = PRICE_
     return found
 
 
+# -- the same copy on Kalshi --------------------------------------------------------------------------
+
+
+def _kalshi_position(price: float | None, stake: float, multiplier: float) -> Shadow | None:
+    if price is None or not 0 < price < 1:
+        return None
+    contracts = stake / price
+    fees = taker_fee(contracts, price, multiplier)
+    return price, contracts, fees, price * contracts + fees
+
+
+def simulate_kalshi(event: AlertEvent, market: KalshiMarket, side: str, quotes: list[Quote], *, strategy: str,
+                    stake: float, delay: int, max_slippage: float, fee_multiplier: float) -> SimTrade:
+    """Copy a Polymarket alert by buying the matching Kalshi contract at Kalshi's own ask.
+
+    Same rule as the Polymarket replay: the alert-time ask is Kalshi's ask when the
+    alert is detected (trigger + 33 s), the fill is at Kalshi's ask ``delay`` seconds
+    after the trigger, MISSED if that is more than ``max_slippage`` above the alert-time
+    ask or the market closed first. Quotes are real minute candles (best bid and ask),
+    so no spread has to be assumed. Taker fee per Kalshi's schedule; settlement at
+    Kalshi's own result, which can differ from Polymarket's (fair-price settlements).
+    """
+    t = SimTrade(event, strategy, "MISSED", venue="kalshi", contract=f"{market.ticker}:{side}")
+    q0 = quote_at(quotes, event.trigger_ts)
+    qa = quote_at(quotes, event.trigger_ts + DETECTION_LAG)
+    alert_ask = qa.ask(side) if qa else None
+    t.zero = _kalshi_position(q0.ask(side) if q0 else None, stake, fee_multiplier)
+    t.atask = _kalshi_position(alert_ask, stake, fee_multiplier)
+    fill_at = event.trigger_ts + delay
+    t.fill_ts = fill_at
+    q = quote_at(quotes, fill_at)
+    ask = q.ask(side) if q else None
+    if not market.open_at(fill_at):
+        t.miss_reason = "market closed before the fill"
+    elif ask is None:
+        t.miss_reason = "no Kalshi offer at the fill"
+    else:
+        t.fill_price = ask
+        if alert_ask is not None and ask - alert_ask > max_slippage + 1e-9:
+            t.miss_reason = f"slippage: fill {ask:.3f} vs alert ask {alert_ask:.3f} (max {max_slippage:g})"
+        else:
+            pos = _kalshi_position(ask, stake, fee_multiplier)
+            assert pos is not None
+            t.status, t.fill_ts = "FILLED", q.ts
+            _, t.contracts, t.fees, t.cost = pos
+    pps = market.payout(side)
+    if pps is not None:
+        filled = t.status == "FILLED"
+
+        def pnl(pos: Shadow | None) -> float | None:
+            return None if pos is None else pos[1] * pps - pos[3]
+
+        t.settled = {
+            "settled_at": market.settled_at or market.close_time, "payout_per_share": pps,
+            "result": result_label(pps) if filled else None,
+            "payout": t.contracts * pps if filled else None,
+            "pnl": (t.contracts * pps - t.cost) if filled else 0.0,
+            "zero_pnl": pnl(t.zero), "atask_pnl": pnl(t.atask),
+        }
+    return t
+
+
 # -- who is copied in each period -----------------------------------------------------------------
 
 
@@ -305,11 +371,12 @@ class BacktestReport:
     delay: int = 90
     ask_premium: float = 0.01
     watch: Stopwatch | None = None
+    comparison: list[str] = field(default_factory=list)
 
 
 async def run_backtest(app: App, folds: list[Fold], *, delay: int = 90, ask_premium: float = 0.01,
                        min_wallets: int = 10, min_alerts: int = 50, objective: str = "pooled", write: bool = True,
-                       progress: Callable[[str], None] | None = None,
+                       kalshi: bool = False, progress: Callable[[str], None] | None = None,
                        watch: Stopwatch | None = None) -> BacktestReport:
     say = progress or (lambda _m: None)
     al, pp = app.cfg.alerts, app.cfg.paper
@@ -380,15 +447,99 @@ async def run_backtest(app: App, folds: list[Fold], *, delay: int = 90, ask_prem
         report.trades.append(simulate(e, markets[e.condition_id], prices.get((e.token_id, e.trigger_ts + delay)),
                                       strategy=plan.strategy, stake=pp.stake_usd, delay=delay,
                                       ask_premium=ask_premium, max_slippage=pp.max_slippage))
+    if kalshi:
+        await _kalshi_copies(app, report, jobs, markets, delay=delay, min_close_ts=min(f.cutoff for f in folds) - 7 * 86_400,
+                             say=say, watch=watch)
+        report.comparison = same_alert_comparison(report.trades, markets, samples=app.cfg.stats.bootstrap_samples)
     if write:
         with watch.stage("write paper trades"):
             write_trades(app, report.trades, run={
-                "delay": delay, "ask_premium": ask_premium, "objective": objective,
+                "delay": delay, "ask_premium": ask_premium, "objective": objective, "kalshi": kalshi,
                 "periods": [{"strategy": p.strategy, "start": iso(p.fold.cutoff), "end": iso(p.fold.end),
                              "wallets": len(p.wallets), "passed": p.passed,
                              "requirements": {k: v for k, v in p.requirements.items() if v != LOOSEST[k]}}
                             for p in plans]})
     return report
+
+
+async def _kalshi_copies(app: App, report: BacktestReport, jobs: list[tuple[PeriodPlan, AlertEvent]],
+                         markets: dict[str, MarketInfo], *, delay: int, min_close_ts: int,
+                         say: Callable[[str], None], watch: Stopwatch) -> None:
+    """The Kalshi twin of every Polymarket copy whose game Kalshi also lists."""
+    al, pp = app.cfg.alerts, app.cfg.paper
+    store = KalshiStore(app)
+    games = {cid: poly_game(markets[cid]) for cid in {e.condition_id for _, e in jobs}}
+    with watch.stage("kalshi markets"):
+        index = await store.index({g.league for g in games.values() if g}, min_close_ts=min_close_ts)
+    legs = {cid: match(markets[cid], index) for cid, g in games.items() if g}
+    todo = []
+    for plan, e in jobs:
+        label = f"{plan.strategy} on kalshi"
+        leg = (legs.get(e.condition_id) or {}).get(e.outcome_index) if e.outcome_index is not None else None
+        if leg is None:
+            why = "no matching Kalshi game" if games.get(e.condition_id) else "not a game-winner market"
+            report.skipped[(label, why)] += 1
+            continue
+        km = index.by_ticker[leg.ticker]
+        if not km.open_at(e.trigger_ts + DETECTION_LAG):
+            report.skipped[(label, "Kalshi market not open at alert time")] += 1
+            continue
+        todo.append((plan, e, km, leg.side))
+    need: dict[str, set[int]] = defaultdict(set)
+    for _, e, km, _ in todo:
+        need[km.ticker].update((e.trigger_ts, e.trigger_ts + DETECTION_LAG, e.trigger_ts + delay))
+    quotes: dict[str, list[Quote]] = {}
+    ticker = Progress(say, "Kalshi quotes", len(need))
+    sem = asyncio.Semaphore(4)
+
+    async def load(tk: str) -> None:
+        async with sem:
+            try:
+                quotes[tk] = await store.quotes(index.by_ticker[tk], need[tk])
+            except Exception as exc:
+                log.warning("Kalshi quotes for %s failed: %s", tk, exc)
+                quotes[tk] = []
+        ticker.tick()
+
+    with watch.stage("kalshi quotes (minute candles)"):
+        await asyncio.gather(*(load(tk) for tk in need))
+    for plan, e, km, side in todo:
+        label = f"{plan.strategy} on kalshi"
+        qa = quote_at(quotes.get(km.ticker) or [], e.trigger_ts + DETECTION_LAG)
+        ask = qa.ask(side) if qa else None
+        if ask is None:
+            report.skipped[(label, "no Kalshi offer at alert time")] += 1
+        elif not al.min_price <= ask <= al.max_price:
+            report.skipped[(label, f"price outside {al.min_price:g}-{al.max_price:g}")] += 1
+        else:
+            report.trades.append(simulate_kalshi(e, km, side, quotes[km.ticker], strategy=plan.strategy,
+                                                 stake=pp.stake_usd, delay=delay, max_slippage=pp.max_slippage,
+                                                 fee_multiplier=store.fee_multiplier(km.series)))
+
+
+def same_alert_comparison(trades: list[SimTrade], markets: dict[str, MarketInfo], *, samples: int) -> list[str]:
+    """Each venue's mean ROI per settled copy, on exactly the alerts copied on both."""
+    def key(t: SimTrade) -> tuple:
+        e = t.event
+        return t.strategy, e.wallet, e.token_id, e.first_fill_ts
+
+    poly = {key(t): t for t in trades if t.venue == VENUE}
+    lines = []
+    for strategy in sorted({t.strategy for t in trades if t.venue == "kalshi"}):
+        pairs = [(poly[key(t)], t) for t in trades if t.venue == "kalshi" and t.strategy == strategy and key(t) in poly]
+        lines.append(f"  {strategy}: {len(pairs)} alerts copied on both venues")
+        for name, pick in (("Polymarket", 0), ("Kalshi", 1)):
+            st = [p[pick] for p in pairs if p[pick].status == "FILLED" and p[pick].settled]
+            if not st:
+                lines.append(f"    {name:10s} no settled copies")
+                continue
+            ev = [markets[t.event.condition_id].event_slug or t.event.condition_id for t in st]
+            m, lo, hi = two_way_bootstrap_mean_ci([t.settled["pnl"] / t.cost for t in st], [t.event.wallet for t in st],
+                                                  ev, samples=samples)
+            ci = "no CI" if lo is None else f"95% CI [{lo:+.1%}, {hi:+.1%}]"
+            lines.append(f"    {name:10s} mean ROI per settled copy {m:+.1%}, {ci}, n={len(st)} "
+                         f"({len({t.event.wallet for t in st})} wallets, {len(set(ev))} events)")
+    return lines
 
 
 def write_trades(app: App, trades: list[SimTrade], *, run: dict[str, Any] | None = None) -> None:
@@ -422,7 +573,8 @@ def write_trades(app: App, trades: list[SimTrade], *, run: dict[str, Any] | None
                 "zero_price, zero_contracts, zero_fees, zero_cost, atask_price, atask_contracts, atask_fees, "
                 "atask_cost, settled_at, settle_result, payout_per_share, payout, pnl, zero_pnl, atask_pnl, "
                 "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (alert_ids[key], VENUE, t.strategy, t.status, t.miss_reason, e.token_id, e.condition_id,
+                (alert_ids[key], t.venue, t.strategy, t.status, t.miss_reason,
+                 e.token_id if t.venue == VENUE else f"kalshi:{t.contract}", e.condition_id,
                  app.cfg.paper.stake_usd, 0, e.trigger_ts + DETECTION_LAG, atask[0], t.fill_ts, t.fill_price,
                  t.contracts, t.fees, t.cost, None, *zero, *atask, s.get("settled_at"), s.get("result"),
                  s.get("payout_per_share"), s.get("payout"), s.get("pnl"), s.get("zero_pnl"), s.get("atask_pnl"),
@@ -441,17 +593,22 @@ def describe(report: BacktestReport) -> str:
         lines.append(f"  {'':22s} {p.note}")
     by: dict[str, Counter] = defaultdict(Counter)
     for t in report.trades:
-        by[t.strategy]["paper trades"] += 1
-        by[t.strategy][t.status.lower()] += 1
+        label = t.strategy if t.venue == VENUE else f"{t.strategy} on {t.venue}"
+        by[label]["paper trades"] += 1
+        by[label][t.status.lower()] += 1
         if t.status == "MISSED":
-            by[t.strategy]["missed: " + (t.miss_reason or "").split(":")[0]] += 1
+            by[label]["missed: " + (t.miss_reason or "").split(":")[0]] += 1
         elif t.settled:
-            by[t.strategy]["settled"] += 1
+            by[label]["settled"] += 1
     for (strategy, reason), n in report.skipped.items():
         by[strategy][f"no trade: {reason}"] += n
     lines.append("")
     for strategy, c in sorted(by.items()):
         lines.append(f"  {strategy}: " + ", ".join(f"{k} {v}" for k, v in sorted(c.items())))
+    if report.comparison:
+        lines.append("")
+        lines.append("Same alerts, both venues (the copies Kalshi could take, and their Polymarket twins):")
+        lines += report.comparison
     lines.append("")
     lines.append("The results are in `python -m whalewatcher stats`, labelled SIMULATED, apart from live trades.")
     return "\n".join(lines)

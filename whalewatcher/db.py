@@ -226,6 +226,47 @@ CREATE TABLE IF NOT EXISTS service_state (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 );
+
+-- Kalshi public market data, cached for the backtest's cross-venue copies.
+CREATE TABLE IF NOT EXISTS kalshi_markets (
+    ticker               TEXT PRIMARY KEY,
+    event_ticker         TEXT NOT NULL,
+    series_ticker        TEXT NOT NULL,
+    name                 TEXT,             -- yes_sub_title
+    status               TEXT,
+    result               TEXT,
+    settlement_value     REAL,             -- what one YES contract paid
+    open_time            INTEGER,
+    close_time           INTEGER,
+    expected_expiration  INTEGER,
+    settled_at           INTEGER,
+    archived             INTEGER NOT NULL, -- settled before the historical cutoff
+    fetched_at           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS kalshi_markets_series ON kalshi_markets (series_ticker);
+
+CREATE TABLE IF NOT EXISTS kalshi_series (
+    ticker          TEXT PRIMARY KEY,
+    fee_type        TEXT,
+    fee_multiplier  REAL,
+    markets_fetched_at INTEGER,            -- when the series' market list was last read
+    fetched_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kalshi_quotes (
+    ticker   TEXT NOT NULL,
+    ts       INTEGER NOT NULL,             -- end of the one-minute candle
+    yes_bid  REAL,
+    yes_ask  REAL,
+    PRIMARY KEY (ticker, ts)
+);
+
+CREATE TABLE IF NOT EXISTS kalshi_quote_windows (
+    ticker   TEXT NOT NULL,
+    start_ts INTEGER NOT NULL,
+    end_ts   INTEGER NOT NULL,
+    PRIMARY KEY (ticker, start_ts, end_ts)
+);
 """
 
 
