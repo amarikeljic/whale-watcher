@@ -1,0 +1,280 @@
+"""SQLite storage. All times are UTC epoch seconds (INTEGER); convert only for display.
+
+Plain ``sqlite3`` rather than an async driver: the service writes a few rows a
+minute, every statement takes well under a millisecond, and a synchronous
+connection keeps the code and the tests simple.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS wallets (
+    address      TEXT PRIMARY KEY,
+    name         TEXT,
+    sources      TEXT,             -- JSON list: where the wallet entered the candidate pool
+    first_seen   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+
+-- Activity rows from /v2/activity: TRADE, SPLIT, MERGE, REDEEM, CONVERSION.
+-- Market text (title, slug) lives in poly_markets: repeating it on every fill
+-- made this table ~400 bytes a row heavier.
+CREATE TABLE IF NOT EXISTS wallet_trades (
+    id            INTEGER PRIMARY KEY,
+    wallet        TEXT NOT NULL,
+    ts            INTEGER NOT NULL,   -- block timestamp of the fill
+    type          TEXT NOT NULL,
+    condition_id  TEXT NOT NULL,
+    token_id      TEXT,
+    outcome       TEXT,
+    outcome_index INTEGER,
+    side          TEXT,
+    size          REAL,
+    usdc_size     REAL,
+    price         REAL,
+    tx_hash       TEXT,
+    fill_key      TEXT NOT NULL UNIQUE,   -- sha1 of the fill's fields (see polymarket.assign_fill_keys)
+    seen_at       INTEGER NOT NULL    -- when this service first saw the row
+);
+CREATE INDEX IF NOT EXISTS wallet_trades_wallet_ts ON wallet_trades (wallet, ts);
+CREATE INDEX IF NOT EXISTS wallet_trades_wallet_cond ON wallet_trades (wallet, condition_id);
+
+-- Which time ranges of a wallet's activity are already stored, so a rescore
+-- only fetches what is new.
+CREATE TABLE IF NOT EXISTS wallet_fetches (
+    wallet      TEXT NOT NULL,
+    start_ts    INTEGER NOT NULL,
+    end_ts      INTEGER NOT NULL,
+    rows        INTEGER NOT NULL,
+    truncated   INTEGER NOT NULL DEFAULT 0,
+    fetched_at  INTEGER NOT NULL,
+    PRIMARY KEY (wallet, start_ts, end_ts)
+);
+
+CREATE TABLE IF NOT EXISTS poly_markets (
+    condition_id      TEXT PRIMARY KEY,
+    question          TEXT,
+    slug              TEXT,
+    event_slug        TEXT,
+    event_title       TEXT,
+    category          TEXT,
+    tags              TEXT,            -- JSON list of tag slugs
+    outcomes          TEXT,            -- JSON list
+    token_ids         TEXT,            -- JSON list, same order as outcomes
+    end_date          INTEGER,
+    closed            INTEGER,
+    closed_time       INTEGER,
+    game_start_time   INTEGER,
+    sports_market_type TEXT,
+    neg_risk          INTEGER,
+    accepting_orders  INTEGER,
+    fees_enabled      INTEGER,
+    fee_rate          REAL,
+    fee_exponent      REAL,
+    fee_taker_only    INTEGER,
+    description       TEXT,            -- resolution rules
+    resolution_source TEXT,
+    resolved          INTEGER NOT NULL DEFAULT 0,
+    resolved_at       INTEGER,
+    payouts           TEXT,            -- JSON list, per outcome index, dollars per share
+    meta_fetched_at   INTEGER,
+    resolution_checked_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS price_snapshots (
+    token_id          TEXT NOT NULL,
+    at_ts             INTEGER NOT NULL,  -- the instant asked about
+    price             REAL,              -- NULL: asked, and there was no observation
+    observed_ts       INTEGER,
+    resolution_seconds INTEGER,
+    source            TEXT NOT NULL,     -- 'prices-history-as-of', 'book-ask', ...
+    fetched_at        INTEGER NOT NULL,
+    PRIMARY KEY (token_id, at_ts, source)
+);
+
+CREATE TABLE IF NOT EXISTS score_runs (
+    id             INTEGER PRIMARY KEY,
+    as_of          INTEGER NOT NULL,
+    kind           TEXT NOT NULL,        -- score | nightly | validate-selection
+    created_at     INTEGER NOT NULL,
+    config_json    TEXT NOT NULL,
+    sources_json   TEXT NOT NULL,
+    n_candidates   INTEGER NOT NULL,
+    n_passed       INTEGER NOT NULL,
+    notes          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS wallet_score_snapshots (
+    run_id                  INTEGER NOT NULL REFERENCES score_runs(id),
+    wallet                  TEXT NOT NULL,
+    as_of                   INTEGER NOT NULL,
+    settled_markets         INTEGER,
+    total_pnl               REAL,
+    total_cost              REAL,
+    roi                     REAL,
+    profitable_months       INTEGER,
+    months_in_window        INTEGER,
+    max_single_market_share REAL,
+    avg_stake_usd           REAL,
+    days_since_last_trade   REAL,
+    two_sided_ratio         REAL,
+    clv                     REAL,
+    clv_n                   INTEGER,
+    clv_markout             REAL,
+    clv_markout_n           INTEGER,
+    win_rate                REAL,
+    unreliable_markets      INTEGER,
+    activity_rows           INTEGER,
+    passed                  INTEGER NOT NULL,
+    fail_reasons            TEXT,         -- JSON list
+    rank                    INTEGER,
+    selected                INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, wallet)
+);
+
+CREATE TABLE IF NOT EXISTS monitored_wallets (
+    wallet        TEXT PRIMARY KEY,
+    run_id        INTEGER NOT NULL,      -- snapshot that put it here
+    rank          INTEGER,
+    active        INTEGER NOT NULL DEFAULT 1,
+    added_at      INTEGER NOT NULL,
+    removed_at    INTEGER,
+    last_polled_at INTEGER,
+    last_seen_ts  INTEGER                -- newest fill timestamp seen
+);
+
+-- A group of one wallet's buys of one outcome token inside the dedupe window.
+CREATE TABLE IF NOT EXISTS alerts (
+    id               INTEGER PRIMARY KEY,
+    wallet           TEXT NOT NULL,
+    condition_id     TEXT NOT NULL,
+    token_id         TEXT NOT NULL,
+    outcome          TEXT,
+    kind             TEXT NOT NULL,       -- NEW | ADD
+    first_fill_ts    INTEGER NOT NULL,    -- whale trade time (first fill of the group)
+    last_fill_ts     INTEGER NOT NULL,
+    trigger_fill_ts  INTEGER,             -- the fill that took the group over the threshold
+    whale_shares     REAL NOT NULL,
+    whale_usd        REAL NOT NULL,
+    whale_price      REAL NOT NULL,       -- VWAP of the group's fills
+    fills            INTEGER NOT NULL,
+    detected_at      INTEGER NOT NULL,    -- when this service saw the fill that crossed the threshold
+    posted_at        INTEGER,             -- when the webhook accepted it (NULL if skipped / not posted)
+    status           TEXT NOT NULL,       -- POSTED | SKIPPED | UNSENT (no webhook) | FAILED
+    skip_reason      TEXT,
+    alert_best_ask   REAL,
+    alert_best_bid   REAL,
+    alert_book_ts    INTEGER,
+    snapshot_run_id  INTEGER,             -- score run current when the alert fired
+    discord_message_id TEXT,
+    message          TEXT,
+    updated_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS alerts_group ON alerts (wallet, token_id, first_fill_ts);
+
+CREATE TABLE IF NOT EXISTS alert_fills (
+    alert_id   INTEGER NOT NULL REFERENCES alerts(id),
+    fill_key   TEXT NOT NULL,
+    PRIMARY KEY (alert_id, fill_key)
+);
+
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id               INTEGER PRIMARY KEY,
+    alert_id         INTEGER NOT NULL REFERENCES alerts(id),
+    venue            TEXT NOT NULL,       -- polymarket
+    strategy         TEXT NOT NULL,       -- hold_to_resolution
+    status           TEXT NOT NULL,       -- PENDING | FILLED | MISSED | SETTLED
+    miss_reason      TEXT,
+    token_id         TEXT NOT NULL,
+    condition_id     TEXT NOT NULL,
+    stake_usd        REAL NOT NULL,
+    due_poll         INTEGER NOT NULL,    -- poll counter value at which to fill
+    alert_ts         INTEGER NOT NULL,
+    alert_ask        REAL,
+    fill_ts          INTEGER,
+    fill_price       REAL,                -- VWAP of the walk, before fees
+    contracts        REAL,
+    fees             REAL,
+    cost             REAL,                -- fill_price * contracts + fees
+    levels_walked    INTEGER,
+    -- shadow fills, hypothetical, never part of the headline numbers
+    zero_price       REAL, zero_contracts REAL, zero_fees REAL, zero_cost REAL,
+    atask_price      REAL, atask_contracts REAL, atask_fees REAL, atask_cost REAL,
+    -- settlement
+    settled_at       INTEGER,
+    settle_result    TEXT,                -- WIN | LOSS | SPLIT | REFUND
+    payout_per_share REAL,
+    payout           REAL,
+    pnl              REAL,
+    zero_pnl         REAL,
+    atask_pnl        REAL,
+    closing_price    REAL,                -- for CLV of the paper fill
+    updated_at       INTEGER NOT NULL,
+    UNIQUE (alert_id, venue, strategy)
+);
+
+CREATE TABLE IF NOT EXISTS service_state (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+"""
+
+
+class Database:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        if path != ":memory:":
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute("PRAGMA busy_timeout = 5000")
+        self.conn.executescript(SCHEMA)
+        self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def close(self) -> None:
+        self.conn.close()
+
+    @contextmanager
+    def tx(self) -> Iterator[sqlite3.Connection]:
+        self.conn.execute("BEGIN")
+        try:
+            yield self.conn
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+        else:
+            self.conn.execute("COMMIT")
+
+    def execute(self, sql: str, params: Iterable[Any] | dict[str, Any] = ()) -> sqlite3.Cursor:
+        return self.conn.execute(sql, params)
+
+    def query(self, sql: str, params: Iterable[Any] | dict[str, Any] = ()) -> list[sqlite3.Row]:
+        return self.conn.execute(sql, params).fetchall()
+
+    def one(self, sql: str, params: Iterable[Any] | dict[str, Any] = ()) -> sqlite3.Row | None:
+        return self.conn.execute(sql, params).fetchone()
+
+    # -- service state ------------------------------------------------------------
+
+    def get_state(self, key: str, default: Any = None) -> Any:
+        row = self.one("SELECT value FROM service_state WHERE key = ?", (key,))
+        return default if row is None else json.loads(row["value"])
+
+    def set_state(self, key: str, value: Any) -> None:
+        self.execute(
+            "INSERT INTO service_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, json.dumps(value)),
+        )

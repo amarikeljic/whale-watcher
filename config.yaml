@@ -1,0 +1,61 @@
+# Whale Watcher configuration. Secrets go in .env, never here.
+# Every key is optional; anything left out takes the default in whalewatcher/config.py.
+
+database_path: data/whalewatcher.sqlite3
+
+scoring:
+  lookback_months: 6
+  min_settled_markets: 50
+  min_profitable_months: 4        # out of the calendar months in the lookback window
+  max_single_market_share: 0.30   # largest market's P&L / total P&L
+  min_avg_stake_usd: 100
+  max_days_since_last_trade: 30
+  max_two_sided_ratio: 0.40
+  min_roi: 0.05
+  top_k: 20                       # wallets to actively monitor
+  rank_by: clv                    # clv | clv_markout | roi | total_pnl
+  # Additions not in the original spec (see README "Deviations"):
+  entry_lookback_days: 180        # look this far before the window for entries in markets that settle inside it
+  max_activity_rows: 20000        # busier wallets are bots/market makers; skipped before the full fetch
+  max_unreliable_market_share: 0.25  # markets we cannot account for (neg-risk conversions, transfers)
+  markout_hours: 24               # horizon for clv_markout
+  min_clv_positions: 10           # fewer CLV data points than this and the wallet cannot be ranked by CLV
+
+candidates:
+  leaderboard_periods: [week, month, all]
+  leaderboard_categories: [overall]
+  leaderboard_limit: 100          # per period x category
+  recent_trades_min_usd: 1000     # "large traders seen in recent trade data"
+  recent_trades_pages: 5          # pages of 1000 trades from the global feed
+  historical_markets: 60          # leak-free pool for past as_of dates: top markets by volume
+  historical_min_trade_usd: 1000
+  max_candidates: 400
+
+alerts:
+  poll_interval_seconds: 60
+  min_whale_trade_usd: 500
+  dedupe_window_seconds: 300
+  min_price: 0.05
+  max_price: 0.95
+
+paper:
+  stake_usd: 10
+  reaction_polls: 1
+  max_slippage: 0.03
+  strategy: hold_to_resolution
+  settle_interval_seconds: 600
+
+stats:
+  min_settled_for_conclusions: 30
+  bootstrap_samples: 10000
+  daily_summary_hour_utc: 13
+
+rescore:
+  enabled: true
+  hour_utc: 0
+  minute_utc: 20
+
+api:
+  user_agent: "whale-watcher/0.1 (read-only research)"
+  timeout_seconds: 20
+  max_concurrency: 8

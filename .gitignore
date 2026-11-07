@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Local data: the database is rebuilt from the APIs, except paper trades and
+# alerts, which live on the mounted volume on the server.
+data/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+exports/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Editors
+.idea/
+.vscode/
+*.log
