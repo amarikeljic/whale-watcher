@@ -210,8 +210,9 @@ What this supports:
   or `worst`). That is what a weak signal looks like.
 
 The profile below is a judgment call, not a proven optimum. It is the only rule
-positive in all three periods, it passed its one honest test, and it keeps
-roughly 15-20 wallets to watch:
+positive in all three periods and it passed its one honest test. It kept 14-22
+wallets per historical period, and 10 wallets on 2026-11-07's live pool (400 of
+5,633 candidates):
 
 ```yaml
 scoring:
