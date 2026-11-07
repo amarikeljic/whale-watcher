@@ -20,6 +20,15 @@ docker compose logs -f
 On first start it scores wallets (10 to 30 minutes), monitors the top 20, and
 then polls every 60 seconds. Data lives in `./data/whalewatcher.sqlite3`.
 
+Live paper trades take weeks to settle in numbers worth reading. To see what
+the strategy would have made over the last six months now, run the backtest
+once (about 30 minutes on an empty database). Its trades appear in `stats`
+under SIMULATED, apart from the live ones:
+
+```bash
+docker compose exec whale-watcher python -m whalewatcher backtest --dataset data/optimize-folds.json
+```
+
 ## Commands
 
 ```bash
@@ -75,9 +84,17 @@ costs.
 
 **Phase 5, stats** (`stats.py`). Covers counts, P&L, ROI, win rate, mean ROI
 per trade with a 95% bootstrap CI, CLV of the paper fills, delays, latency
-cost, drawdown and the shadow comparison. Breakdowns by wallet, category,
-venue and entry price. Under 30 settled trades the output leads with a warning,
-and no profit number appears without its n and CI.
+cost, drawdown and the shadow comparison. The CI resamples wallets and events
+together, because one wallet's repeated buys, or several wallets on one event,
+are not independent results. Breakdowns by month, wallet, category, venue and
+entry price. Under 30 settled live trades the output leads with a warning,
+each strategy below 30 carries its own, and no profit number appears without
+its n and CI.
+
+**Backtest** (`backtest.py`). Replays past periods as simulated paper trades,
+written as strategy `backtest:*`. `stats` shows them in their own section,
+labelled SIMULATED, never mixed into the live numbers. See "Would copying have
+made money?" below.
 
 **Phase 6, walk-forward** (`service.py`). It rescores nightly with data up to
 that day, rotates the monitored set, and links every alert to the snapshot
@@ -99,7 +116,8 @@ that was current when it fired.
    On 38 resolved non-sports markets the median gap between that price and the
    final payout was 0.001; on 22 sports markets the pre-game price differed
    from the payout by 0.455. So for non-sports markets `clv` mostly repeats
-   realized return. The spec's `clv` is kept as the default `rank_by`, and
+   realized return. The spec's `clv` is kept as the code default `rank_by`
+   (the shipped `config.yaml` ranks by `roi`, see below), and
    `clv_markout` (price 24h after the first buy, minus that buy's price) is
    computed alongside it. Use `validate --rank-by` to see which one predicts.
 5. **Candidate pool leakage.** Using today's leaderboard to choose candidates
@@ -213,7 +231,8 @@ What this supports:
 The profile below is a judgment call, not a proven optimum. It is the only rule
 positive in all three periods and it passed its one honest test. It kept 14-22
 wallets per historical period, and 10 wallets on 2026-11-07's live pool (400 of
-5,633 candidates):
+5,633 candidates). These ROIs are at the whale's own price. With this service's
+copy delay the same rule lost money in its honest test (next section):
 
 ```yaml
 scoring:
@@ -227,6 +246,71 @@ scoring:
   rank_by: roi
   top_k: 20
 ```
+
+## Would copying have made money? The backtest (2026-11-07)
+
+**No.** Replaying the last six months the way this service runs, copying lost
+money. The whales' edge was real at their own price, but the market priced it
+in within about a minute, before a 60-second poller can buy.
+
+`python -m whalewatcher backtest` uses the same three periods as `optimize`. At
+each period's start it picks wallets with earlier data only, ranks them like
+scoring and keeps `top_k`. It then copies every alert-worthy buy group those
+wallets placed during the period. Each copy fills 90 s after the fill that
+triggered the alert (detection plus one poll in the live dry run), at the CLOB
+minute price plus one cent, plus the market's taker fee, and is held to
+resolution. As in the live engine, a fill more than 3 cents above the alert
+price is MISSED. CIs resample wallets and events together.
+
+| Rule | Period | Wallets | Settled copies | At the whale's price | Copy 90 s later, 95% CI |
+|---|---|---|---|---|---|
+| Walk-forward: 5+ profitable months, win rate >= 60% | Jul-Sep | 16 | 414 | -6.6% | -5.3% [-28.3%, +22.6%] |
+| Walk-forward: max single-market share <= 0.2 (shipped profile) | Sep-Nov | 14 | 823 | +6.8% | -8.9% [-20.6%, +3.0%] |
+| Spec thresholds | May-Jul | 6 | 1,227 | +3.4% | +2.3% [-11.7%, +13.6%] |
+| Spec thresholds | Jul-Sep | 1 | 35 | -1.2% | -12.9% [-47.6%, +28.3%] |
+| Spec thresholds | Sep-Nov | 9 | 1,016 | +6.2% | -5.8% [-17.7%, +5.3%] |
+| **Walk-forward, all periods** | Jul-Nov | 30 | 1,237 | +3.4% | **-7.7% [-19.6%, +5.1%]** |
+| **Spec, all periods** | May-Nov | 16 | 2,278 | +4.8% | **-1.6% [-10.9%, +7.1%]** |
+
+"Walk-forward" is the honest test of this system: each period copies the
+wallets that the requirements chosen on earlier periods select. "At the
+whale's price" is the zero-latency shadow over every settled alert. It is the
+return available to the whale, not to a copier.
+
+Where the edge goes (walk-forward rule; the spec rule splits the same way):
+
+| Copies | Alerts | Win rate | ROI at the whale's price |
+|---|---|---|---|
+| Filled: the price had not run away | 1,237 | 60% | -9.7% |
+| Missed on slippage: the price ran 3+ cents first | 537 | 83% | +33.2% |
+
+The whales' winning trades are the ones the market prices in within a minute or
+two. A copier that waits gets the rest. 74-76% of the copies were sports, and
+74-87% of those were bought after the game had started, where prices move on
+each play.
+
+How fast a copy would have to be (mean ROI per copy and 95% CI, by the time from
+the triggering fill to the copy's fill; prices are per minute, so each row is a
+range):
+
+| Copy fill | Spec rule | Walk-forward rule |
+|---|---|---|
+| Within the first minute | +4.3% [-4.3%, +13.4%] | +0.8% [-14.6%, +16.2%] |
+| 30-90 s | +0.5% [-7.9%, +9.1%] | -6.4% [-17.0%, +6.0%] |
+| 90-150 s (this service) | -1.6% [-10.9%, +7.1%] | -7.7% [-19.6%, +5.1%] |
+| About 5 minutes | -1.4% [-11.3%, +7.8%] | -6.8% [-18.7%, +7.5%] |
+| 90-150 s, no slippage cap | -0.3% [-7.3%, +7.3%] | -4.7% [-14.2%, +5.7%] |
+
+Even an instant copy shows no profit that clears its interval. Removing the
+slippage cap does not help either: buying the winners after they have moved
+earns about nothing. The live engine compares its fill with the ask at alert
+time, not the whale's price, so it buys some of the moved trades. Its
+expected result sits between the capped and uncapped rows.
+
+What the replay cannot capture: real order books (a minute midpoint plus a
+cent understates the cost of thin books, so the real result is likely worse),
+nightly re-picking (here a period's wallets are fixed), and the true alert-time
+ask. The live paper trades measure all three.
 
 ## Known limits
 
