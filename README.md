@@ -136,8 +136,18 @@ Each is one sample, not a conclusion.
   * spec CLV vs holdout ROI: +0.15
   * 24h markout vs holdout ROI: **+0.48 (n=27)**
 
-  The markout predicted best, but on one holdout after three metrics were
-  tried. Replicate it at other cutoffs before switching `rank_by`.
+  The markout looked best on that one holdout, after three metrics were tried.
+* **Replication, cutoff 2026-08-01, holdout to 2026-10-01.** The markout result
+  flips. The 8 selected wallets lost 15.5% overall in the holdout, and all
+  scored candidates lost 4.9%. Across both holdouts, none of ROI, the spec's CLV
+  or the 24h markout reliably picked the large traders who kept winning.
+
+  Spearman correlation between the selection-period metric and holdout ROI:
+
+  | cutoff | past ROI | spec CLV | 24h markout |
+  |---|---|---|---|
+  | 2026-09-01 | +0.04 (n=28) | +0.15 (n=28) | +0.48 (n=27) |
+  | 2026-08-01 | +0.09 (n=34) | -0.25 (n=34) | -0.26 (n=30) |
 * **Alert pipeline, 25 actively trading wallets (hand-picked to exercise the
   plumbing, not selected by the strategy).** Detection is about 28 s from the
   triggering fill to the alert, and the paper fill lands about 83 s after that
