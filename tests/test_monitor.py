@@ -64,6 +64,22 @@ async def test_small_fills_add_up_inside_the_window_into_one_alert(live_app, fak
     assert len(sink.posts) == 1
 
 
+async def test_the_whale_price_is_the_fill_price_vwap_not_usdc_per_share(live_app, fake_http, clock):
+    """usdc_size includes the taker fee on taker fills, so USDC per share would put the
+    whale's fee into its price and make the zero-latency shadow pay a fee twice."""
+    world, monitor, sink = setup(live_app, fake_http)
+    world.trade(WHALE, NOW - 50, COND, size=1000, price=0.40, usdc=405)     # $400 at 0.40 plus a $5 fee
+    await monitor.poll_once()
+    clock.advance(60)
+    world.trade(WHALE, NOW + 30, COND, size=1000, price=0.42, usdc=425.25)  # $420 plus $5.25
+    await monitor.poll_once()
+    (a,) = alerts(live_app)
+    assert a["whale_usd"] == pytest.approx(830.25), "the threshold counts what the whale spent"
+    assert a["whale_price"] == pytest.approx(0.41), "(0.40 x 1000 + 0.42 x 1000) / 2000"
+    (t,) = live_app.db.query("SELECT zero_price FROM paper_trades")
+    assert t["zero_price"] == pytest.approx(0.41)
+
+
 async def test_later_fills_in_the_window_edit_the_message_instead_of_posting(live_app, fake_http, clock):
     world, monitor, sink = setup(live_app, fake_http)
     world.trade(WHALE, NOW - 20, COND, size=1500, price=0.42, usdc=630)

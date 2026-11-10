@@ -166,7 +166,9 @@ class PaperEngine:
                 continue
             closing = None
             ref = market.close_reference_ts()
-            if ref is not None:
+            # For sports the reference is the game start. A fill after it (in-play) has no
+            # closing price to compare with: the "last pre-game price" is older than the fill.
+            if ref is not None and not (t["fill_ts"] and market.game_start_time and t["fill_ts"] >= ref):
                 point = await app.prices.at(t["token_id"], ref - 1)
                 closing = point.price if point is not None else None
             values = settle_values(t, pps)

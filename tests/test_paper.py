@@ -140,3 +140,22 @@ async def test_settle_job_pays_out_resolved_markets(live_app, fake_http, clock):
     assert t["status"] == "FILLED", "status stays FILLED; settlement fields mark it settled"
     assert t["settle_result"] == "WIN" and t["pnl"] == pytest.approx(t["contracts"] - t["cost"])
     assert t["closing_price"] == 0.80
+
+
+async def test_an_in_play_fill_gets_no_closing_price(live_app, fake_http, clock):
+    """For sports the closing price is the last pre-game price; a fill after the start has none."""
+    world, monitor = world_with_alert(live_app, fake_http)
+    world.markets[COND].game_start = NOW - 1800          # the game started before the alert
+    await monitor.poll_once()
+    clock.advance(60)
+    await monitor.poll_once()
+    assert live_app.db.one("SELECT status FROM paper_trades")["status"] == "FILLED"
+    world.markets[COND].resolved_at = NOW + 3600
+    world.markets[COND].payouts = [1.0, 0.0]
+    clock.advance(7200)
+    live_app.db.execute("UPDATE poly_markets SET meta_fetched_at = 0, resolution_checked_at = NULL")
+    lookups = fake_http.count("/v2/prices-history")
+    assert await PaperEngine(live_app).settle() == 1
+    t = live_app.db.one("SELECT * FROM paper_trades")
+    assert t["settle_result"] == "WIN" and t["closing_price"] is None
+    assert fake_http.count("/v2/prices-history") == lookups, "no lookup for a price that means nothing"

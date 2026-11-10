@@ -206,10 +206,16 @@ class Monitor:
                 return "dup"
             shares = group["whale_shares"] + fill.size
             usd = group["whale_usd"] + fill.usdc_size
+            # The whale's price is the VWAP of the fill prices. usdc_size includes the taker
+            # fee on taker fills (checked 2026-11-10 on 263k fills in fee markets), so
+            # usd / shares would put the whale's fee into its price, and the zero-latency
+            # shadow would then pay a fee twice.
+            price = (group["whale_price"] * group["whale_shares"] + fill.price * fill.size) / shares if shares \
+                else fill.price
             app.db.execute(
                 "UPDATE alerts SET whale_shares = ?, whale_usd = ?, whale_price = ?, fills = fills + 1, "
                 "first_fill_ts = MIN(first_fill_ts, ?), last_fill_ts = MAX(last_fill_ts, ?), updated_at = ? "
-                "WHERE id = ?", (shares, usd, usd / shares if shares else fill.price, fill.ts, fill.ts, now, alert_id))
+                "WHERE id = ?", (shares, usd, price, fill.ts, fill.ts, now, alert_id))
             app.db.execute("INSERT INTO alert_fills (alert_id, fill_key) VALUES (?, ?)", (alert_id, fill.fill_key))
 
         alert = app.db.one("SELECT * FROM alerts WHERE id = ?", (alert_id,))

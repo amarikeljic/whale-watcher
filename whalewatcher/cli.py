@@ -284,6 +284,14 @@ async def _backtest(args, cfg) -> int:
     return 0
 
 
+async def _audit(args, cfg) -> int:
+    from .audit import monitored_wallets, render, run_audit
+    async with open_app(cfg) as app:
+        rep = run_audit(app, n=args.trades, pick="random" if args.random else "gap", ids=args.id)
+        print(render(rep, monitored_wallets(app)))
+    return 0
+
+
 async def _fresh(args, cfg) -> int:
     from .fresh import describe, run_fresh_wallet_test
     from .stats import render
@@ -357,6 +365,12 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--kalshi", action="store_true",
                     help="also copy each alert on a game Kalshi lists, at Kalshi's own ask (public data, no key)")
 
+    au = sub.add_parser("audit", help="hand-check settled paper trades and their shadow fills (read-only)")
+    au.add_argument("--trades", type=int, default=5, help="how many trades to show in full")
+    au.add_argument("--random", action="store_true", help="show a seeded random sample instead of the trades "
+                                                            "that make the zero-latency vs alert-time gap")
+    au.add_argument("--id", type=int, action="append", help="show this paper trade id (repeatable)")
+
     fr = sub.add_parser("fresh-wallets", help="test copying large buys by brand-new wallets in non-sports markets")
     fr.add_argument("--start", default="2026-05-07", help="markets resolved from this date (UTC)")
     fr.add_argument("--end", help="...until this date; default: today 00:00 UTC")
@@ -408,5 +422,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_backtest(args, cfg))
     if args.command == "fresh-wallets":
         return asyncio.run(_fresh(args, cfg))
+    if args.command == "audit":
+        return asyncio.run(_audit(args, cfg))
     from . import service  # the live loop and stats, imported lazily
     return asyncio.run(service.run_command(args, cfg))

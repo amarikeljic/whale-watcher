@@ -39,6 +39,7 @@ python -m whalewatcher optimize                      # walk-forward search for t
 python -m whalewatcher backtest                      # simulated paper trades for the past 6 months, shown by `stats`
 python -m whalewatcher backtest --kalshi             # ...and the same alerts copied on Kalshi, where it lists the game
 python -m whalewatcher fresh-wallets                # test copying large buys by brand-new wallets (non-sports)
+python -m whalewatcher audit                        # hand-check settled paper trades and their shadow fills
 python -m whalewatcher monitor [--no-post] [--cycles N]
 python -m whalewatcher settle
 python -m whalewatcher stats [--post]
@@ -87,7 +88,12 @@ costs.
 
 **Phase 5, stats** (`stats.py`). Covers counts, P&L, ROI, win rate, mean ROI
 per trade with a 95% bootstrap CI, CLV of the paper fills, delays, latency
-cost, drawdown and the shadow comparison. The CI resamples wallets and events
+cost, drawdown and the shadow comparison. Latency cost is measured from the
+whale's price when the paper trade opened (the price the zero-latency shadow
+uses) in two parts: whale to alert-time ask over every alert, missed ones
+included, and alert-time ask to fill over filled trades. CLV leaves out fills
+made after a game started, because a sports market's closing price is its last
+pre-game price, which is older than such a fill. The CI resamples wallets and events
 together, because one wallet's repeated buys, or several wallets on one event,
 are not independent results. Breakdowns by month, wallet, category, venue and
 entry price. Under 30 settled live trades the output leads with a warning,

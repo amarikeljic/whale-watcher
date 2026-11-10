@@ -97,13 +97,15 @@ def _groups(buys: list[Activity], window: int) -> Iterator[list[Activity]]:
 
 
 def _trigger(group: list[Activity], min_usd: float) -> tuple[Activity, float] | None:
-    """The fill that took the group to ``min_usd``, and the VWAP up to it."""
-    usd = shares = 0.0
+    """The fill that took the group to ``min_usd`` (USDC spent, fees included, as the monitor
+    counts it), and the VWAP of the fill prices up to it (fees excluded, as in monitor.py)."""
+    usd = shares = notional = 0.0
     for b in group:
         usd += b.usdc_size
         shares += b.size
+        notional += b.price * b.size
         if usd >= min_usd and shares > 0:
-            return b, usd / shares
+            return b, notional / shares
     return None
 
 

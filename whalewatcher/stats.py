@@ -38,7 +38,7 @@ QUERY = """
 SELECT p.*, a.wallet, a.kind, a.outcome, a.whale_price, a.whale_usd, a.first_fill_ts, a.last_fill_ts,
        a.trigger_fill_ts,
        a.detected_at, a.posted_at, a.status AS alert_status, a.snapshot_run_id,
-       m.category, m.question, m.slug, m.event_slug
+       m.category, m.question, m.slug, m.event_slug, m.game_start_time
 FROM paper_trades p
 JOIN alerts a ON a.id = p.alert_id
 LEFT JOIN poly_markets m ON m.condition_id = p.condition_id
@@ -65,9 +65,14 @@ class Summary:
     ci_low: float | None = None
     ci_high: float | None = None
     avg_clv: float | None = None
+    clv_n: int = 0
+    clv_inplay_excluded: int = 0       # fills after the game started: no closing price to compare with
     avg_detection_delay: float | None = None
     avg_fill_delay: float | None = None
-    avg_latency_cost: float | None = None
+    avg_latency_cost: float | None = None      # fill - whale price at the alert, filled trades only
+    avg_detection_cost: float | None = None    # alert-time ask - whale price, every alert with an ask
+    detection_n: int = 0
+    avg_fill_cost: float | None = None         # fill - alert-time ask, filled trades
     max_drawdown: float = 0.0
     zero_pnl: float | None = None
     atask_pnl: float | None = None
@@ -82,6 +87,12 @@ class Summary:
 
 def load_trades(app: App) -> list[dict]:
     return [dict(r) for r in app.db.query(QUERY)]
+
+
+def in_play(t: dict) -> bool:
+    """Whether the paper fill came after the game started (sports markets only)."""
+    start, filled = t.get("game_start_time"), t.get("fill_ts")
+    return bool(start and filled and filled >= start)
 
 
 def is_backtest(t: dict) -> bool:
@@ -118,16 +129,27 @@ def summarise(label: str, trades: list[dict], *, samples: int = 10_000) -> Summa
             [t["pnl"] / t["cost"] for t in settled], [t["wallet"] for t in settled],
             [event_key(t) for t in settled], samples=samples)
         s.max_drawdown = max_drawdown([t["pnl"] for t in sorted(settled, key=lambda t: (t["settled_at"], t["id"]))])
-    clvs = [t["closing_price"] - t["fill_price"] for t in settled if t["closing_price"] is not None]
-    s.avg_clv = mean(clvs)
+    # A sports market's closing price is the last price before the game starts. For a fill
+    # made after the start that price is older than the fill, so there is nothing to compare.
+    inplay = [t for t in settled if in_play(t)]
+    clvs = [t["closing_price"] - t["fill_price"] for t in settled if t["closing_price"] is not None and not in_play(t)]
+    s.avg_clv, s.clv_n, s.clv_inplay_excluded = mean(clvs), len(clvs), len(inplay)
     # Measured from the fill that made the group alert-worthy, so the time a whale
     # spends building a position is not counted as our latency.
     s.avg_detection_delay = mean([t["detected_at"] - t["trigger_fill_ts"] for t in trades
                                   if t["detected_at"] and t["trigger_fill_ts"]])
     s.avg_fill_delay = mean([t["fill_ts"] - t["trigger_fill_ts"] for t in trades
                              if t["status"] == "FILLED" and t["fill_ts"] and t["trigger_fill_ts"]])
-    s.avg_latency_cost = mean([t["fill_price"] - t["whale_price"] for t in trades
-                               if t["status"] == "FILLED" and t["fill_price"] is not None])
+    # All against the whale's price when the paper trade opened (zero_price), the same price
+    # the zero-latency shadow uses: the alert's whale_price keeps moving as later fills arrive.
+    s.avg_latency_cost = mean([t["fill_price"] - t["zero_price"] for t in trades
+                               if t["status"] == "FILLED" and t["fill_price"] is not None
+                               and t["zero_price"] is not None])
+    detection = [t["alert_ask"] - t["zero_price"] for t in trades
+                 if t["alert_ask"] is not None and t["zero_price"] is not None]
+    s.avg_detection_cost, s.detection_n = mean(detection), len(detection)
+    s.avg_fill_cost = mean([t["fill_price"] - t["alert_ask"] for t in trades
+                            if t["status"] == "FILLED" and t["fill_price"] is not None and t["alert_ask"] is not None])
     # Shadow comparison over every alert whose market has settled, MISSED included:
     # zero-latency and alert-time fills were always possible; the real strategy
     # earned 0 on the trades it missed.
@@ -304,10 +326,16 @@ def _render_summary(s: Summary, threshold: int) -> list[str]:
         lines.append(f"  max drawdown {_money(-s.max_drawdown) if s.max_drawdown else '$0.00'}")
     else:
         lines.append("  no settled trades yet, so no P&L.")
-    lines.append(f"  avg CLV of paper fills {'-' if s.avg_clv is None else f'{s.avg_clv:+.3f}'} | "
+    def cents(x: float | None) -> str:
+        return "-" if x is None else f"{x:+.3f}"
+
+    inplay = f", {s.clv_inplay_excluded} in-play fills left out" if s.clv_inplay_excluded else ""
+    lines.append(f"  avg CLV of paper fills {cents(s.avg_clv)} (n={s.clv_n}{inplay}) | "
                  f"detection delay {_secs(s.avg_detection_delay)} | fill delay {_secs(s.avg_fill_delay)} "
-                 f"(from the fill that triggered the alert) | latency cost "
-                 f"{'-' if s.avg_latency_cost is None else f'{s.avg_latency_cost:+.3f}'} per share")
+                 f"(from the fill that triggered the alert)")
+    lines.append(f"  price paid vs the whale, per share: whale -> alert-time ask {cents(s.avg_detection_cost)} "
+                 f"(n={s.detection_n}, missed included) | alert-time ask -> fill {cents(s.avg_fill_cost)} | "
+                 f"whale -> fill {cents(s.avg_latency_cost)} (filled trades only)")
     if s.shadow_n:
         lines.append(f"  shadow comparison over {s.shadow_n} settled alerts (missed included): zero-latency "
                      f"{_money(s.zero_pnl)} | alert-time ask {_money(s.atask_pnl)} | real delayed fill "

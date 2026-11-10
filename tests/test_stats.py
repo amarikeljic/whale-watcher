@@ -103,3 +103,29 @@ def test_csv_export_has_every_trade(app, tmp_path):
 
 def test_empty_database(app):
     assert "No paper trades yet." in render(app)
+
+
+def test_latency_cost_is_measured_from_the_whale_price_the_shadow_uses_and_includes_misses(app):
+    seed(app.db, FIXTURE)
+    # Later fills moved the alerts' whale_price after the paper trades opened at zero_price.
+    app.db.execute("UPDATE alerts SET whale_price = whale_price + 0.05")
+    from whalewatcher.stats import load_trades
+    s = summarise("all", load_trades(app), samples=200)
+    # whale -> fill over the filled trades, against zero_price (0.45, 0.30, 0.38, 0.60): unchanged
+    assert s.avg_latency_cost == pytest.approx(((0.50 - 0.45) + (0.32 - 0.30) + (0.40 - 0.38) + (0.62 - 0.60)) / 4)
+    # whale -> alert-time ask over every alert with an ask, the missed one included
+    assert s.detection_n == 5
+    assert s.avg_detection_cost == pytest.approx(((0.48 - 0.45) + (0.31 - 0.30) + (0.39 - 0.38) + (0.52 - 0.50)
+                                                 + (0.61 - 0.60)) / 5)
+    assert s.avg_fill_cost == pytest.approx(((0.50 - 0.48) + (0.32 - 0.31) + (0.40 - 0.39) + (0.62 - 0.61)) / 4)
+
+
+def test_in_play_fills_are_left_out_of_clv(app):
+    seed(app.db, FIXTURE)
+    # The sports market's game started before the fills (BASE + i*1000 + 101): in-play.
+    app.db.execute("UPDATE poly_markets SET game_start_time = ? WHERE condition_id = '0xspo'", (BASE,))
+    from whalewatcher.stats import load_trades
+    s = summarise("all", load_trades(app), samples=200)
+    assert s.clv_inplay_excluded == 1 and s.clv_n == 2, "the settled sports trade was in-play"
+    assert s.avg_clv == pytest.approx(((0.60 - 0.50) + (0.50 - 0.40)) / 2)
+    assert "1 in-play fills left out" in render(app)

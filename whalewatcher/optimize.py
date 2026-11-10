@@ -133,16 +133,17 @@ def alert_prices(buys: list[Buy], window: int, min_usd: float) -> list[float]:
     """
     out: list[float] = []
     group_start: int | None = None
-    usd = shares = 0.0
+    usd = shares = notional = 0.0
     for b in sorted(buys, key=lambda b: b.ts):
         if group_start is None or b.ts - group_start > window:
             if group_start is not None and usd >= min_usd and shares > 0:
-                out.append(usd / shares)
-            group_start, usd, shares = b.ts, 0.0, 0.0
+                out.append(notional / shares)
+            group_start, usd, shares, notional = b.ts, 0.0, 0.0, 0.0
         usd += b.usdc
         shares += b.size
+        notional += b.price * b.size      # fill prices: usdc includes the whale's taker fee
     if group_start is not None and usd >= min_usd and shares > 0:
-        out.append(usd / shares)
+        out.append(notional / shares)
     return out
 
 

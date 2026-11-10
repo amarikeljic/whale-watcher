@@ -34,6 +34,11 @@ Gotchas found by testing, not in the docs:
 * SPLIT/MERGE/CONVERSION rows have an empty `token_id` and `outcome_index` 999.
   CONVERSION rows cannot be attributed to tokens, so those markets are excluded.
 * Since 2026-08-10 REDEEM rows are per outcome (losing side has `usdc_size` 0).
+* **`usdc_size` includes the taker fee on taker fills; `price` is the execution price.**
+  On 263k fills in fee markets (checked 2026-11-10) USDC per share exceeded `price`
+  by `feeRate x p x (1 - p)` on taker buys and fell short of it on taker sells;
+  maker fills and fee-free markets show no gap. A whale's price is therefore the
+  VWAP of `price`, not `usdc_size / size`.
 * No per-fill id exists; fills are keyed by a hash of (tx, type, token, side,
   size, price, ts) plus an occurrence counter.
 
