@@ -40,6 +40,10 @@ python -m whalewatcher backtest                      # simulated paper trades fo
 python -m whalewatcher backtest --kalshi             # ...and the same alerts copied on Kalshi, where it lists the game
 python -m whalewatcher fresh-wallets                # test copying large buys by brand-new wallets (non-sports)
 python -m whalewatcher audit                        # hand-check settled paper trades and their shadow fills
+python -m whalewatcher watchlist                    # who is being watched: metrics, days on the list, status
+python -m whalewatcher watchlist --last             # what the latest nightly review added, kept, removed, and why
+python -m whalewatcher watchlist --history          # every add and removal ever (never deleted)
+python -m whalewatcher watchlist --review           # run the nightly review now
 python -m whalewatcher monitor [--no-post] [--cycles N]
 python -m whalewatcher settle
 python -m whalewatcher stats [--post]
@@ -105,9 +109,53 @@ written as strategy `backtest:*`. `stats` shows them in their own section,
 labelled SIMULATED, never mixed into the live numbers. See "Would copying have
 made money?" below.
 
-**Phase 6, walk-forward** (`service.py`). It rescores nightly with data up to
-that day, rotates the monitored set, and links every alert to the snapshot
-that was current when it fired.
+**The watchlist** (`watchlist.py`, v2). The monitored set is a list that
+grows, not a nightly top 20. Every night the service scores candidates with
+data up to that day, then:
+
+1. **adds** wallets that meet `watchlist.entry`, best ranked first, while there
+   is room (`max_size`). Nobody is pushed out to make room.
+2. **re-scores every member** against the looser `watchlist.exit`. A wallet is
+   **removed only after failing 3 reviews in a row**. One passing review resets
+   the count. A wallet whose data could not be read that night is not judged.
+3. records every decision with its reason (`watchlist_events`).
+
+Entry is stricter than exit (hysteresis), so a wallet near a line does not flip
+in and out. Two checks apply at the door as well as at review:
+
+* **Market makers and bots** (`/v2/user-stats`): a wallet whose lifetime income
+  is more than 30% maker rebates and liquidity rewards, or with more than 100
+  fills per market, is turned away. A check that could not be read is never
+  treated as a pass.
+* **Our own record of the wallet**: once our paper trades on its alerts cover 15
+  settled events, a negative mean closing-line value is a failed review, and
+  keeps a removed wallet from walking straight back in.
+
+Every stay on the list is one row of `watchlist_membership`. A wallet that
+comes back gets a new row, and the database refuses to delete history. New
+members are on **probation** for 14 days: alerts say so, and `stats` shows
+probation, established and pre-watchlist trades as separate rows. Each alert
+stores the membership row, the probation flag and the score snapshot that were
+current when it fired, so nothing is judged with knowledge that came later.
+
+The entry values in `config.yaml` come from the last real scoring run (400
+candidates): 246 are dropped as too active to be anything but bots, 145 of the
+rest fail the concentration rule, and raising the sample floor from 10 to 30
+settled markets costs no wallet at all. The small ROI floor closes the gap that
+let a 1% ROI wallet through while `scoring.min_roi` was off.
+
+**Upgrading an existing database.** The first start on the new code takes a
+full backup to `data/backups/<name>.<UTC time>.pre-v2` before changing anything
+(SQLite's online backup, safe while the file is in use), then adds the new
+tables and two columns to `alerts`. Existing rows are untouched. The wallets v1
+was monitoring are carried over as members. If the disk has no room for the
+backup, it stops and changes nothing.
+
+**Protocol V2** (`protocol.py`). Sports markets move to Polymarket's Protocol
+V2 on 2026-12-01, where outcome tokens are position ids. The decoder for those
+ids is in place and tested against the layout in Polymarket's own SDK. It is
+not yet checked against a live V2 market (none exists before 2026-11-23) and
+nothing depends on it yet.
 
 ## Where this deviates from the spec, and why
 

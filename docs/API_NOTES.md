@@ -23,6 +23,7 @@ Migration guide: https://docs.polymarket.com/migrate/data-api-v1-to-v2.md
 | Resolutions | `GET /v2/resolutions?condition=..` (<=20 ids) | Condition rows: `resolved_at` (RFC3339), `payouts` (micro-USDC per share). UMA rows: `last_update_timestamp` (epoch string), `price` (1e18 = first outcome; `"69"` = unset). |
 | CLV prices | `GET /v2/prices-history?token_id=..&as_of=..` | Latest observation at or before `as_of`. 1-minute data kept >= 7 days, 5-minute >= 60, 30-minute >= 90; 3h/12h permanent. Each point has `resolution_seconds`. |
 | ADD vs NEW | `GET /v2/positions?user=..&condition=..` | `current_size` is shares held now. |
+| Market-maker / bot screen | `GET /v2/user-stats?user=..` | `data` is null for an unknown wallet. `trades` = distinct markets traded. `all_time_pnl` has `trade_count` (fills), `position_pnl`, `maker_rebate`, `taker_rebate`, `reward_income` (lifetime USDC). Checked 2026-11-10. |
 | Freshness | `GET /v2/status` | `serving.lag_seconds`; used to flag delayed data in alerts. |
 
 Gotchas found by testing, not in the docs:

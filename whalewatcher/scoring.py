@@ -60,6 +60,7 @@ class WalletMetrics:
     unreliable_markets: int = 0
     activity_rows: int = 0
     truncated: bool = False
+    fetch_failed: bool = False      # the wallet's activity could not be read: not scored, not judged
     passed: bool = False
     fail_reasons: list[str] = field(default_factory=list)
     rank: int | None = None
@@ -243,6 +244,8 @@ async def compute_clv(positions: list[ClvPosition], prices: PriceLookup, as_of: 
 
 def apply_filters(m: WalletMetrics, cfg: ScoringConfig) -> list[str]:
     """Reasons the wallet fails, empty if it passes. CLV is checked when ranking."""
+    if m.fetch_failed:
+        return ["fetch_failed (activity could not be read)"]
     if m.truncated:
         return [f"too_active(>{cfg.max_activity_rows} rows: bot or market maker)"]
     reasons = []
@@ -493,6 +496,7 @@ class ScoreRun:
     sources: dict[str, int]
     analyses: dict[str, WalletAnalysis] = field(default_factory=dict)
     watch: Stopwatch | None = None
+    cfg: ScoringConfig | None = None     # the thresholds this run was scored with
 
     @property
     def selected(self) -> list[WalletMetrics]:
@@ -511,8 +515,11 @@ async def run_scoring(
     progress: Callable[[str], None] | None = None,
     watch: Stopwatch | None = None,
     stage_prefix: str = "",
+    scoring_cfg: ScoringConfig | None = None,
 ) -> ScoreRun:
-    cfg = app.cfg.scoring
+    """``scoring_cfg`` replaces ``app.cfg.scoring`` for this run (the nightly watchlist
+    review scores with the watchlist's entry rules); it is what the snapshot records."""
+    cfg = scoring_cfg or app.cfg.scoring
     say = progress or (lambda _msg: None)
     watch = watch or Stopwatch(app.http)
     notes = list(extra_notes)
@@ -529,6 +536,8 @@ async def run_scoring(
     sem = asyncio.Semaphore(8)
     ticker = Progress(say, "wallet activity", len(pool))
 
+    failed: set[str] = set()
+
     async def fetch(wallet: str) -> tuple[str, list[Activity], bool]:
         async with sem:
             try:
@@ -537,6 +546,7 @@ async def run_scoring(
             except Exception as exc:  # one wallet failing must not sink the run
                 log.warning("fetch failed for %s: %s", wallet, exc)
                 rows, truncated = [], False
+                failed.add(wallet)
             ticker.tick()
             return wallet, rows, truncated
 
@@ -547,7 +557,7 @@ async def run_scoring(
     with watch.stage(f"{stage_prefix}markets"):
         markets = await app.markets.ensure(conditions)
 
-    rows_by_wallet = {w: rows for w, rows, truncated in fetched if not truncated}
+    rows_by_wallet = {w: rows for w, rows, truncated in fetched if not truncated and w not in failed}
     analyses: dict[str, WalletAnalysis] = {w: analyse(w, rows, markets, as_of, cfg)
                                            for w, rows in rows_by_wallet.items()}
     # Positions opened before the fetched window show up as incomplete markets;
@@ -574,8 +584,8 @@ async def run_scoring(
 
     metrics: list[WalletMetrics] = []
     for wallet, _rows, truncated in fetched:
-        if truncated:
-            m = WalletMetrics(wallet=wallet, as_of=as_of, truncated=True)
+        if truncated or wallet in failed:
+            m = WalletMetrics(wallet=wallet, as_of=as_of, truncated=truncated, fetch_failed=wallet in failed)
             m.fail_reasons = apply_filters(m, cfg)
             metrics.append(m)
             continue
@@ -602,7 +612,7 @@ async def run_scoring(
     for tags in pool.values():
         for tag in tags:
             sources[tag] += 1
-    run = ScoreRun(None, as_of, ordered, notes, dict(sources), analyses, watch)
+    run = ScoreRun(None, as_of, ordered, notes, dict(sources), analyses, watch, cfg)
     if save:
         run.run_id = save_run(app, run, kind)
     return run
@@ -627,12 +637,12 @@ SNAPSHOT_FIELDS = (
 
 
 def save_run(app: App, run: ScoreRun, kind: str) -> int:
-    cfg = app.cfg
+    scoring_cfg = run.cfg or app.cfg.scoring
     with app.db.tx() as conn:
         cur = conn.execute(
             "INSERT INTO score_runs (as_of, kind, created_at, config_json, sources_json, n_candidates, "
             "n_passed, notes) VALUES (?,?,?,?,?,?,?,?)",
-            (run.as_of, kind, app.clock(), json.dumps(asdict(cfg.scoring)), json.dumps(run.sources),
+            (run.as_of, kind, app.clock(), json.dumps(asdict(scoring_cfg)), json.dumps(run.sources),
              len(run.metrics), sum(1 for m in run.metrics if m.passed), json.dumps(run.notes)))
         run_id = int(cur.lastrowid)
         conn.executemany(
@@ -654,5 +664,7 @@ def load_run(app: App, run_id: int) -> list[WalletMetrics]:
             setattr(m, f, r[f])
         m.passed, m.rank, m.selected = bool(r["passed"]), r["rank"], bool(r["selected"])
         m.fail_reasons = json.loads(r["fail_reasons"] or "[]")
+        m.truncated = any(f.startswith("too_active") for f in m.fail_reasons)
+        m.fetch_failed = any(f.startswith("fetch_failed") for f in m.fail_reasons)
         out.append(m)
     return out

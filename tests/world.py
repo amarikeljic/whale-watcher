@@ -78,6 +78,9 @@ class World:
         http.route("/v2/status", {"data": {"age_seconds": 3, "serving": {"lag_seconds": 2}}})
         http.route("/v2/positions", self._positions)
         http.route("/prices-history", self._clob_prices)
+        # /v2/user-stats: wallet -> the `data` object; an unknown wallet answers data: null.
+        self.user_stats: dict[str, dict[str, Any]] = {}
+        http.route("/v2/user-stats", lambda params: {"data": self.user_stats.get(params["user"])})
 
     def _clob_prices(self, params: dict[str, Any]) -> dict[str, Any]:
         token, start, end = params["market"], int(params["startTs"]), int(params["endTs"])

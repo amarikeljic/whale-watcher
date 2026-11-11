@@ -25,6 +25,7 @@ from .discord import NullSink, Sink
 from .paper import PaperEngine
 from .polymarket import Activity, Book, MarketInfo, assign_fill_keys
 from .timeutil import iso
+from .watchlist import membership_at
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +83,8 @@ def format_alert(app: App, alert, market: MarketInfo | None, *, run_id: int | No
         f"Whale trade: {iso(alert['first_fill_ts'])}   detected: {iso(alert['detected_at'])}",
         f"Polymarket: {market.url if market else 'https://polymarket.com'}",
     ]
+    if alert["probation"]:
+        lines.append("Watchlist: on probation (recently added; counted separately in the stats)")
     if lag is not None and lag > 120:
         lines.append(f"⚠ Polymarket data is running ~{lag}s behind the chain")
     lines.append("Paper-trading research, not advice.")
@@ -255,10 +258,15 @@ class Monitor:
         bid = book.best_bid if book else None
         reason = self._skip_reason(alert, fill, market, book, now)
         run_id = self.run_id
+        # Which stay on the watchlist this alert belongs to and whether the wallet was
+        # still on probation, frozen now so later knowledge cannot leak into the judging.
+        member = membership_at(app, alert["wallet"], now)
         app.db.execute(
             "UPDATE alerts SET kind = ?, detected_at = ?, trigger_fill_ts = ?, alert_best_ask = ?, alert_best_bid = ?, "
-            "alert_book_ts = ?, snapshot_run_id = ?, updated_at = ? WHERE id = ?",
-            (kind, now, fill.ts, ask, bid, book.ts if book else None, run_id, now, alert["id"]))
+            "alert_book_ts = ?, snapshot_run_id = ?, membership_id = ?, probation = ?, updated_at = ? WHERE id = ?",
+            (kind, now, fill.ts, ask, bid, book.ts if book else None, run_id,
+             member["id"] if member else None,
+             (1 if now < member["probation_until"] else 0) if member else None, now, alert["id"]))
         alert = app.db.one("SELECT * FROM alerts WHERE id = ?", (alert["id"],))
         message = format_alert(app, alert, market, run_id=run_id, lag=lag)
         if reason:
@@ -307,24 +315,3 @@ class Monitor:
         held = sum(float(r.get("current_size") or 0) for r in rows if str(r.get("token_id")) == alert["token_id"])
         before = held - alert["whale_shares"]
         return "ADD" if before > max(1.0, 0.01 * alert["whale_shares"]) else "NEW"
-
-
-def rotate_monitored(app: App, run_id: int) -> tuple[list[str], list[str]]:
-    """Make the selected wallets of ``run_id`` the monitored set (Phase 6 rotation)."""
-    now = app.clock()
-    selected = {r["wallet"]: r["rank"] for r in app.db.query(
-        "SELECT wallet, rank FROM wallet_score_snapshots WHERE run_id = ? AND selected = 1", (run_id,))}
-    current = {r["wallet"] for r in app.db.query("SELECT wallet FROM monitored_wallets WHERE active = 1")}
-    removed = sorted(current - set(selected))
-    added = sorted(set(selected) - current)
-    with app.db.tx() as conn:
-        for w in removed:
-            conn.execute("UPDATE monitored_wallets SET active = 0, removed_at = ? WHERE wallet = ?", (now, w))
-        for w, rank in selected.items():
-            conn.execute(
-                "INSERT INTO monitored_wallets (wallet, run_id, rank, active, added_at) VALUES (?,?,?,1,?) "
-                "ON CONFLICT(wallet) DO UPDATE SET run_id = excluded.run_id, rank = excluded.rank, active = 1, "
-                "removed_at = NULL", (w, run_id, rank, now))
-        conn.execute("INSERT INTO service_state (key, value) VALUES ('monitored_run_id', ?) "
-                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(run_id),))
-    return added, removed

@@ -94,6 +94,52 @@ class RescoreConfig:
 
 
 @dataclass
+class WatchlistEntry:
+    """What a wallet needs to JOIN the watchlist. Stricter than WatchlistExit on every
+    shared rule (hysteresis), so a wallet near a line does not flip in and out nightly.
+
+    Defaults come from Phase 0 and the walk-forward search: the concentration rule is
+    the only requirement that held out of sample, 30 settled markets guards against the
+    thin samples that fake most apparent edge, and a small positive ROI closes the gap
+    that let a 1% ROI wallet in while ``scoring.min_roi`` was off."""
+    min_roi: float = 0.02
+    min_settled_markets: int = 30
+    min_profitable_months: int = 0        # no out-of-sample value found; 0 = off
+    max_single_market_share: float = 0.20
+    max_two_sided_ratio: float = 1.0      # 1.0 = off; the market-maker screen below does this job
+    max_days_since_last_trade: float = 30.0
+    # Market-maker / bot screen from /v2/user-stats (lifetime figures).
+    max_rebate_share: float = 0.30        # (rebates + rewards) / (rebates + rewards + position profit)
+    max_fills_per_market: float = 100.0
+
+
+@dataclass
+class WatchlistExit:
+    """What makes a wallet already on the list FAIL a nightly review. It is removed
+    only after ``fail_reviews_in_a_row`` consecutive failed reviews."""
+    min_roi: float = 0.0
+    min_settled_markets: int = 15
+    max_single_market_share: float = 0.30
+    max_two_sided_ratio: float = 1.0
+    max_days_since_last_trade: float = 45.0
+    max_rebate_share: float = 0.50
+    max_fills_per_market: float = 200.0
+    fail_reviews_in_a_row: int = 3
+    # Our own paper record of the wallet: once it has this many settled live events
+    # with a closing price, a mean CLV below live_max_clv is a failed review.
+    live_min_events: int = 15
+    live_max_clv: float = 0.0
+
+
+@dataclass
+class WatchlistConfig:
+    entry: WatchlistEntry = field(default_factory=WatchlistEntry)
+    exit: WatchlistExit = field(default_factory=WatchlistExit)
+    max_size: int = 40
+    probation_days: int = 14              # new members are tracked, and flagged in alerts and stats
+
+
+@dataclass
 class ApiConfig:
     # https://docs.polymarket.com/api-reference/rate-limits.md (verified 2026-11-07)
     data_api: str = "https://data-api.polymarket.com"
@@ -135,6 +181,7 @@ class Config:
     paper: PaperConfig = field(default_factory=PaperConfig)
     stats: StatsConfig = field(default_factory=StatsConfig)
     rescore: RescoreConfig = field(default_factory=RescoreConfig)
+    watchlist: WatchlistConfig = field(default_factory=WatchlistConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
     # Secrets, from the environment only.
     discord_webhook_url: str | None = field(default=None, repr=False)
@@ -159,6 +206,7 @@ _SECTIONS = {
     "paper": PaperConfig,
     "stats": StatsConfig,
     "rescore": RescoreConfig,
+    "watchlist": WatchlistConfig,
     "api": ApiConfig,
 }
 
@@ -173,6 +221,9 @@ def _build(cls: type, raw: dict[str, Any], where: str) -> Any:
     values = {}
     for name, value in raw.items():
         default = getattr(cls(), name)
+        if dataclasses.is_dataclass(default):
+            values[name] = _build(type(default), value or {}, f"{where}.{name}")
+            continue
         if isinstance(default, bool):
             if not isinstance(value, bool):
                 raise ConfigError(f"{where}.{name} must be true or false")
@@ -200,6 +251,26 @@ def validate(cfg: Config) -> None:
         raise ConfigError("alerts.min_price must be below alerts.max_price, both within 0..1")
     if a.poll_interval_seconds < 5:
         raise ConfigError("alerts.poll_interval_seconds must be at least 5")
+    w = cfg.watchlist
+    if w.max_size < 1:
+        raise ConfigError("watchlist.max_size must be at least 1")
+    if w.probation_days < 0:
+        raise ConfigError("watchlist.probation_days cannot be negative")
+    if w.exit.fail_reviews_in_a_row < 1:
+        raise ConfigError("watchlist.exit.fail_reviews_in_a_row must be at least 1")
+    # Hysteresis only works if entry is at least as strict as exit on every shared rule.
+    for name, entry_stricter in (("min_roi", w.entry.min_roi >= w.exit.min_roi),
+                                 ("min_settled_markets", w.entry.min_settled_markets >= w.exit.min_settled_markets),
+                                 ("max_single_market_share",
+                                  w.entry.max_single_market_share <= w.exit.max_single_market_share),
+                                 ("max_two_sided_ratio", w.entry.max_two_sided_ratio <= w.exit.max_two_sided_ratio),
+                                 ("max_days_since_last_trade",
+                                  w.entry.max_days_since_last_trade <= w.exit.max_days_since_last_trade),
+                                 ("max_rebate_share", w.entry.max_rebate_share <= w.exit.max_rebate_share),
+                                 ("max_fills_per_market",
+                                  w.entry.max_fills_per_market <= w.exit.max_fills_per_market)):
+        if not entry_stricter:
+            raise ConfigError(f"watchlist.entry.{name} must be at least as strict as watchlist.exit.{name}")
     p = cfg.paper
     if p.stake_usd <= 0:
         raise ConfigError("paper.stake_usd must be positive")

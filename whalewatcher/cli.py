@@ -307,6 +307,26 @@ async def _fresh(args, cfg) -> int:
     return 0
 
 
+async def _watchlist(args, cfg) -> int:
+    from . import watchlist as wl
+    async with open_app(cfg) as app:
+        if wl.seed_from_monitored(app):
+            wl.sync_monitored(app, None)
+        if args.review:
+            review = await wl.nightly(app, as_of=parse_as_of(args.as_of) if args.as_of else None,
+                                      progress=lambda m: print(f"  .. {m}", file=sys.stderr))
+            print(wl.render_review(review.run_id, review.as_of, review.before, review.after, review.max_size,
+                                   review.decisions))
+            print()
+        if args.history:
+            print(wl.render_history(app))
+        elif args.last:
+            print(wl.render_last_review(app))
+        else:
+            print(wl.render_current(app))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m whalewatcher",
                                 description="Find skilled Polymarket wallets and paper trade their entries. "
@@ -380,6 +400,13 @@ def build_parser() -> argparse.ArgumentParser:
     fr.add_argument("--delay", type=int, default=90)
     fr.add_argument("--no-write", action="store_true", help="print only; keep the overview as it is")
 
+    w = sub.add_parser("watchlist", help="show the wallets being watched; --history shows every add and removal")
+    w.add_argument("--history", action="store_true", help="every stay on the list, with the reasons")
+    w.add_argument("--last", action="store_true", help="what the most recent nightly review decided, and why")
+    w.add_argument("--review", action="store_true",
+                   help="run the nightly review now (score, add, keep, remove), then show the result")
+    w.add_argument("--as-of", help="with --review: use data up to this date (default: today 00:00 UTC)")
+
     for name, helptext in (("monitor", "run the live alert + paper trading loop"),
                            ("settle", "settle open paper trades once"),
                            ("stats", "print paper-trading statistics"),
@@ -424,5 +451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_fresh(args, cfg))
     if args.command == "audit":
         return asyncio.run(_audit(args, cfg))
+    if args.command == "watchlist":
+        return asyncio.run(_watchlist(args, cfg))
     from . import service  # the live loop and stats, imported lazily
     return asyncio.run(service.run_command(args, cfg))

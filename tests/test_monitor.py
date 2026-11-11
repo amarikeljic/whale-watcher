@@ -6,7 +6,7 @@ import pytest
 
 from conftest import NOW
 from whalewatcher.discord import MemorySink, NullSink
-from whalewatcher.monitor import Monitor, rotate_monitored
+from whalewatcher.monitor import Monitor
 from whalewatcher.paper import PaperEngine
 from world import FakeMarket, World
 
@@ -170,20 +170,6 @@ async def test_a_failed_post_is_recorded_and_not_traded(live_app, fake_http, clo
     await monitor.poll_once()
     assert alerts(live_app)[0]["status"] == "FAILED"
     assert live_app.db.one("SELECT COUNT(*) n FROM paper_trades")["n"] == 0
-
-
-async def test_rotation_follows_the_new_snapshot(live_app):
-    db = live_app.db
-    db.execute("INSERT INTO score_runs (id, as_of, kind, created_at, config_json, sources_json, n_candidates, n_passed) "
-               "VALUES (7, 0, 'nightly', 0, '{}', '{}', 3, 2)")
-    for w, rank, sel in (("0xa", 1, 1), ("0xb", 2, 1), ("0xc", 3, 0)):
-        db.execute("INSERT INTO wallet_score_snapshots (run_id, wallet, as_of, passed, rank, selected) "
-                   "VALUES (7, ?, 0, 1, ?, ?)", (w, rank, sel))
-    db.execute("INSERT INTO monitored_wallets (wallet, run_id, rank, active, added_at) VALUES ('0xold', 1, 1, 1, 0)")
-    added, removed = rotate_monitored(live_app, 7)
-    assert added == ["0xa", "0xb"] and removed == ["0xold"]
-    active = [r["wallet"] for r in db.query("SELECT wallet FROM monitored_wallets WHERE active = 1 ORDER BY rank")]
-    assert active == ["0xa", "0xb"] and db.get_state("monitored_run_id") == 7
 
 
 async def test_score_line_says_when_a_wallet_could_not_be_scored(live_app, fake_http, clock):

@@ -4,7 +4,7 @@ One loop, one process, nothing listening on any port:
 
     every poll_interval_seconds   paper fills that are due -> poll wallets -> alerts
     every settle_interval_seconds settle resolved paper trades
-    nightly at rescore.hour_utc   rescore with data up to today, rotate the monitored set (Phase 6)
+    nightly at rescore.hour_utc   rescore with data up to today, review the watchlist (watchlist.py)
     daily at daily_summary_hour   post the stats summary to the stats webhook
 
 Failures degrade instead of crashing: a wallet that fails is skipped for that
@@ -22,11 +22,11 @@ import time
 from .app import App, open_app
 from .config import Config
 from .discord import DiscordWebhook, NullSink, Sink
-from .monitor import DATA_HOST, Monitor, rotate_monitored
+from .monitor import DATA_HOST, Monitor
 from .paper import PaperEngine
-from .scoring import run_scoring
 from .stats import daily_summary, export_csv, render
-from .timeutil import from_ts, iso, start_of_day
+from .timeutil import from_ts, iso
+from .watchlist import nightly, seed_from_monitored, sync_monitored
 
 log = logging.getLogger(__name__)
 
@@ -34,18 +34,12 @@ HEARTBEAT_KEY = "heartbeat"
 
 
 async def rescore(app: App, *, as_of: int | None = None) -> int | None:
-    """Score with data up to today 00:00 UTC and rotate the monitored set to the new top_k."""
-    as_of = as_of if as_of is not None else start_of_day(app.clock())
-    run = await run_scoring(app, as_of, kind="nightly", historical_pool=False,
-                            progress=lambda m: log.info("rescore: %s", m))
-    if run.selected:
-        added, removed = rotate_monitored(app, run.run_id)
-        log.info("rescore run #%s: monitoring %d wallets (+%d, -%d)", run.run_id, len(run.selected),
-                 len(added), len(removed))
-    else:
-        log.warning("rescore run #%s: no wallet passed the filters; keeping the current monitored set",
-                    run.run_id)
-    return run.run_id
+    """The nightly job: score with data up to today 00:00 UTC, then review the watchlist
+    (add wallets that meet the entry rules, remove ones that kept failing the exit rules)."""
+    review = await nightly(app, as_of=as_of, progress=lambda m: log.info("rescore: %s", m))
+    if not review.after:
+        log.warning("rescore run #%s: the watchlist is empty (no wallet meets the entry rules)", review.run_id)
+    return review.run_id
 
 
 class Service:
@@ -60,6 +54,8 @@ class Service:
 
     async def run(self, *, cycles: int | None = None) -> None:
         app, cfg = self.app, self.app.cfg
+        if seed_from_monitored(app):          # first start after the v2 upgrade
+            sync_monitored(app, None)
         if not self.monitor.wallets():
             log.info("no monitored wallets yet: scoring now")
             await self._rescore()
@@ -103,9 +99,9 @@ class Service:
         run = app.db.one("SELECT n_candidates FROM score_runs WHERE id = ?", (run_id,))
         n = run["n_candidates"] if run else 0
         await (self.stats_sink or self.sink).post(
-            f"⚠ Whale Watcher: no wallet passed the scoring filters (snapshot #{run_id}, {n} candidates), "
-            "so nothing is being monitored and no alerts will fire. Loosen the filters in config.yaml or "
-            "wait for a wallet to qualify; see `python -m whalewatcher score` for why each one failed.")
+            f"⚠ Whale Watcher: no wallet meets the watchlist entry rules (snapshot #{run_id}, {n} candidates), "
+            "so nothing is being monitored and no alerts will fire. Loosen watchlist.entry in config.yaml or "
+            "wait for a wallet to qualify; see `python -m whalewatcher watchlist --last` for why.")
 
     async def _periodic(self) -> None:
         app, cfg = self.app, self.app.cfg

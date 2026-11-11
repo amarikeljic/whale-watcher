@@ -8,13 +8,20 @@ connection keeps the code and the tests simple.
 from __future__ import annotations
 
 import json
+import logging
+import shutil
 import sqlite3
+import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+log = logging.getLogger(__name__)
+
+# 1: the original build. 2: v2 Phase 2, the persistent watchlist (watchlist_membership,
+# watchlist_events, alerts.membership_id, alerts.probation).
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallets (
@@ -152,6 +159,44 @@ CREATE TABLE IF NOT EXISTS monitored_wallets (
     last_seen_ts  INTEGER                -- newest fill timestamp seen
 );
 
+-- One row per stay on the watchlist. A wallet that is removed and later qualifies
+-- again gets a NEW row. Rows are never deleted (the triggers below refuse it), so
+-- what the list looked like on any past night can always be rebuilt.
+CREATE TABLE IF NOT EXISTS watchlist_membership (
+    id                 INTEGER PRIMARY KEY,
+    wallet             TEXT NOT NULL,
+    added_at           INTEGER NOT NULL,
+    add_reason         TEXT NOT NULL,
+    added_run_id       INTEGER,           -- score snapshot in force at the add
+    probation_until    INTEGER NOT NULL,
+    removed_at         INTEGER,           -- NULL while on the list
+    remove_reason      TEXT,
+    removed_run_id     INTEGER,           -- score snapshot in force at the removal
+    fail_streak        INTEGER NOT NULL DEFAULT 0,  -- failed nightly reviews in a row
+    last_review_at     INTEGER,
+    last_review_run_id INTEGER,
+    last_review        TEXT               -- JSON list: exit rules failed at the last review ([] = passed)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS watchlist_one_open ON watchlist_membership (wallet) WHERE removed_at IS NULL;
+CREATE INDEX IF NOT EXISTS watchlist_wallet ON watchlist_membership (wallet, added_at);
+
+-- What each nightly review decided about each wallet, and why.
+CREATE TABLE IF NOT EXISTS watchlist_events (
+    id            INTEGER PRIMARY KEY,
+    at            INTEGER NOT NULL,
+    run_id        INTEGER,
+    wallet        TEXT NOT NULL,
+    membership_id INTEGER,
+    action        TEXT NOT NULL,          -- ADD | KEEP | FAIL | REMOVE | WAIT | SKIP
+    detail        TEXT
+);
+CREATE INDEX IF NOT EXISTS watchlist_events_run ON watchlist_events (run_id);
+
+CREATE TRIGGER IF NOT EXISTS watchlist_membership_keep BEFORE DELETE ON watchlist_membership
+BEGIN SELECT RAISE(ABORT, 'watchlist history is never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS watchlist_events_keep BEFORE DELETE ON watchlist_events
+BEGIN SELECT RAISE(ABORT, 'watchlist history is never deleted'); END;
+
 -- A group of one wallet's buys of one outcome token inside the dedupe window.
 CREATE TABLE IF NOT EXISTS alerts (
     id               INTEGER PRIMARY KEY,
@@ -177,7 +222,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     snapshot_run_id  INTEGER,             -- score run current when the alert fired
     discord_message_id TEXT,
     message          TEXT,
-    updated_at       INTEGER NOT NULL
+    updated_at       INTEGER NOT NULL,
+    membership_id    INTEGER,             -- watchlist_membership row the wallet was on when the alert fired
+    probation        INTEGER              -- 1 if that membership was still in probation at the time
 );
 CREATE INDEX IF NOT EXISTS alerts_group ON alerts (wallet, token_id, first_fill_ts);
 
@@ -294,9 +341,19 @@ CREATE TABLE IF NOT EXISTS kalshi_quote_windows (
 """
 
 
+# Columns added to existing tables after version 1. CREATE TABLE IF NOT EXISTS leaves
+# an existing table as it is, so these are added one by one; existing rows keep
+# every value they had and get NULL in the new column.
+ADDED_COLUMNS = (
+    (2, "alerts", "membership_id", "INTEGER"),
+    (2, "alerts", "probation", "INTEGER"),
+)
+
+
 class Database:
     def __init__(self, path: str) -> None:
         self.path = path
+        self.backup_path: str | None = None     # set when opening took a pre-migration backup
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
@@ -305,8 +362,46 @@ class Database:
         if path != ":memory:":
             self.conn.execute("PRAGMA journal_mode = WAL")
             self.conn.execute("PRAGMA busy_timeout = 5000")
+        version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        has_data = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1").fetchone() is not None
+        if has_data and version < SCHEMA_VERSION:
+            # Ground rule: back the database up before any migration. A database that
+            # cannot be backed up is not migrated.
+            if path != ":memory:":
+                self.backup_path = self.backup(f"pre-v{SCHEMA_VERSION}")
+                log.warning("database is at schema v%d; backed up to %s before migrating to v%d",
+                            version, self.backup_path, SCHEMA_VERSION)
         self.conn.executescript(SCHEMA)
+        self._add_columns()
         self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _add_columns(self) -> None:
+        for _version, table, column, decl in ADDED_COLUMNS:
+            have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+    def backup(self, label: str) -> str:
+        """Copy the whole database to ``<db dir>/backups/<name>.<UTC time>.<label>`` with
+        SQLite's online backup API (https://www.sqlite.org/backup.html), which is safe
+        while the file is in use and includes what is still in the write-ahead log; a
+        plain ``cp`` of a WAL database can miss recent writes."""
+        src = Path(self.path)
+        folder = src.parent / "backups"
+        folder.mkdir(parents=True, exist_ok=True)
+        need = src.stat().st_size
+        free = shutil.disk_usage(folder).free
+        if free < need * 1.05:
+            raise RuntimeError(
+                f"not enough disk space to back up {src} before migrating: need {need / 1e9:.2f} GB, "
+                f"{free / 1e9:.2f} GB free in {folder}. Free some space and start again; nothing was changed.")
+        dest = folder / f"{src.name}.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.{label}"
+        target = sqlite3.connect(dest)
+        try:
+            self.conn.backup(target)
+        finally:
+            target.close()
+        return str(dest)
 
     def close(self) -> None:
         self.conn.close()

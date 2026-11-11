@@ -37,7 +37,7 @@ BREAKDOWN_ROWS = 15
 QUERY = """
 SELECT p.*, a.wallet, a.kind, a.outcome, a.whale_price, a.whale_usd, a.first_fill_ts, a.last_fill_ts,
        a.trigger_fill_ts,
-       a.detected_at, a.posted_at, a.status AS alert_status, a.snapshot_run_id,
+       a.detected_at, a.posted_at, a.status AS alert_status, a.snapshot_run_id, a.probation, a.membership_id,
        m.category, m.question, m.slug, m.event_slug, m.game_start_time
 FROM paper_trades p
 JOIN alerts a ON a.id = p.alert_id
@@ -178,6 +178,8 @@ BREAKDOWN_KEYS: dict[str, Callable[[dict], str]] = {
     "category": lambda t: t["category"] or "unknown",
     "venue": lambda t: t["venue"],
     "entry price": lambda t: bucket(t["fill_price"] if t["fill_price"] is not None else t["alert_ask"]),
+    # Frozen on the alert when it fired (monitor._trigger), never recomputed.
+    "watchlist status": lambda t: {None: "before the watchlist", 1: "probation", 0: "established"}[t.get("probation")],
 }
 
 
@@ -359,6 +361,7 @@ CSV_FIELDS = [
     "whale_price", "whale_usd", "alert_ask", "fill_price", "contracts", "fees", "cost", "levels_walked",
     "settled_at", "settle_result", "payout_per_share", "payout", "pnl", "closing_price",
     "zero_price", "zero_cost", "zero_pnl", "atask_price", "atask_cost", "atask_pnl", "snapshot_run_id",
+    "membership_id", "probation",
 ]
 
 

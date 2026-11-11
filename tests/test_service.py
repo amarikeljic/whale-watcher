@@ -1,5 +1,6 @@
-"""Phase 6 and the loop: nightly rescoring rotates the monitored set, alerts link to the
-snapshot current when they fired, outages are reported once, and the loop degrades."""
+"""The loop: the nightly rescore reviews the watchlist, alerts link to the snapshot current
+when they fired, outages are reported once, and the loop degrades. The watchlist rules
+themselves are tested in test_watchlist.py."""
 
 from __future__ import annotations
 
@@ -15,6 +16,10 @@ def loosen(cfg):
     s.min_avg_stake_usd, s.min_clv_positions, s.top_k, s.rank_by, s.min_roi = 10, 1, 1, "roi", 0.0
     cfg.candidates.leaderboard_periods = ["month"]
     cfg.candidates.recent_trades_pages = 1
+    e, x = cfg.watchlist.entry, cfg.watchlist.exit
+    e.min_settled_markets, e.max_single_market_share, e.min_roi = 3, 1.0, 0.0
+    x.min_settled_markets, x.max_single_market_share, x.min_roi = 3, 1.0, 0.0
+    x.fail_reviews_in_a_row = 1          # these tests are about the loop, not about hysteresis
 
 
 def history(world: World, wallet: str, *, win: bool, start: int, n: int = 4, step: int = DAY,
@@ -27,7 +32,7 @@ def history(world: World, wallet: str, *, win: bool, start: int, n: int = 4, ste
         world.trade(wallet, opened, cond, index=0 if win else 1, size=250, price=0.4, usdc=100)
 
 
-async def test_rescore_rotates_and_alerts_link_to_the_snapshot_in_force(live_app, fake_http, clock):
+async def test_rescore_updates_the_watchlist_and_alerts_link_to_the_snapshot_in_force(live_app, fake_http, clock):
     loosen(live_app.cfg)
     world = World(fake_http)
     world.leaderboard = [{"rank": 1, "user_id": "0xaaaa", "pnl": 1000, "volume": 1, "user_name": "a"},
@@ -120,7 +125,7 @@ async def test_a_failing_wallet_does_not_stop_the_cycle(live_app, fake_http, clo
 
 async def test_an_empty_monitored_set_is_announced_once(live_app, fake_http, clock):
     loosen(live_app.cfg)
-    live_app.cfg.scoring.min_settled_markets = 999   # nobody can pass
+    live_app.cfg.watchlist.entry.min_settled_markets = 999   # nobody can join
     world = World(fake_http)
     world.leaderboard = [{"rank": 1, "user_id": "0xaaaa", "pnl": 1000, "volume": 1, "user_name": "a"}]
     history(world, "0xaaaa", win=True, start=NOW - 20 * DAY)
@@ -128,5 +133,5 @@ async def test_an_empty_monitored_set_is_announced_once(live_app, fake_http, clo
     svc = Service(live_app, sink)
     await svc.run(cycles=1)
     await svc._rescore()          # the next night: still nobody
-    notices = [t for _, t in sink.posts if "no wallet passed" in t]
+    notices = [t for _, t in sink.posts if "no wallet meets the watchlist entry rules" in t]
     assert len(notices) == 1 and "nothing is being monitored" in notices[0]

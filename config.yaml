@@ -17,7 +17,7 @@ scoring:
   max_days_since_last_trade: 30
   max_two_sided_ratio: 1.0        # spec: 0.40 (1.0 = off)
   min_roi: -1.0                   # spec: 0.05 (-1.0 = off)
-  top_k: 20                       # wallets to actively monitor
+  top_k: 20                       # research commands only (score, validate, backtest); live size is watchlist.max_size
   rank_by: roi                    # spec: clv. clv | clv_markout | roi | total_pnl
   # Additions not in the original spec (see README "Deviations"):
   entry_lookback_days: 180        # look this far before the window for entries in markets that settle inside it
@@ -62,6 +62,36 @@ rescore:
   enabled: true
   hour_utc: 0
   minute_utc: 20
+
+# The persistent watchlist (v2). Every night: score candidates, ADD wallets that meet
+# `entry`, re-score everyone on the list, and REMOVE a wallet only after it fails
+# `exit` on fail_reviews_in_a_row nights running. Entry is stricter than exit on
+# purpose, so a wallet near a line does not flip in and out. `python -m whalewatcher
+# watchlist` shows the list, `--last` the latest review, `--history` every add/removal.
+# Rules not listed here (unreliable markets, too-active wallets, ranking) come from `scoring`.
+watchlist:
+  max_size: 40
+  probation_days: 14              # new members are tracked, and flagged in alerts and stats
+  entry:
+    min_roi: 0.02                 # closes the gap that let a 1% ROI wallet in (Phase 0)
+    min_settled_markets: 30       # thin samples fake most apparent edge; costs no wallets today
+    min_profitable_months: 0      # 0 = off: no out-of-sample value in the walk-forward search
+    max_single_market_share: 0.20 # the one rule that held out of sample
+    max_two_sided_ratio: 1.0      # 1.0 = off: the two checks below do this job
+    max_days_since_last_trade: 30
+    max_rebate_share: 0.30        # market maker: this share of lifetime income is rebates + rewards
+    max_fills_per_market: 100     # bot: lifetime fills per market traded
+  exit:
+    min_roi: 0.0
+    min_settled_markets: 15
+    max_single_market_share: 0.30
+    max_two_sided_ratio: 1.0
+    max_days_since_last_trade: 45
+    max_rebate_share: 0.50
+    max_fills_per_market: 200
+    fail_reviews_in_a_row: 3      # nights in a row a wallet must fail before it is removed
+    live_min_events: 15           # once OUR paper trades on a wallet cover this many settled events...
+    live_max_clv: 0.0             # ...a mean closing-line value below this is a failed review
 
 api:
   user_agent: "whale-watcher/0.1 (read-only research)"

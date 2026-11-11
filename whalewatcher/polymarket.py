@@ -486,6 +486,14 @@ class DataApi:
         payload = await self.http.get_json(f"{self.base}/v2/status")
         return (payload or {}).get("data") or {}
 
+    # GET /v2/user-stats?user=.. (spec: https://data-api.polymarket.com/v2/openapi.json,
+    # path /v2/user-stats, checked 2026-11-10). `data` is null for an unknown wallet.
+    # `trades` counts distinct markets traded; all_time_pnl carries trade_count (fills),
+    # position_pnl, maker_rebate, taker_rebate and reward_income, all lifetime USDC.
+    async def user_stats(self, user: str) -> dict | None:
+        payload = await self.http.get_json(f"{self.base}/v2/user-stats", {"user": user})
+        return (payload or {}).get("data") or None
+
     # GET /v2/positions: user and/or condition; status OPEN (superset, includes
     # REDEEMABLE) | REDEEMABLE | CLOSED | ... current_size is shares held now.
     async def positions(self, user: str, *, conditions: list[str] | None = None,
