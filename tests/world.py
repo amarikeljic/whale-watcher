@@ -105,11 +105,21 @@ class World:
         return m
 
     def trade(self, wallet: str, ts: int, cond: str, *, side: str = "BUY", index: int = 0, size: float = 100,
-              price: float = 0.5, usdc: float | None = None, type_: str = "TRADE", tx: str | None = None) -> None:
-        self.activity.append({
+              price: float = 0.5, usdc: float | None = None, type_: str = "TRADE", tx: str | None = None,
+              feed: bool = False, activity: bool = True) -> None:
+        """``feed`` also puts the row on the global trade feed (the real feed carries every
+        trade); ``activity=False`` keeps it off the wallet's own activity, to test one route alone."""
+        row = self._row(wallet, ts, cond, side, index, size, price, usdc, type_, tx)
+        if activity:
+            self.activity.append(row)
+        if feed:
+            self.global_trades.append(dict(row))
+
+    def _row(self, wallet, ts, cond, side, index, size, price, usdc, type_, tx) -> dict[str, Any]:
+        return ({
             "proxy_wallet": wallet, "timestamp": ts, "condition_id": cond, "type": type_, "size": size,
             "usdc_size": usdc if usdc is not None else round(size * price, 6),
-            "transaction_hash": tx or f"0x{ts:x}{len(self.activity)}", "price": price,
+            "transaction_hash": tx or f"0x{ts:x}{len(self.activity) + len(self.global_trades)}", "price": price,
             "token_id": f"{cond}-t{index}" if type_ in ("TRADE", "REDEEM") else "",
             "side": side if type_ == "TRADE" else "", "outcome_index": index if type_ in ("TRADE", "REDEEM") else 999,
             "outcome": ["Yes", "No"][index] if type_ in ("TRADE", "REDEEM") else "",

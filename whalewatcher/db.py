@@ -20,8 +20,9 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 # 1: the original build. 2: v2 Phase 2, the persistent watchlist (watchlist_membership,
-# watchlist_events, alerts.membership_id, alerts.probation).
-SCHEMA_VERSION = 2
+# watchlist_events, alerts.membership_id, alerts.probation). 3: v2 Phase 3, the bot
+# model (fill_events, bot_trades, alerts.detect_delay, alerts.whale_position).
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallets (
@@ -269,6 +270,80 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     UNIQUE (alert_id, venue, strategy)
 );
 
+-- What the detector publishes: every fill of a tracked wallet, once, with the moment
+-- it was first seen. Runners read this table in id order and keep their own cursor,
+-- so they all see the same fills with the same timing and no API is asked twice.
+CREATE TABLE IF NOT EXISTS fill_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    fill_key      TEXT NOT NULL UNIQUE,   -- same key as wallet_trades.fill_key
+    wallet        TEXT NOT NULL,
+    ts            INTEGER NOT NULL,       -- block timestamp of the fill
+    condition_id  TEXT NOT NULL,
+    token_id      TEXT,
+    outcome       TEXT,
+    outcome_index INTEGER,
+    side          TEXT,
+    size          REAL,
+    usdc_size     REAL,
+    price         REAL,
+    tx_hash       TEXT,
+    detected_at   REAL NOT NULL,          -- wall clock when the detector first saw it (fractional seconds)
+    source        TEXT NOT NULL           -- feed (global trade feed) | backstop (per-wallet activity)
+);
+CREATE INDEX IF NOT EXISTS fill_events_wallet ON fill_events (wallet, token_id, ts);
+
+-- The bot model's ledger: one row per signal per strategy, whatever happened to it.
+-- Each (runner, strategy) is its own paper account: bankroll, exposure and P&L are
+-- all computed from its rows alone.
+CREATE TABLE IF NOT EXISTS bot_trades (
+    id               INTEGER PRIMARY KEY,
+    runner           TEXT NOT NULL,       -- single | consensus
+    strategy         TEXT NOT NULL,       -- flat_hold | flat_mirror | scaled_hold | placebo_late
+    alert_id         INTEGER REFERENCES alerts(id),
+    wallet           TEXT,
+    condition_id     TEXT NOT NULL,
+    token_id         TEXT NOT NULL,
+    event_key        TEXT NOT NULL,       -- event slug: several markets of one game are one risk
+    status           TEXT NOT NULL,       -- PENDING (placebo, waiting) | FILLED | MISSED | SKIPPED
+    reason           TEXT,                -- why MISSED (the book) or SKIPPED (a risk limit)
+    signal_ts        INTEGER NOT NULL,    -- block time of the whale fill that made the signal
+    detected_at      REAL NOT NULL,       -- when the detector saw that fill
+    decided_at       REAL NOT NULL,       -- when the order book was read and the decision made
+    due_at           REAL,                -- placebo only: when it enters
+    stake_usd        REAL NOT NULL,
+    whale_price      REAL,
+    best_ask         REAL,
+    fill_price       REAL,                -- VWAP of the walk, before fees
+    contracts        REAL,
+    fees             REAL,
+    cost             REAL,                -- fill_price * contracts + fees
+    levels           INTEGER,
+    -- comparison columns, same stake, never part of the headline
+    zero_price       REAL, zero_contracts REAL, zero_cost REAL, zero_pnl REAL,      -- at the whale's own price
+    human_due        REAL, human_done INTEGER NOT NULL DEFAULT 0,                   -- the old rule: a book walk
+    human_price      REAL, human_contracts REAL, human_cost REAL, human_pnl REAL,  -- human_delay_seconds later
+    -- mirror exits
+    whale_shares     REAL,                -- what the whale held in this outcome when we entered
+    whale_sold       REAL NOT NULL DEFAULT 0,   -- what it has sold since
+    exit_due         INTEGER NOT NULL DEFAULT 0,
+    exit_tried_at    REAL,
+    exit_at          REAL,
+    exit_price       REAL,
+    exit_fees        REAL,
+    proceeds         REAL,
+    -- the end of the trade: an exit or the market's resolution
+    closed_at        INTEGER,
+    result           TEXT,                -- WIN | LOSS | SPLIT | EXIT
+    payout_per_share REAL,
+    pnl              REAL,
+    closing_price    REAL,                -- closing line (pre-game fills only)
+    markout_price    REAL,                -- price markout_seconds after our fill (every fill)
+    markout_done     INTEGER NOT NULL DEFAULT 0,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE (runner, strategy, alert_id)
+);
+CREATE INDEX IF NOT EXISTS bot_trades_open ON bot_trades (runner, strategy, closed_at);
+
 CREATE TABLE IF NOT EXISTS service_state (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
@@ -347,6 +422,8 @@ CREATE TABLE IF NOT EXISTS kalshi_quote_windows (
 ADDED_COLUMNS = (
     (2, "alerts", "membership_id", "INTEGER"),
     (2, "alerts", "probation", "INTEGER"),
+    (3, "alerts", "detect_delay", "REAL"),      # detector saw the triggering fill this long after its block
+    (3, "alerts", "whale_position", "REAL"),    # shares the whale held in the outcome when the alert fired
 )
 
 
@@ -362,18 +439,36 @@ class Database:
         if path != ":memory:":
             self.conn.execute("PRAGMA journal_mode = WAL")
             self.conn.execute("PRAGMA busy_timeout = 5000")
-        version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
-        has_data = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1").fetchone() is not None
-        if has_data and version < SCHEMA_VERSION:
-            # Ground rule: back the database up before any migration. A database that
-            # cannot be backed up is not migrated.
-            if path != ":memory:":
+        # Several processes (detector, runners, a CLI command) can start at once. A file
+        # lock makes exactly one of them back up and migrate; the others wait and then
+        # find the database already current.
+        with self._migration_lock():
+            version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+            has_data = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1").fetchone() is not None
+            if has_data and version < SCHEMA_VERSION and path != ":memory:":
+                # Ground rule: back the database up before any migration. A database that
+                # cannot be backed up is not migrated.
                 self.backup_path = self.backup(f"pre-v{SCHEMA_VERSION}")
                 log.warning("database is at schema v%d; backed up to %s before migrating to v%d",
                             version, self.backup_path, SCHEMA_VERSION)
-        self.conn.executescript(SCHEMA)
-        self._add_columns()
-        self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            if version < SCHEMA_VERSION:
+                self.conn.executescript(SCHEMA)
+                self._add_columns()
+                self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    @contextmanager
+    def _migration_lock(self) -> Iterator[None]:
+        if self.path == ":memory:":
+            yield
+            return
+        import fcntl
+        with open(f"{self.path}.migrate.lock", "w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
     def _add_columns(self) -> None:
         for _version, table, column, decl in ADDED_COLUMNS:

@@ -39,19 +39,65 @@ candidates:
   max_candidates: 400
 
 alerts:
-  poll_interval_seconds: 60
+  poll_interval_seconds: 60       # the per-wallet backstop; detection itself is bot.feed_poll_seconds
   min_whale_trade_usd: 500
   dedupe_window_seconds: 300
   min_price: 0.05
   max_price: 0.95
   max_alert_age_seconds: 600      # older fills (API lag, start-up backlog) are skipped as stale
 
+# The old rule (one paper fill a poll after the alert). Closed to new alerts since the
+# bot model below started; these settings still settle its open trades, and
+# max_slippage is the miss rule of the bot's "old rule" comparison column.
 paper:
   stake_usd: 10
   reaction_polls: 1
   max_slippage: 0.03
   strategy: hold_to_resolution
   settle_interval_seconds: 600
+
+# The bot model (v2 Phase 3): PAPER ONLY. A detector publishes each tracked wallet's
+# fills seconds after they happen; the runner acts on the order book at that instant.
+# Each strategy is its own paper account with its own bankroll and limits.
+bot:
+  feed_poll_seconds: 1.0          # global trade feed. 1 request/s is about 3% of its rate limit
+  runner_poll_seconds: 0.5        # how often the runner looks for newly published fills
+  max_signal_age_seconds: 30      # acting later than this is not "seconds after the whale": MISSED
+  max_slippage: 0.03              # limit price = the whale's price + this. Beyond it: MISSED, not chased
+  human_delay_seconds: 60         # the old rule, kept as a comparison column on every signal
+  mirror_exit_fraction: 0.5       # flat_mirror sells once the whale has sold this share of its position
+  scale_whale_usd: 500            # scaled_hold: stake = stake_usd x (whale's buy / this), capped
+  placebo_min_delay_seconds: 300  # placebo_late: the same outcome, bought at a random time this long...
+  placebo_max_delay_seconds: 1800 # ...to this long after the signal. The control for "does timing matter?"
+  markout_seconds: 300            # price this long after our fill: CLV that also works for in-play fills
+  flat_hold:                      # fixed stake, held to resolution. The headline
+    starting_bankroll: 1000
+    stake_usd: 10
+    max_stake_usd: 10
+    max_market_exposure_usd: 30   # open cost in one market
+    max_event_exposure_usd: 50    # ...and in one event (one game has several markets)
+    daily_loss_limit_usd: 100     # realised loss in a UTC day that pauses new entries
+  flat_mirror:                    # fixed stake, sold when the whale sells
+    starting_bankroll: 1000
+    stake_usd: 10
+    max_stake_usd: 10
+    max_market_exposure_usd: 30
+    max_event_exposure_usd: 50
+    daily_loss_limit_usd: 100
+  scaled_hold:                    # stake grows with the whale's buy, $10 to $50
+    starting_bankroll: 1000
+    stake_usd: 10
+    max_stake_usd: 50
+    max_market_exposure_usd: 100
+    max_event_exposure_usd: 150
+    daily_loss_limit_usd: 200
+  placebo_late:                   # the control arm
+    starting_bankroll: 1000
+    stake_usd: 10
+    max_stake_usd: 10
+    max_market_exposure_usd: 30
+    max_event_exposure_usd: 50
+    daily_loss_limit_usd: 100
 
 stats:
   min_settled_for_conclusions: 30

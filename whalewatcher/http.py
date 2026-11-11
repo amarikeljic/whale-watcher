@@ -149,7 +149,10 @@ class HttpClient:
         self.attempts = attempts
         self.health: dict[str, HostHealth] = {}
         self._cache: OrderedDict[str, tuple[float, int, Any]] = OrderedDict()
-        self._etags: dict[str, tuple[str, Any]] = {}
+        # Bounded: the detector asks a URL it has never asked before every second, and
+        # an unbounded map of URL -> payload would grow by a page of trades each time.
+        self._etags: OrderedDict[str, tuple[str, Any]] = OrderedDict()
+        self._max_etags = 256
         self._max_cache = max_cache_entries
         self._inflight: dict[str, asyncio.Future] = {}
         self._session = None
@@ -296,6 +299,9 @@ class HttpClient:
             new_etag = resp_headers.get("ETag") if method == "GET" else None
             if new_etag:
                 self._etags[url] = (new_etag, payload)
+                self._etags.move_to_end(url)
+                while len(self._etags) > self._max_etags:
+                    self._etags.popitem(last=False)
             return payload
         raise HttpError(f"failed after {self.attempts} attempts: {url}: {last_error}")
 

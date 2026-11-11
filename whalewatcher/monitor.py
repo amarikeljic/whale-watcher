@@ -21,9 +21,11 @@ import logging
 from dataclasses import dataclass, field
 
 from .app import App
+from .bot import Bot
+from .detector import Detector
 from .discord import NullSink, Sink
 from .paper import PaperEngine
-from .polymarket import Activity, Book, MarketInfo, assign_fill_keys
+from .polymarket import Activity, Book, MarketInfo
 from .timeutil import iso
 from .watchlist import membership_at
 
@@ -43,6 +45,8 @@ class PollStats:
     errors: int = 0
     data_lag: int | None = None
     paper_filled: list[int] = field(default_factory=list)
+    exits_marked: int = 0
+    bot: dict[str, int] = field(default_factory=dict)
 
 
 def short(wallet: str) -> str:
@@ -69,7 +73,20 @@ def score_line(app: App, wallet: str, run_id: int | None) -> str:
             f"{r['profitable_months']}/{r['months_in_window']} profitable months  (snapshot #{run_id})")
 
 
-def format_alert(app: App, alert, market: MarketInfo | None, *, run_id: int | None, lag: int | None) -> str:
+def bot_line(app: App, alert_id: int, runner: str = "single") -> str | None:
+    """What the paper bot did with this signal (the flat_hold account), for the alert text."""
+    t = app.db.one("SELECT * FROM bot_trades WHERE runner = ? AND strategy = 'flat_hold' AND alert_id = ?",
+                   (runner, alert_id))
+    if t is None:
+        return None
+    delay = t["decided_at"] - t["signal_ts"]
+    if t["status"] == "FILLED":
+        return (f"Paper bot: bought ${t['stake_usd']:g} at {t['fill_price']:.3f}, {delay:.0f}s after the whale")
+    return f"Paper bot: {t['status'].lower()} ({t['reason']})"
+
+
+def format_alert(app: App, alert, market: MarketInfo | None, *, run_id: int | None, lag: int | None,
+                 bot_line: str | None = None) -> str:
     kind = "opened a position" if alert["kind"] == "NEW" else "added to a position"
     question = market.question if market else alert["condition_id"]
     ask = "n/a" if alert["alert_best_ask"] is None else f"{alert['alert_best_ask']:.3f}"
@@ -83,6 +100,8 @@ def format_alert(app: App, alert, market: MarketInfo | None, *, run_id: int | No
         f"Whale trade: {iso(alert['first_fill_ts'])}   detected: {iso(alert['detected_at'])}",
         f"Polymarket: {market.url if market else 'https://polymarket.com'}",
     ]
+    if bot_line:
+        lines.append(bot_line)
     if alert["probation"]:
         lines.append("Watchlist: on probation (recently added; counted separately in the stats)")
     if lag is not None and lag > 120:
@@ -92,55 +111,95 @@ def format_alert(app: App, alert, market: MarketInfo | None, *, run_id: int | No
 
 
 class Monitor:
-    def __init__(self, app: App, sink: Sink, *, paper: PaperEngine | None = None,
-                 max_alert_age_seconds: int | None = None) -> None:
+    """The ``single`` runner: turns published fills of watchlist wallets into alerts
+    (one per buy group that crosses the threshold), posts them, and hands each one to
+    the paper bot the moment it is detected.
+
+    ``embedded`` runs a detector inside this process (tests, and a plain ``monitor``
+    with no detector container). With ``embedded=False`` this class only reads what
+    the separate detector process published. ``paper`` without ``bot`` is the pre-v3 behaviour
+    (one human-delay paper trade per alert), kept for the tests of that rule."""
+
+    RUNNER = "single"
+
+    def __init__(self, app: App, sink: Sink, *, paper: PaperEngine | None = None, bot: Bot | None = None,
+                 embedded: bool = True, max_alert_age_seconds: int | None = None) -> None:
         self.app = app
         self.sink = sink
         self.paper = paper
+        self.bot = bot
+        self.embedded = embedded
+        self.detector = Detector(app) if embedded else None
         self.cfg = app.cfg.alerts
         self.max_alert_age = max_alert_age_seconds or self.cfg.max_alert_age_seconds
+        self._lag: int | None = None
+        self._lag_at = 0.0
 
     @property
     def run_id(self) -> int | None:
         return self.app.db.get_state("monitored_run_id")
 
+    @property
+    def cursor_key(self) -> str:
+        return f"runner_cursor:{self.RUNNER}"
+
     def wallets(self):
         return self.app.db.query("SELECT * FROM monitored_wallets WHERE active = 1 ORDER BY rank")
 
-    async def poll_once(self) -> PollStats:
+    async def _data_lag(self) -> int | None:
+        """serving.lag_seconds from /v2/status, asked at most twice a minute."""
+        now = self.app.wall()
+        if now - self._lag_at >= 30 or self._lag_at == 0.0:
+            self._lag_at = now
+            try:
+                status = await self.app.data.status()
+                self._lag = (status.get("serving") or {}).get("lag_seconds")
+            except Exception as exc:
+                log.debug("status check failed: %s", exc)
+        return self._lag
+
+    def _new_events(self) -> list:
+        cursor = int(self.app.db.get_state(self.cursor_key, 0))
+        return self.app.db.query("SELECT * FROM fill_events WHERE id > ? ORDER BY id LIMIT 2000", (cursor,))
+
+    async def poll_once(self, *, backstop: bool | None = True) -> PollStats:
+        """One runner step: (detect, when the detector is embedded,) then act on every
+        newly published fill, then the things that fall due with time."""
         app = self.app
         counter = int(app.db.get_state("poll_counter", 0)) + 1
         app.db.set_state("poll_counter", counter)
         stats = PollStats(counter)
         if self.paper is not None:
             stats.paper_filled = await self.paper.process_due(counter)
-        try:
-            status = await app.data.status()
-            stats.data_lag = (status.get("serving") or {}).get("lag_seconds")
-        except Exception as exc:
-            log.debug("status check failed: %s", exc)
-
-        buys: list[Activity] = []
-        wallets = self.wallets()
-        stats.wallets = len(wallets)
-        for w in wallets:
-            try:
-                new = await self._poll_wallet(w)
-            except Exception as exc:  # degrade: skip this wallet this cycle
-                stats.errors += 1
-                log.warning("poll failed for %s: %s", w["wallet"], exc)
-                continue
-            stats.new_fills += len(new)
-            buys.extend(r for r in new if r.side == "BUY")
+        stats.data_lag = await self._data_lag()
+        if self.embedded:
+            found = await self.detector.poll_once(backstop=backstop)
+            stats.errors += found.errors
+        watched = {w["wallet"] for w in self.wallets()}
+        stats.wallets = len(watched)
+        events = self._new_events()
+        mine = [e for e in events if e["wallet"] in watched]
+        stats.new_fills = len(mine)
         self._prune_small_groups()
-        for fill in sorted(buys, key=lambda r: r.ts):
-            outcome = await self._handle_buy(fill, counter, stats.data_lag)
+        for e in sorted(mine, key=lambda e: (e["ts"], e["id"])):
+            if e["side"] == "SELL":
+                if self.bot is not None:
+                    stats.exits_marked += self.bot.on_whale_sell(e["wallet"], e["token_id"] or "", e["size"] or 0.0,
+                                                                 e["ts"])
+                continue
+            if e["side"] != "BUY":
+                continue
+            outcome = await self._handle_buy(_as_activity(e), counter, stats.data_lag, detected_at=e["detected_at"])
             if outcome == "alert":
                 stats.alerts += 1
             elif outcome == "skipped":
                 stats.skipped += 1
             elif outcome == "edit":
                 stats.edits += 1
+        if events:
+            app.db.set_state(self.cursor_key, events[-1]["id"])
+        if self.bot is not None:
+            stats.bot = await self.bot.tick()
         return stats
 
     def _prune_small_groups(self) -> None:
@@ -156,31 +215,6 @@ class Monitor:
                          "(SELECT id FROM alerts WHERE status = 'BELOW_THRESHOLD' AND first_fill_ts < ?)", (cutoff,))
             conn.execute("DELETE FROM alerts WHERE status = 'BELOW_THRESHOLD' AND first_fill_ts < ?", (cutoff,))
 
-    async def _poll_wallet(self, w) -> list[Activity]:
-        app = self.app
-        now = app.clock()
-        overlap = max(self.cfg.dedupe_window_seconds, 3 * self.cfg.poll_interval_seconds)
-        start = (w["last_seen_ts"] or now - 2 * self.cfg.poll_interval_seconds) - overlap
-        rows, _ = await app.data.activity(w["wallet"], types=("TRADE",), start=start, end=now + 60,
-                                          max_rows=3000)
-        assign_fill_keys(rows)
-        new: list[Activity] = []
-        for r in rows:
-            cur = app.db.execute(
-                "INSERT OR IGNORE INTO wallet_trades (wallet, ts, type, condition_id, token_id, outcome, "
-                "outcome_index, side, size, usdc_size, price, tx_hash, fill_key, seen_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (r.wallet, r.ts, r.type, r.condition_id, r.token_id, r.outcome, r.outcome_index, r.side,
-                 r.size, r.usdc_size, r.price, r.tx_hash, r.fill_key, now))
-            if cur.rowcount == 1:
-                new.append(r)
-        newest = max([r.ts for r in rows], default=None)
-        app.db.execute(
-            "UPDATE monitored_wallets SET last_polled_at = ?, last_seen_ts = MAX(COALESCE(last_seen_ts, 0), ?) "
-            "WHERE wallet = ?", (now, newest or (w["last_seen_ts"] or now - 2 * self.cfg.poll_interval_seconds),
-                                 w["wallet"]))
-        return new
-
     def _group_for(self, fill: Activity):
         window = self.cfg.dedupe_window_seconds
         return self.app.db.one(
@@ -188,7 +222,8 @@ class Monitor:
             "AND status != 'BACKTEST' ORDER BY first_fill_ts DESC LIMIT 1",
             (fill.wallet, fill.token_id, fill.ts, window))
 
-    async def _handle_buy(self, fill: Activity, counter: int, lag: int | None) -> str:
+    async def _handle_buy(self, fill: Activity, counter: int, lag: int | None, *,
+                          detected_at: float | None = None) -> str:
         app = self.app
         now = app.clock()
         group = self._group_for(fill)
@@ -226,7 +261,7 @@ class Monitor:
             if alert["whale_usd"] < self.cfg.min_whale_trade_usd:
                 return "below"
             try:
-                return await self._trigger(alert, fill, counter, lag)
+                return await self._trigger(alert, fill, counter, lag, detected_at=detected_at)
             except Exception as exc:
                 # The fill will not come round again, so record the alert rather than lose it.
                 log.warning("alert %s failed: %s", alert_id, exc)
@@ -236,16 +271,23 @@ class Monitor:
                 return "failed"
         if alert["status"] == "POSTED" and alert["discord_message_id"]:
             market = app.markets.get(alert["condition_id"])
-            message = format_alert(app, alert, market, run_id=alert["snapshot_run_id"], lag=lag)
+            message = format_alert(app, alert, market, run_id=alert["snapshot_run_id"], lag=lag,
+                                   bot_line=bot_line(app, alert_id, self.RUNNER) if self.bot else None)
             if await self.sink.edit(alert["discord_message_id"], message):
                 app.db.execute("UPDATE alerts SET message = ? WHERE id = ?", (message, alert_id))
             return "edit"
         return "grouped"
 
-    async def _trigger(self, alert, fill: Activity, counter: int, lag: int | None) -> str:
-        """The group just crossed the threshold: decide, record, post, paper trade."""
+    async def _trigger(self, alert, fill: Activity, counter: int, lag: int | None, *,
+                       detected_at: float | None = None) -> str:
+        """The group just crossed the threshold: decide, paper trade, record, post.
+
+        Order matters for latency. The bot acts first, on the order book read at this
+        instant; the slower things a bot would not wait for (the whale's position
+        lookup, the Discord post) come after."""
         app = self.app
         now = app.clock()
+        detected_at = float(now) if detected_at is None else detected_at
         markets = await app.markets.ensure([alert["condition_id"]], refresh_after=300)
         market = markets.get(alert["condition_id"])
         book: Book | None = None
@@ -253,7 +295,7 @@ class Monitor:
             book = await app.clob.book(alert["token_id"])
         except Exception as exc:
             log.warning("book fetch failed for %s: %s", alert["token_id"], exc)
-        kind = await self._kind(alert)
+        decided_at = app.wall()
         ask = book.best_ask if book else None
         bid = book.best_bid if book else None
         reason = self._skip_reason(alert, fill, market, book, now)
@@ -262,13 +304,25 @@ class Monitor:
         # still on probation, frozen now so later knowledge cannot leak into the judging.
         member = membership_at(app, alert["wallet"], now)
         app.db.execute(
-            "UPDATE alerts SET kind = ?, detected_at = ?, trigger_fill_ts = ?, alert_best_ask = ?, alert_best_bid = ?, "
-            "alert_book_ts = ?, snapshot_run_id = ?, membership_id = ?, probation = ?, updated_at = ? WHERE id = ?",
-            (kind, now, fill.ts, ask, bid, book.ts if book else None, run_id,
+            "UPDATE alerts SET detected_at = ?, trigger_fill_ts = ?, alert_best_ask = ?, alert_best_bid = ?, "
+            "alert_book_ts = ?, snapshot_run_id = ?, membership_id = ?, probation = ?, detect_delay = ?, "
+            "updated_at = ? WHERE id = ?",
+            (int(detected_at), fill.ts, ask, bid, book.ts if book else None, run_id,
              member["id"] if member else None,
-             (1 if now < member["probation_until"] else 0) if member else None, now, alert["id"]))
+             (1 if now < member["probation_until"] else 0) if member else None,
+             detected_at - fill.ts, now, alert["id"]))
         alert = app.db.one("SELECT * FROM alerts WHERE id = ?", (alert["id"],))
-        message = format_alert(app, alert, market, run_id=run_id, lag=lag)
+        tradable = not reason and market is not None
+        if tradable and self.bot is not None:
+            self.bot.enter(alert, market, book, detected_at=detected_at, decided_at=decided_at)
+
+        kind, held = await self._kind(alert)
+        app.db.execute("UPDATE alerts SET kind = ?, whale_position = ? WHERE id = ?", (kind, held, alert["id"]))
+        if self.bot is not None:
+            self.bot.set_whale_position(alert["id"], held)
+        alert = app.db.one("SELECT * FROM alerts WHERE id = ?", (alert["id"],))
+        message = format_alert(app, alert, market, run_id=run_id, lag=lag,
+                               bot_line=bot_line(app, alert["id"], self.RUNNER) if self.bot else None)
         if reason:
             app.db.execute("UPDATE alerts SET status = 'SKIPPED', skip_reason = ?, message = ? WHERE id = ?",
                            (reason, message, alert["id"]))
@@ -285,7 +339,9 @@ class Monitor:
         app.db.execute("UPDATE alerts SET status = ?, posted_at = ?, discord_message_id = ?, message = ? WHERE id = ?",
                        (status, posted_at, message_id, message, alert["id"]))
         log.info("alert %s %s:\n%s", alert["id"], status, message)
-        if status in ("POSTED", "UNSENT") and self.paper is not None and market is not None:
+        # Before v3 every alert got one human-delay paper trade. With the bot running
+        # that rule lives on as the bot's human_* comparison columns instead.
+        if self.bot is None and status in ("POSTED", "UNSENT") and self.paper is not None and market is not None:
             self.paper.open(alert["id"], poll_counter=counter, market=market)
         return "alert" if status != "FAILED" else "failed"
 
@@ -306,12 +362,20 @@ class Monitor:
             return f"price {price:.3f} outside {cfg.min_price:g}-{cfg.max_price:g}"
         return None
 
-    async def _kind(self, alert) -> str:
-        """NEW unless the wallet already held this outcome before the group started."""
+    async def _kind(self, alert) -> tuple[str, float | None]:
+        """(NEW or ADD, shares the wallet holds in this outcome now). NEW unless it
+        already held the outcome before the group started."""
         try:
             rows = await self.app.data.positions(alert["wallet"], conditions=[alert["condition_id"]])
         except Exception:
-            rows = []
+            return "NEW", None
         held = sum(float(r.get("current_size") or 0) for r in rows if str(r.get("token_id")) == alert["token_id"])
         before = held - alert["whale_shares"]
-        return "ADD" if before > max(1.0, 0.01 * alert["whale_shares"]) else "NEW"
+        return ("ADD" if before > max(1.0, 0.01 * alert["whale_shares"]) else "NEW"), held
+
+
+def _as_activity(e) -> Activity:
+    return Activity(wallet=e["wallet"], ts=e["ts"], type="TRADE", condition_id=e["condition_id"],
+                    token_id=e["token_id"] or "", outcome=e["outcome"] or "", outcome_index=e["outcome_index"],
+                    side=e["side"] or "", size=e["size"] or 0.0, usdc_size=e["usdc_size"] or 0.0,
+                    price=e["price"] or 0.0, tx_hash=e["tx_hash"] or "", fill_key=e["fill_key"])

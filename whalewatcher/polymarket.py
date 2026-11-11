@@ -433,6 +433,24 @@ class DataApi:
         raw, _ = await self._pages("/v2/trades", params, max_pages=max_pages)
         return [Activity.from_api({**r, "type": "TRADE"}) for r in raw]
 
+    # GET /v2/trades with no user/condition: the global feed, newest first, limit <= 1000
+    # (spec https://data-api.polymarket.com/v2/openapi.json; rate limit 300 req/10 s,
+    # https://docs.polymarket.com/api-reference/rate-limits.md). taker_only=false adds
+    # the maker rows. Responses carry `cache-control: public, max-age=300`, and an
+    # identical URL is answered from that cache (measured 2026-11-10: newest row 10 s
+    # old against 2-3 s for a URL not seen before), hence the nonce.
+    async def trade_feed(self, *, limit: int = 1000, nonce: str | None = None,
+                         cursor: str | None = None) -> tuple[list[Activity], str | None]:
+        """One page of every trade on the platform, and the cursor for the next page."""
+        params: dict[str, Any] = {"limit": limit, "taker_only": "false"}
+        if nonce:
+            params["_t"] = nonce
+        if cursor:
+            params["cursor"] = cursor
+        payload = await self.http.get_json(f"{self.base}/v2/trades", params)
+        rows = [Activity.from_api({**r, "type": "TRADE"}) for r in (payload or {}).get("data") or []]
+        return rows, ((payload or {}).get("pagination") or {}).get("next_cursor")
+
     async def trade_pages(self, *, min_usd: float | None = None, taker_only: bool = True,
                           max_pages: int = 20, page_size: int = 1000):
         """Pages of the global /v2/trades feed, newest first, for callers that stop

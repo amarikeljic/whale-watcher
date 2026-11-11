@@ -1,9 +1,9 @@
 # Whale Watcher
 
 Finds Polymarket wallets that look consistently profitable, alerts in Discord
-when one of them opens or adds to a position, and **paper trades every alert at
-the price available one poll later**, after fees, to answer one question: would
-copying them make money after a realistic reaction delay?
+when one of them opens or adds to a position, and **paper trades every alert the
+way a bot would: against the live order book, seconds after the whale**, after
+fees, to answer one question: would copying them make money?
 
 Research tool. It **never places orders**, never asks for or stores wallet keys,
 seed phrases or trading credentials, and publishes no ports. It covers whale
@@ -44,7 +44,8 @@ python -m whalewatcher watchlist                    # who is being watched: metr
 python -m whalewatcher watchlist --last             # what the latest nightly review added, kept, removed, and why
 python -m whalewatcher watchlist --history          # every add and removal ever (never deleted)
 python -m whalewatcher watchlist --review           # run the nightly review now
-python -m whalewatcher monitor [--no-post] [--cycles N]
+python -m whalewatcher detector                     # watch trades, publish tracked wallets' fills (own container)
+python -m whalewatcher monitor [--no-post] [--cycles N] [--no-detector]   # the runner: alerts + the paper bot
 python -m whalewatcher settle
 python -m whalewatcher stats [--post]
 python -m whalewatcher export --csv exports/paper_trades.csv
@@ -108,6 +109,68 @@ its n and CI.
 written as strategy `backtest:*`. `stats` shows them in their own section,
 labelled SIMULATED, never mixed into the live numbers. See "Would copying have
 made money?" below.
+
+**The bot model** (`detector.py`, `bot.py`, v2 Phase 3). Paper only: no order
+is ever placed, nothing is signed, no key exists.
+
+*Detection.* One detector process publishes every fill of a tracked wallet
+once, into the `fill_events` table, with the moment it was first seen. It has
+two routes on one dedupe key:
+
+* the **global trade feed** (`GET /v2/trades`, maker fills included), polled
+  once a second. Measured over 600 polls: a fill shows up a median 3.4 s after
+  its block. Each request carries a unique parameter, because an identical URL
+  is answered from a 300-second cache.
+* a **per-wallet backstop** once a minute, which cannot miss a fill and catches
+  whatever the feed dropped or happened while the detector was down.
+
+Runners read `fill_events` from their own cursor, so the APIs are asked once
+and every runner sees identical timing. Detector and runner are **separate
+containers**: one crashing or restarting never stops the other, the detector
+keeps publishing while the runner is down, and the runner resumes where it
+stopped. The runner says so in Discord if the detector's heartbeat goes stale.
+The nightly review runs as a child process so the bot never freezes for it.
+
+*The fill.* When a buy group crosses the alert threshold, the bot reads the
+order book at once and walks the asks for its stake as a fill-or-kill limit
+order at `whale price + max_slippage`. Fees are charged per level. Each signal
+leaves one row per strategy in `bot_trades`, whatever happened:
+
+| Status | Meaning |
+|---|---|
+| FILLED | the book absorbed the stake inside the limit |
+| MISSED | the price had already run, the book was too thin, the market had closed, or we acted more than 30 s after the whale |
+| SKIPPED | a risk limit refused it; the reason is stored |
+
+*Strategies*, each its own paper account (bankroll, exposure, ledger, P&L):
+
+| Strategy | Rule |
+|---|---|
+| `flat_hold` | $10, held to resolution. The headline |
+| `flat_mirror` | $10, sold into the bids once the whale has sold half of what it held when we entered |
+| `scaled_hold` | $10 to $50, growing with the size of the whale's buy |
+| `placebo_late` | the control: the same outcome, $10, bought at a random time 5 to 30 minutes later |
+
+The placebo is what tells timing apart from market choice. If copying a whale
+within seconds carries information, `flat_hold` has to beat `placebo_late` on
+the signals both filled; `stats` prints that paired difference with its
+interval. Another study's copy edge more than halved against this kind of
+control (docs/v2-research.md).
+
+*Risk limits per strategy:* starting bankroll, stake cap, open cost per market,
+open cost per **event** (wallets pile into the same game, and those results move
+together), and a daily realised-loss limit that pauses new entries until
+00:00 UTC.
+
+*Comparison columns* on the hold strategies, same stake, never in the headline:
+`zero_*` is the whale's own price (no latency at all) and `human_*` is the old
+rule (a book walk 60 s later). Paper trades made before the bot model stay in
+`paper_trades` under their old label and `stats` shows them as their own
+section.
+
+*CLV.* Pre-game fills are compared with the closing line as before. Every fill,
+in-play included, also gets the price 5 minutes after it, which is the only
+honest reference for a bet placed during a game.
 
 **The watchlist** (`watchlist.py`, v2). The monitored set is a list that
 grows, not a nightly top 20. Every night the service scores candidates with
@@ -491,12 +554,17 @@ worse.
 
 ## Known limits
 
-* Detection is polling (60 s) plus the Data API's indexing lag, which
-  `/v2/status` reports and alerts flag when it exceeds 2 minutes.
+* Detection is the public trade feed polled once a second: a median of about
+  3.5 s behind the whale, never sub-second. A websocket or mempool watcher
+  would be faster (docs/v2-research.md); both were left out because the first
+  is an unsupported legacy feed and the second needs a paid node.
+* A paper fill assumes we could take the book we saw. A real order would
+  arrive later still and move the price; treat results as an upper bound.
+* Two tracked wallets filled identically in one transaction used to collide on
+  one key and the second fill was dropped. The detector now keeps both; scoring
+  history fetched before this fix may be missing a few such fills.
 * Positions opened more than `entry_lookback_days` before the lookback window
   and held to resolution without any later activity are invisible to scoring.
-* Phase 3b (`mirror_exits`) is not implemented. SELL fills are already stored
-  for it.
 * Discord's webhook endpoints could not be re-read from the build sandbox. They
   follow the published API, and the tests mock them.
 

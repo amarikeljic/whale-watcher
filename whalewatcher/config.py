@@ -140,6 +140,42 @@ class WatchlistConfig:
 
 
 @dataclass
+class StrategyConfig:
+    """One paper account: its own bankroll and its own limits."""
+    enabled: bool = True
+    starting_bankroll: float = 1000.0
+    stake_usd: float = 10.0
+    max_stake_usd: float = 10.0
+    max_market_exposure_usd: float = 30.0   # open cost in one market
+    max_event_exposure_usd: float = 50.0    # ...and in one event: wallets pile into the same game
+    daily_loss_limit_usd: float = 100.0     # realised loss in a UTC day that pauses new entries
+
+
+def _scaled() -> StrategyConfig:
+    return StrategyConfig(max_stake_usd=50.0, max_market_exposure_usd=100.0, max_event_exposure_usd=150.0,
+                          daily_loss_limit_usd=200.0)
+
+
+@dataclass
+class BotConfig:
+    """v2 Phase 3: a bot that acts the moment a whale fill is detected."""
+    feed_poll_seconds: float = 1.0          # global trade feed: 1 req/s is ~3% of its 300 per 10 s limit
+    runner_poll_seconds: float = 0.5        # how often a runner looks for newly published fills
+    max_signal_age_seconds: float = 30.0    # older than this when we act: not "seconds after the whale"
+    max_slippage: float = 0.03              # limit price = the whale's price + this (do not chase further)
+    human_delay_seconds: int = 60           # the old rule, kept as a comparison column
+    mirror_exit_fraction: float = 0.5       # flat_mirror sells when the whale has sold this share of its position
+    scale_whale_usd: float = 500.0          # scaled_hold: stake = stake_usd x whale_usd / this, capped
+    placebo_min_delay_seconds: int = 300    # placebo_late enters the same outcome at a random later time
+    placebo_max_delay_seconds: int = 1800
+    markout_seconds: int = 300              # price this long after our fill, for CLV on every fill
+    flat_hold: StrategyConfig = field(default_factory=StrategyConfig)
+    flat_mirror: StrategyConfig = field(default_factory=StrategyConfig)
+    scaled_hold: StrategyConfig = field(default_factory=_scaled)
+    placebo_late: StrategyConfig = field(default_factory=StrategyConfig)
+
+
+@dataclass
 class ApiConfig:
     # https://docs.polymarket.com/api-reference/rate-limits.md (verified 2026-11-07)
     data_api: str = "https://data-api.polymarket.com"
@@ -182,6 +218,7 @@ class Config:
     stats: StatsConfig = field(default_factory=StatsConfig)
     rescore: RescoreConfig = field(default_factory=RescoreConfig)
     watchlist: WatchlistConfig = field(default_factory=WatchlistConfig)
+    bot: BotConfig = field(default_factory=BotConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
     # Secrets, from the environment only.
     discord_webhook_url: str | None = field(default=None, repr=False)
@@ -207,22 +244,26 @@ _SECTIONS = {
     "stats": StatsConfig,
     "rescore": RescoreConfig,
     "watchlist": WatchlistConfig,
+    "bot": BotConfig,
     "api": ApiConfig,
 }
 
 
-def _build(cls: type, raw: dict[str, Any], where: str) -> Any:
+def _build(cls: type, raw: dict[str, Any], where: str, base: Any = None) -> Any:
+    """``base`` is the instance whose values apply to keys the file leaves out
+    (a nested section can have defaults that differ from its class's)."""
     if not isinstance(raw, dict):
         raise ConfigError(f"{where} must be a mapping")
+    base = cls() if base is None else base
     known = {f.name: f for f in dataclasses.fields(cls)}
     unknown = sorted(set(raw) - set(known))
     if unknown:
         raise ConfigError(f"unknown key(s) in {where}: {', '.join(unknown)}")
     values = {}
     for name, value in raw.items():
-        default = getattr(cls(), name)
+        default = getattr(base, name)
         if dataclasses.is_dataclass(default):
-            values[name] = _build(type(default), value or {}, f"{where}.{name}")
+            values[name] = _build(type(default), value or {}, f"{where}.{name}", default)
             continue
         if isinstance(default, bool):
             if not isinstance(value, bool):
@@ -235,7 +276,10 @@ def _build(cls: type, raw: dict[str, Any], where: str) -> Any:
                 raise ConfigError(f"{where}.{name} must be a number")
             value = float(value)
         values[name] = value
-    return cls(**values)
+    return dataclasses.replace(base, **values)
+
+
+BOT_STRATEGIES = ("flat_hold", "flat_mirror", "scaled_hold", "placebo_late")
 
 
 def validate(cfg: Config) -> None:
@@ -271,6 +315,21 @@ def validate(cfg: Config) -> None:
                                   w.entry.max_fills_per_market <= w.exit.max_fills_per_market)):
         if not entry_stricter:
             raise ConfigError(f"watchlist.entry.{name} must be at least as strict as watchlist.exit.{name}")
+    b = cfg.bot
+    if b.feed_poll_seconds < 0.5:
+        raise ConfigError("bot.feed_poll_seconds must be at least 0.5 (the feed's rate limit is shared)")
+    if b.runner_poll_seconds <= 0:
+        raise ConfigError("bot.runner_poll_seconds must be positive")
+    if not 0 < b.mirror_exit_fraction <= 1:
+        raise ConfigError("bot.mirror_exit_fraction must be within 0..1")
+    if b.placebo_min_delay_seconds > b.placebo_max_delay_seconds:
+        raise ConfigError("bot.placebo_min_delay_seconds cannot exceed bot.placebo_max_delay_seconds")
+    for name in BOT_STRATEGIES:
+        st = getattr(b, name)
+        if st.stake_usd <= 0 or st.starting_bankroll <= 0:
+            raise ConfigError(f"bot.{name}: stake_usd and starting_bankroll must be positive")
+        if st.max_stake_usd < st.stake_usd:
+            raise ConfigError(f"bot.{name}.max_stake_usd cannot be below stake_usd")
     p = cfg.paper
     if p.stake_usd <= 0:
         raise ConfigError("paper.stake_usd must be positive")

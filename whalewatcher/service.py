@@ -1,11 +1,19 @@
-"""The long-running service and the commands that read its results.
+"""The long-running processes and the commands that read their results.
 
-One loop, one process, nothing listening on any port:
+Nothing listens on any port. Two processes share the database (v2 Phase 3):
 
-    every poll_interval_seconds   paper fills that are due -> poll wallets -> alerts
+  detector   watches trades and publishes each tracked wallet's fills (detector.py)
+  monitor    the `single` runner: reads published fills -> alerts -> paper bot, plus
+             the housekeeping:
+
     every settle_interval_seconds settle resolved paper trades
     nightly at rescore.hour_utc   rescore with data up to today, review the watchlist (watchlist.py)
     daily at daily_summary_hour   post the stats summary to the stats webhook
+
+They are separate containers so that one crashing, restarting or pausing never
+stops the other: the detector keeps publishing while a runner is down, and the
+runner picks up from its cursor when it returns. A plain ``monitor`` with no
+detector container still works: it runs the detector inside its own process.
 
 Failures degrade instead of crashing: a wallet that fails is skipped for that
 cycle, a host that stays down is reported once and again when it recovers, and
@@ -17,20 +25,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import sys
 import time
 
 from .app import App, open_app
+from .bot import Bot
 from .config import Config
+from .detector import HEARTBEAT_KEY as DETECTOR_HEARTBEAT_KEY
+from .detector import Detector
 from .discord import DiscordWebhook, NullSink, Sink
 from .monitor import DATA_HOST, Monitor
 from .paper import PaperEngine
-from .stats import daily_summary, export_csv, render
+from .stats import daily_summary, export_bot_csv, export_csv, render
 from .timeutil import from_ts, iso
 from .watchlist import nightly, seed_from_monitored, sync_monitored
 
 log = logging.getLogger(__name__)
 
 HEARTBEAT_KEY = "heartbeat"
+HEARTBEAT_EVERY = 5.0          # seconds between heartbeat writes: the loops tick faster than that
+DETECTOR_STALE_SECONDS = 90
 
 
 async def rescore(app: App, *, as_of: int | None = None) -> int | None:
@@ -43,14 +57,32 @@ async def rescore(app: App, *, as_of: int | None = None) -> int | None:
 
 
 class Service:
-    def __init__(self, app: App, sink: Sink, stats_sink: Sink | None = None) -> None:
+    """The `single` runner and the housekeeping. ``with_detector`` also runs the
+    detector in this process; False means a separate detector process publishes."""
+
+    def __init__(self, app: App, sink: Sink, stats_sink: Sink | None = None, *, with_detector: bool = True,
+                 review_in_subprocess: bool = False, config_path: str | None = None) -> None:
         self.app = app
         self.sink = sink
         self.stats_sink = stats_sink
-        self.paper = PaperEngine(app)
-        self.monitor = Monitor(app, sink, paper=self.paper)
+        self.with_detector = with_detector
+        # The nightly review scores hundreds of wallets: minutes of work, some of it
+        # pure computation that would freeze this loop, and a bot that is frozen
+        # misses every signal in that window. The live service runs it as a child
+        # process and keeps trading; tests run it in-process.
+        self.detector_grace = 0.0 if not review_in_subprocess else 600.0    # live service only
+        self.review_in_subprocess = review_in_subprocess
+        self.config_path = config_path
+        self._review_task: asyncio.Task | None = None
+        self.paper = PaperEngine(app)            # settles the pre-v3 paper trades; opens no new ones
+        self.bot = Bot(app, Monitor.RUNNER)
+        self.monitor = Monitor(app, sink, paper=self.paper, bot=self.bot, embedded=with_detector)
         self.stop = asyncio.Event()
         self._outage_reported: str | None = None
+        self._detector_down = False
+        self._started = time.monotonic()
+        self._beat_at = 0.0
+        self._quiet_since = 0.0
 
     async def run(self, *, cycles: int | None = None) -> None:
         app, cfg = self.app, self.app.cfg
@@ -61,24 +93,42 @@ class Service:
             await self._rescore()
             # That was today's rescore; do not run another one after the first poll.
             app.db.set_state("last_rescore_day", from_ts(app.clock()).strftime("%Y-%m-%d"))
+        interval = cfg.bot.feed_poll_seconds if self.with_detector else cfg.bot.runner_poll_seconds
+        log.info("runner `single` started: %s, a step every %gs",
+                 "detector in this process" if self.with_detector else "reading the detector process's fills",
+                 interval)
         done = 0
+        totals = {"fills": 0, "alerts": 0, "skipped": 0, "errors": 0}
         while not self.stop.is_set():
             started = time.monotonic()
             try:
-                stats = await self.monitor.poll_once()
-                log.info("poll #%d: %d wallets, %d new fills, %d alerts, %d skipped, %d edits, %d errors, "
-                         "%d paper fills, data lag %ss", stats.counter, stats.wallets, stats.new_fills,
-                         stats.alerts, stats.skipped, stats.edits, stats.errors, len(stats.paper_filled),
-                         stats.data_lag)
+                # backstop=None: the per-wallet safety net runs when it is due, not every step
+                stats = await self.monitor.poll_once(backstop=None)
+                totals["fills"] += stats.new_fills
+                totals["alerts"] += stats.alerts
+                totals["skipped"] += stats.skipped
+                totals["errors"] += stats.errors
+                # A step every second: log one line when something happened, and a
+                # summary once a minute otherwise, instead of 86,400 lines a day.
+                if stats.alerts or stats.skipped or stats.errors or time.monotonic() - self._quiet_since >= 60:
+                    self._quiet_since = time.monotonic()
+                    log.info("step #%d: %d wallets | since last line: %d new fills, %d alerts, %d skipped, "
+                             "%d errors | data lag %ss", stats.counter, stats.wallets, totals["fills"],
+                             totals["alerts"], totals["skipped"], totals["errors"], stats.data_lag)
+                    totals = dict.fromkeys(totals, 0)
                 await self._periodic()
             except Exception:
                 log.exception("cycle failed; continuing")
-            app.db.set_state(HEARTBEAT_KEY, app.clock())
-            await self._report_outage()
+            if time.monotonic() - self._beat_at >= HEARTBEAT_EVERY or cycles is not None:
+                self._beat_at = time.monotonic()
+                app.db.set_state(HEARTBEAT_KEY, app.clock())
+                if self.with_detector:
+                    app.db.set_state(DETECTOR_HEARTBEAT_KEY, app.clock())
+                await self._report_outage()
             done += 1
             if cycles is not None and done >= cycles:
                 break
-            wait = max(0.0, cfg.alerts.poll_interval_seconds - (time.monotonic() - started))
+            wait = max(0.0, interval - (time.monotonic() - started))
             try:
                 await asyncio.wait_for(self.stop.wait(), timeout=wait)
             except TimeoutError:
@@ -90,6 +140,10 @@ class Service:
         otherwise look exactly like a broken service."""
         app = self.app
         run_id = await rescore(app)
+        await self._after_review(run_id)
+
+    async def _after_review(self, run_id: int | None) -> None:
+        app = self.app
         if self.monitor.wallets():
             app.db.set_state("empty_notice_run", None)
             return
@@ -103,20 +157,46 @@ class Service:
             "so nothing is being monitored and no alerts will fire. Loosen watchlist.entry in config.yaml or "
             "wait for a wallet to qualify; see `python -m whalewatcher watchlist --last` for why.")
 
+    async def _review_in_child(self) -> None:
+        """`python -m whalewatcher watchlist --review` as a child process. Its report goes
+        to this container's log; the list it leaves in the database is picked up on the
+        next step, because the runner reads the watched wallets every step."""
+        cmd = [sys.executable, "-m", "whalewatcher"]
+        if self.config_path:
+            cmd += ["--config", self.config_path]
+        cmd += ["watchlist", "--review"]
+        log.info("nightly review started in a child process")
+        try:
+            proc = await asyncio.create_subprocess_exec(*cmd)
+            code = await proc.wait()
+        except Exception:
+            log.exception("nightly review could not be started")
+            return
+        if code != 0:
+            log.error("nightly review exited with code %s; the watchlist is unchanged", code)
+            return
+        log.info("nightly review finished")
+        await self._after_review(self.app.db.get_state("monitored_run_id"))
+
     async def _periodic(self) -> None:
         app, cfg = self.app, self.app.cfg
         now = app.clock()
         if now - int(app.db.get_state("last_settle_at", 0)) >= cfg.paper.settle_interval_seconds:
             settled = await self.paper.settle()
+            closed = await self.bot.settle()
             app.db.set_state("last_settle_at", now)
-            if settled:
-                log.info("settled %d paper trades", settled)
+            if settled or closed:
+                log.info("settled %d old-rule paper trades and %d bot trades", settled, closed)
         today = from_ts(now).strftime("%Y-%m-%d")
         dt = from_ts(now)
         if (cfg.rescore.enabled and app.db.get_state("last_rescore_day") != today
                 and (dt.hour, dt.minute) >= (cfg.rescore.hour_utc, cfg.rescore.minute_utc)):
             app.db.set_state("last_rescore_day", today)
-            await self._rescore()
+            if self.review_in_subprocess:
+                if self._review_task is None or self._review_task.done():
+                    self._review_task = asyncio.create_task(self._review_in_child())
+            else:
+                await self._rescore()
         if (self.stats_sink is not None and app.db.get_state("last_summary_day") != today
                 and dt.hour >= cfg.stats.daily_summary_hour_utc):
             app.db.set_state("last_summary_day", today)
@@ -135,6 +215,60 @@ class Service:
             self._outage_reported = None
             log.info("outage over")
             await target.post("✅ Whale Watcher: Polymarket data is answering again.")
+        # The detector is a separate process: if it stops, nothing is detected and
+        # silence would look exactly like a quiet market.
+        if self.with_detector:
+            return
+        beat = self.app.db.get_state(DETECTOR_HEARTBEAT_KEY)
+        stale = beat is None or self.app.clock() - int(beat) > DETECTOR_STALE_SECONDS
+        # Both containers start together and the detector may still be backing up and
+        # migrating the database: no alarm until it has had time to write a heartbeat.
+        warming_up = beat is None and time.monotonic() - self._started < self.detector_grace
+        if stale and not self._detector_down and not warming_up:
+            self._detector_down = True
+            log.error("detector heartbeat is stale (%s): no fills are being detected", iso(beat))
+            await target.post("⚠ Whale Watcher: the detector is not running (last heartbeat "
+                              f"{iso(beat)}). No whale fills are being detected until it is back.")
+        elif not stale and self._detector_down:
+            self._detector_down = False
+            await target.post("✅ Whale Watcher: the detector is running again.")
+
+
+async def run_detector(app: App, stop: asyncio.Event, *, cycles: int | None = None) -> None:
+    """The detector process: one feed poll every feed_poll_seconds, the per-wallet
+    backstop every alerts.poll_interval_seconds, a heartbeat every few seconds."""
+    detector = Detector(app)
+    interval = app.cfg.bot.feed_poll_seconds
+    log.info("detector started: global trade feed every %gs, per-wallet backstop every %ds",
+             interval, app.cfg.alerts.poll_interval_seconds)
+    done = published = backstop = errors = 0
+    beat_at = line_at = 0.0
+    while not stop.is_set():
+        started = time.monotonic()
+        try:
+            stats = await detector.poll_once()
+            published += stats.published
+            backstop += stats.from_backstop
+            errors += stats.errors
+        except Exception:
+            log.exception("detector step failed; continuing")
+        if time.monotonic() - beat_at >= HEARTBEAT_EVERY or cycles is not None:
+            beat_at = time.monotonic()
+            app.db.set_state(DETECTOR_HEARTBEAT_KEY, app.clock())
+        if time.monotonic() - line_at >= 60:
+            line_at = time.monotonic()
+            log.info("detector: %d wallets tracked | last minute: %d fills published (%d only the backstop saw), "
+                     "%d errors, %d feed gaps so far", len(detector.tracked()), published, backstop, errors,
+                     detector.gaps)
+            published = backstop = errors = 0
+        done += 1
+        if cycles is not None and done >= cycles:
+            break
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=max(0.0, interval - (time.monotonic() - started)))
+        except TimeoutError:
+            pass
+    log.info("detector stopped after %d steps", done)
 
 
 def _sinks(app: App, *, post: bool) -> tuple[Sink, Sink | None]:
@@ -150,22 +284,29 @@ def _sinks(app: App, *, post: bool) -> tuple[Sink, Sink | None]:
 
 async def run_command(args, cfg: Config) -> int:
     async with open_app(cfg) as app:
-        if args.command == "monitor":
-            sink, stats_sink = _sinks(app, post=not args.no_post)
-            if isinstance(sink, NullSink):
-                log.warning("no Discord webhook in use: alerts are stored as UNSENT and still paper traded")
-            service = Service(app, sink, stats_sink)
+        if args.command in ("monitor", "detector"):
+            stop = asyncio.Event()
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGTERM, signal.SIGINT):
                 try:
-                    loop.add_signal_handler(sig, service.stop.set)
+                    loop.add_signal_handler(sig, stop.set)
                 except (NotImplementedError, RuntimeError):
                     pass
+            if args.command == "detector":
+                await run_detector(app, stop, cycles=args.cycles)
+                return 0
+            sink, stats_sink = _sinks(app, post=not args.no_post)
+            if isinstance(sink, NullSink):
+                log.warning("no Discord webhook in use: alerts are stored as UNSENT and still paper traded")
+            service = Service(app, sink, stats_sink, with_detector=not args.no_detector,
+                              review_in_subprocess=True, config_path=args.config)
+            service.stop = stop
             await service.run(cycles=1 if args.once else args.cycles)
             return 0
         if args.command == "settle":
             n = await PaperEngine(app).settle()
-            print(f"settled {n} paper trades")
+            m = await Bot(app, Monitor.RUNNER).settle()
+            print(f"settled {n} old-rule paper trades and {m} bot trades")
             return 0
         if args.command == "stats":
             text = render(app)
@@ -179,10 +320,13 @@ async def run_command(args, cfg: Config) -> int:
             return 0
         if args.command == "export":
             n = export_csv(app, args.csv)
-            print(f"wrote {n} paper trades to {args.csv}")
+            print(f"wrote {n} old-rule paper trades to {args.csv}")
+            bot_path = str(args.csv).removesuffix(".csv") + "_bot.csv"
+            m = export_bot_csv(app, bot_path)
+            print(f"wrote {m} bot trades to {bot_path}")
             return 0
         if args.command == "health":
-            beat = app.db.get_state(HEARTBEAT_KEY)
+            beat = app.db.get_state(DETECTOR_HEARTBEAT_KEY if args.detector else HEARTBEAT_KEY)
             limit = 5 * cfg.alerts.poll_interval_seconds
             if beat is None or app.clock() - int(beat) > limit:
                 print(f"unhealthy: last heartbeat {iso(beat)}")

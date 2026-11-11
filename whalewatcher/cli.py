@@ -407,7 +407,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run the nightly review now (score, add, keep, remove), then show the result")
     w.add_argument("--as-of", help="with --review: use data up to this date (default: today 00:00 UTC)")
 
-    for name, helptext in (("monitor", "run the live alert + paper trading loop"),
+    d = sub.add_parser("detector", help="watch trades and publish tracked wallets' fills (its own container)")
+    d.add_argument("--cycles", type=int, help="stop after this many feed polls")
+
+    for name, helptext in (("monitor", "run the `single` runner: alerts + the paper bot (+ the detector, unless "
+                                       "--no-detector)"),
                            ("settle", "settle open paper trades once"),
                            ("stats", "print paper-trading statistics"),
                            ("export", "write all paper trades to CSV"),
@@ -417,6 +421,10 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--once", action="store_true", help="one poll cycle, then exit")
             sp.add_argument("--cycles", type=int, help="stop after this many poll cycles")
             sp.add_argument("--no-post", action="store_true", help="never post to Discord (dry run)")
+            sp.add_argument("--no-detector", action="store_true",
+                            help="do not detect in this process: a separate `detector` process publishes the fills")
+        if name == "health":
+            sp.add_argument("--detector", action="store_true", help="check the detector's heartbeat instead")
         if name == "stats":
             sp.add_argument("--post", action="store_true", help="also post the summary to the stats webhook")
         if name == "export":

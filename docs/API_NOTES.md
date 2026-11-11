@@ -23,6 +23,7 @@ Migration guide: https://docs.polymarket.com/migrate/data-api-v1-to-v2.md
 | Resolutions | `GET /v2/resolutions?condition=..` (<=20 ids) | Condition rows: `resolved_at` (RFC3339), `payouts` (micro-USDC per share). UMA rows: `last_update_timestamp` (epoch string), `price` (1e18 = first outcome; `"69"` = unset). |
 | CLV prices | `GET /v2/prices-history?token_id=..&as_of=..` | Latest observation at or before `as_of`. 1-minute data kept >= 7 days, 5-minute >= 60, 30-minute >= 90; 3h/12h permanent. Each point has `resolution_seconds`. |
 | ADD vs NEW | `GET /v2/positions?user=..&condition=..` | `current_size` is shares held now. |
+| Detection (v2 Phase 3) | `GET /v2/trades?taker_only=false&limit=1000&_t=<unique>` | The global feed, newest first. Maker rows are 46% of fills of $500+. An identical URL is served from a 300 s cache, so each request adds a unique `_t`. Measured 2026-11-10: median 3.4 s from block to first sight, page spans 4-45 s. 1 req/s is ~3% of the 300/10 s limit. Rows match `/v2/activity` exactly (39 of 39 wallets, 2026-11-11), so one fill key serves both. |
 | Market-maker / bot screen | `GET /v2/user-stats?user=..` | `data` is null for an unknown wallet. `trades` = distinct markets traded. `all_time_pnl` has `trade_count` (fills), `position_pnl`, `maker_rebate`, `taker_rebate`, `reward_income` (lifetime USDC). Checked 2026-11-10. |
 | Freshness | `GET /v2/status` | `serving.lag_seconds`; used to flag delayed data in alerts. |
 

@@ -360,8 +360,9 @@ async def test_an_alert_records_its_membership_probation_and_snapshot(live_app, 
     # The earlier alert keeps what was true when it fired.
     assert live_app.db.one("SELECT probation FROM alerts WHERE id = ?", (early["id"],))["probation"] == 1
 
-    from whalewatcher.stats import BREAKDOWN_KEYS, load_trades
-    status = {t["condition_id"]: BREAKDOWN_KEYS["watchlist status"](t) for t in load_trades(live_app)}
+    from whalewatcher.stats import BREAKDOWN_KEYS, load_bot_trades
+    status = {t["condition_id"]: BREAKDOWN_KEYS["watchlist status"](t) for t in load_bot_trades(live_app)
+              if t["strategy"] == "flat_hold"}
     assert status == {"0xlive1": "probation", "0xlive2": "established"}
 
 

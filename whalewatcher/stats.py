@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .app import App
-from .stats_util import max_drawdown, mean, two_way_bootstrap_mean_ci
+from .stats_util import max_drawdown, mean, median, two_way_bootstrap_mean_ci
 from .timeutil import iso
 
 PRICE_BUCKETS = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0)]
@@ -87,6 +87,172 @@ class Summary:
 
 def load_trades(app: App) -> list[dict]:
     return [dict(r) for r in app.db.query(QUERY)]
+
+
+# -- the bot model (v2 Phase 3) -------------------------------------------------------
+
+BOT_HEADLINE = "flat_hold"
+BOT_QUERY = """
+SELECT b.*, a.kind, a.outcome, a.whale_usd, a.probation, a.membership_id, a.detect_delay, a.trigger_fill_ts,
+       a.snapshot_run_id, m.category, m.question, m.slug, m.event_slug, m.game_start_time
+FROM bot_trades b
+LEFT JOIN alerts a ON a.id = b.alert_id
+LEFT JOIN poly_markets m ON m.condition_id = b.condition_id
+ORDER BY b.signal_ts, b.id
+"""
+
+
+def load_bot_trades(app: App) -> list[dict]:
+    """Bot ledger rows, with the names ``summarise`` and the breakdowns read."""
+    out = []
+    for r in app.db.query(BOT_QUERY):
+        d = dict(r)
+        d.update(venue=f"bot:{d['runner']}", settled_at=d["closed_at"], miss_reason=d["reason"],
+                 alert_ts=d["signal_ts"], alert_ask=d["best_ask"], atask_pnl=None,
+                 fill_ts=d["decided_at"] if d["status"] == "FILLED" else None,
+                 # the whale's price is the zero-latency reference on every strategy
+                 zero_price=d["zero_price"] if d["zero_price"] is not None else d["whale_price"])
+        out.append(d)
+    return out
+
+
+def _quantile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+
+
+def detection_lines(app: App) -> list[str]:
+    """How long after the whale's fill we saw it: the distribution, not just a mean."""
+    limit = app.cfg.alerts.max_alert_age_seconds
+    rows = [r["detect_delay"] for r in app.db.query(
+        "SELECT detect_delay FROM alerts WHERE detect_delay IS NOT NULL AND status != 'BACKTEST'")]
+    # A fill first seen more than max_alert_age late was not a slow detection: the
+    # detector was not running (a restart, an outage). Counted, not averaged in.
+    delays = [d for d in rows if d <= limit]
+    late = len(rows) - len(delays)
+    if not delays:
+        return []
+    fast = sum(1 for d in delays if d <= 5) / len(delays)
+    src = {r["source"]: r["n"] for r in app.db.query("SELECT source, COUNT(*) n FROM fill_events GROUP BY source")}
+    return [f"DETECTION DELAY (whale's fill -> our detector saw it), n={len(delays)} alerts: "
+            f"median {median(delays):.1f}s | p90 {_quantile(delays, 0.9):.1f}s | p99 {_quantile(delays, 0.99):.1f}s | "
+            f"max {max(delays):.0f}s | {fast:.0%} within 5s (target: median under 5s)",
+            f"  fills published: {src.get('feed', 0)} from the global feed, {src.get('backstop', 0)} that only the "
+            "per-wallet backstop saw"
+            + (f" | {late} more alerts were first seen over {limit // 60} min late (detector restarts or outages)"
+               if late else "")]
+
+
+def _paired(a: list[dict], b: list[dict], samples: int) -> tuple[int, float | None, float | None, float | None]:
+    """Mean P&L difference (a - b) on the signals both strategies filled and closed."""
+    other = {t["alert_id"]: t for t in b if t["status"] == "FILLED" and t["closed_at"] is not None}
+    pairs = [(t, other[t["alert_id"]]) for t in a
+             if t["status"] == "FILLED" and t["closed_at"] is not None and t["alert_id"] in other]
+    if not pairs:
+        return 0, None, None, None
+    diffs = [x["pnl"] / x["cost"] - y["pnl"] / y["cost"] for x, y in pairs]
+    m, lo, hi = two_way_bootstrap_mean_ci(diffs, [x["wallet"] for x, _ in pairs], [event_key(x) for x, _ in pairs],
+                                          samples=samples)
+    return len(pairs), m, lo, hi
+
+
+def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], threshold: int, samples: int,
+                        *, brief: bool) -> list[str]:
+    from .bot import Bot
+    traded = [t for t in rows if t["status"] != "SKIPPED"]
+    skipped = [t for t in rows if t["status"] == "SKIPPED"]
+    s = summarise(f"{runner} / {strategy}", traded, samples=samples)
+    acct = Bot(app, runner).account(strategy)
+    if brief and strategy != BOT_HEADLINE:
+        head = _brief_summary(s, threshold)
+        head[0] += f" | bankroll ${acct.equity:,.2f}"
+        return head
+    note = {"flat_hold": "bot fill at detection, held to resolution; the headline",
+            "flat_mirror": "bot fill, sold when the whale sells",
+            "scaled_hold": "stake grows with the whale's size, capped",
+            "placebo_late": "the control: same outcome at a random later time"}.get(strategy, "")
+    lines = [f"== {runner} / {strategy} ({note}) =="]
+    if s.settled < threshold:
+        lines.append(f"  ⚠ only {s.settled} closed trades: not enough to draw conclusions (need {threshold})")
+    lines.append(f"  signals {len(rows)} | filled {s.filled} | missed {s.missed} | skipped {len(skipped)} | "
+                 f"waiting {s.pending} | closed {s.settled} | open {s.open}")
+    if s.missed:
+        lines.append("  missed because: " + ", ".join(f"{k} {v}" for k, v in sorted(s.miss_reasons.items())))
+    if skipped:
+        why: dict[str, int] = defaultdict(int)
+        for t in skipped:
+            why[(t["reason"] or "unknown").split(":")[0]] += 1
+        lines.append("  skipped by a risk limit: " + ", ".join(f"{k} {v}" for k, v in sorted(why.items())))
+    lines.append(f"  paper bankroll ${acct.equity:,.2f} (started ${acct.starting:,.2f}) | open at cost "
+                 f"${acct.open_cost:,.2f} | free ${acct.cash:,.2f} | closed today {_money(acct.today)}")
+    if s.settled:
+        lines.append(f"  total P&L {_money(s.total_pnl)} on ${s.total_cost:,.2f} staked (n={s.settled} closed) | "
+                     f"ROI {_pct(s.roi)} | win rate {s.win_rate:.0%}")
+        lines.append(f"  mean ROI per trade {_pct(s.mean_roi)}, 95% CI {_ci_text(s)}, n={s.settled} "
+                     f"({s.wallets} wallets, {s.events} events, resampled together)")
+        verdict = _verdict(s)
+        if verdict:
+            lines.append(f"  -> {verdict}")
+        lines.append(f"  max drawdown {_money(-s.max_drawdown) if s.max_drawdown else '$0.00'}")
+    else:
+        lines.append("  no closed trades yet, so no P&L.")
+    if brief:
+        return lines
+
+    def cents(x: float | None) -> str:
+        return "-" if x is None else f"{x:+.3f}"
+
+    marks = [t["markout_price"] - t["fill_price"] for t in traded
+             if t["status"] == "FILLED" and t["markout_price"] is not None]
+    inplay = f", {s.clv_inplay_excluded} in-play fills have no closing line" if s.clv_inplay_excluded else ""
+    lines.append(f"  CLV: closing line {cents(s.avg_clv)} (n={s.clv_n}{inplay}) | price "
+                 f"{app.cfg.bot.markout_seconds // 60} min after our fill {cents(mean(marks))} (n={len(marks)}, every fill)")
+    decide = [t["decided_at"] - t["signal_ts"] for t in traded if t["status"] in ("FILLED", "MISSED")
+              and strategy != "placebo_late"]
+    if decide:
+        lines.append(f"  whale's fill -> our decision: median {median(decide):.1f}s | p90 {_quantile(decide, 0.9):.1f}s "
+                     f"(n={len(decide)})")
+    lines.append(f"  price vs the whale, per share: whale -> best ask when we looked {cents(s.avg_detection_cost)} "
+                 f"(n={s.detection_n}, missed included) | whale -> our fill {cents(s.avg_latency_cost)} (filled only)")
+    done = [t for t in traded if t["closed_at"] is not None and t["zero_pnl"] is not None and t["human_pnl"] is not None]
+    if done:
+        lines.append(f"  same {len(done)} closed signals, same stake, a miss counted as $0: bot "
+                     f"{_money(sum(t['pnl'] or 0.0 for t in done))} | zero latency (the whale's price) "
+                     f"{_money(sum(t['zero_pnl'] for t in done))} | old rule ({app.cfg.bot.human_delay_seconds}s later) "
+                     f"{_money(sum(t['human_pnl'] for t in done))}")
+    return lines
+
+
+def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_breakdowns: bool) -> list[str]:
+    from .config import BOT_STRATEGIES
+    trades = load_bot_trades(app)
+    if not trades:
+        return []
+    lines = ["BOT PAPER TRADES: a bot that buys the moment a whale fill is detected (paper only)"]
+    by: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for t in trades:
+        by[(t["runner"], t["strategy"])].append(t)
+    order = {name: i for i, name in enumerate(BOT_STRATEGIES)}
+    for (runner, strategy), rows in sorted(by.items(), key=lambda kv: (kv[0][0], order.get(kv[0][1], 99))):
+        lines += _bot_strategy_lines(app, runner, strategy, rows, threshold, samples, brief=brief)
+    for runner in sorted({r for r, _ in by}):
+        n, m, lo, hi = _paired(by.get((runner, BOT_HEADLINE), []), by.get((runner, "placebo_late"), []), samples)
+        if n:
+            ci = "-" if lo is None else f"[{_pct(lo)}, {_pct(hi)}]"
+            verdict = ("copying beats the control" if lo is not None and lo > 0 else
+                       "the control beats copying" if hi is not None and hi < 0 else
+                       "no difference shown: the whale's timing has not been shown to matter")
+            lines.append(f"  {runner}: flat_hold minus placebo_late, ROI per trade on the {n} signals both filled: "
+                         f"{_pct(m)}, 95% CI {ci} -> {verdict}")
+    lines += detection_lines(app)
+    if with_breakdowns:
+        headline = [t for t in trades if t["strategy"] == BOT_HEADLINE and t["status"] != "SKIPPED"]
+        if headline:
+            lines += _breakdown_lines(headline, f" ({BOT_HEADLINE})",
+                                      ("watchlist status", "month", "category", "entry price", "wallet"))
+    return lines
 
 
 def in_play(t: dict) -> bool:
@@ -260,22 +426,36 @@ def render(app: App, *, with_breakdowns: bool = True, brief_backtest: bool = Fal
     live = [t for t in trades if not is_backtest(t)]
     simulated = [t for t in trades if is_backtest(t)]
     lines: list[str] = []
-    live_settled = sum(1 for t in live if t["status"] == "FILLED" and t["settled_at"] is not None)
-    if live_settled < threshold:
-        lines.append(f"⚠ NOT ENOUGH DATA TO DRAW CONCLUSIONS YET: {live_settled} settled live paper trades "
+    bot = bot_lines(app, threshold=threshold, samples=samples, brief=brief_backtest, with_breakdowns=with_breakdowns)
+    if bot:
+        headline = app.db.one("SELECT COUNT(*) n FROM bot_trades WHERE strategy = ? AND status = 'FILLED' "
+                              "AND closed_at IS NOT NULL", (BOT_HEADLINE,))["n"]
+        label = "closed bot paper trades (flat_hold)"
+    else:
+        headline = sum(1 for t in live if t["status"] == "FILLED" and t["settled_at"] is not None)
+        label = "settled live paper trades"
+    if headline < threshold:
+        lines.append(f"⚠ NOT ENOUGH DATA TO DRAW CONCLUSIONS YET: {headline} {label} "
                      f"(need at least {threshold}). Every live number below is noise until then.")
         lines.append("")
-    if not trades:
+    if not trades and not bot:
         lines.append("No paper trades yet.")
         return "\n".join(lines)
 
-    lines.append("LIVE PAPER TRADES")
+    if bot:
+        lines += bot
+        lines.append("")
+        lines.append("OLD RULE, LIVE: one paper fill a poll (about a minute) after the alert. Closed to new alerts "
+                     "since the bot model started; kept for comparison.")
+    else:
+        lines.append("LIVE PAPER TRADES")
     if not live:
-        lines.append("  No live paper trades yet.")
+        lines.append("  No live paper trades under the old rule." if bot else "  No live paper trades yet.")
     for (venue, strategy), group in _per_strategy(live):
-        lines += _render_summary(summarise(f"{venue} / {strategy}", group, samples=samples), threshold)
+        summary = summarise(f"{venue} / {strategy}", group, samples=samples)
+        lines += _brief_summary(summary, threshold) if bot and brief_backtest else _render_summary(summary, threshold)
     if with_breakdowns and live:
-        lines += _breakdown_lines(live, "", BREAKDOWN_KEYS)
+        lines += _breakdown_lines(live, " (old rule)" if bot else "", BREAKDOWN_KEYS)
 
     if simulated:
         lines.append("")
@@ -373,6 +553,26 @@ def export_csv(app: App, path: str) -> int:
         writer.writeheader()
         for t in trades:
             writer.writerow(t)
+    return len(trades)
+
+
+BOT_CSV_FIELDS = [
+    "id", "runner", "strategy", "status", "reason", "alert_id", "wallet", "category", "question", "outcome",
+    "condition_id", "token_id", "event_key", "signal_ts", "detected_at", "decided_at", "detect_delay", "stake_usd",
+    "whale_price", "best_ask", "fill_price", "contracts", "fees", "cost", "levels", "zero_price", "zero_cost",
+    "zero_pnl", "human_price", "human_cost", "human_pnl", "whale_shares", "whale_sold", "exit_at", "exit_price",
+    "exit_fees", "proceeds", "closed_at", "result", "payout_per_share", "pnl", "closing_price", "markout_price",
+    "probation", "membership_id", "snapshot_run_id",
+]
+
+
+def export_bot_csv(app: App, path: str) -> int:
+    trades = load_bot_trades(app)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=BOT_CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(trades)
     return len(trades)
 
 
