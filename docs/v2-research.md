@@ -72,3 +72,169 @@ bot" family (Tando404, emmanuelwestra and copies), per the brief.
 | RTDS `activity` websocket | ~1 s (unmeasured) | nothing | went down for hours on 2026-08-31; documentation has flip-flopped |
 | Polygon `OrderFilled` logs on 3 exchanges | ~2-4 s (block time) | Polygon RPC or HyperSync key (read-only data key) | must decode V2 position IDs from Dec 1 |
 | Pending transactions (`matchOrders` calldata) | under a block | paid websocket RPC with pending-tx support | fragile; deferred |
+
+## Round 2 (2026-11-10/11): measurements and more repos
+
+Everything below was measured from the build sandbox or read from cloned repos.
+Nothing from another repo was run. Sandbox requests go through a proxy, so the
+server should see slightly lower request times.
+
+### Global trade feed, measured for 10 minutes (2026-11-10 17:27-17:37 UTC)
+
+`GET /v2/trades` (spec https://data-api.polymarket.com/v2/openapi.json), each
+URL made unique with a `_t` parameter (Cloudflare answered `DYNAMIC`, not cached).
+
+| Poller | Polls | Gaps | Newest row age, median / p90 | Page span, median (min) | Detection delay, median / p90 / p99 |
+|---|---|---|---|---|---|
+| `taker_only=false`, every 1 s | 600, all 200 | 0 | 3.4 s / 5.0 s | 23 s (4 s) | **3.4 s / 4.9 s / 6.4 s** (fills >= $500: 3.3 / 4.8 s, n=226) |
+| `taker_only=true`, every 2 s | 300, all 200 | 0 | 3.2 s / 5.0 s | 60 s (25 s) | 4.0 s / 5.9 s |
+| `filter_type=CASH&filter_amount=500`, every 5 s | 120, all 200 | 0 | 4.9 s / 14.9 s | 2,195 s | 4.0 s / 6.8 s, recall of the full feed's >= $500 rows: 100% |
+
+* Detection delay = first time our poll saw the row minus its block timestamp
+  (whole seconds). Request time median 0.23 s. Local clock vs the server's `Date`
+  header: +0.55 s median, inside the header's 1 s resolution.
+* Volume: 49.5 rows/s with maker rows (29,533 rows in 10 min, 4,123 wallets,
+  1,168 markets). Busiest block-second 432 rows, busiest 10 s 1,610 rows, so a
+  1,000-row page never covered less than 4 s. 62% of rows were crypto Up/Down.
+* **66% of rows, and 103 of 226 fills >= $500 (46%), are maker rows.**
+  `taker_only=true` (the default) misses almost half of what large wallets do.
+* **No row id.** One transaction can carry two identical rows (same wallet,
+  token, side, price and size: two maker orders), seen up to 55 times per page.
+  Keep the existing occurrence counter, and only trust timestamp groups that are
+  not the page's oldest (that group may be cut by the limit).
+* The CASH filter is per fill, so it misses wallets that build through small
+  fills. Poll the unfiltered feed and filter locally (1 req/s is about 3% of the
+  300 per 10 s limit). Follow `next_cursor` whenever a page's oldest row is newer
+  than the previous page's newest row.
+* `/v2/status` answered 40 of 40: `serving.lag_seconds` 2 (worst
+  `custody_balances`), 201 ingestion cursors, already including
+  `auto_redeem_v3_*` and `binary_module_*` streams (Protocol V2). Good health
+  signal for Phase 5.
+
+**Verdict:** the Phase 3 target (median under 5 s) is reachable with polling
+alone. RTDS stays optional (see below).
+
+### RTDS, from other people's measurements (websockets are blocked here)
+
+* structbuild/polymarket-rtds-vs-struct-benchmark (MIT, 2026-07): ~15,000 live
+  trades. A commercial confirmed-trade socket beat RTDS by +0.32 s median;
+  mempool sightings beat RTDS by +2.66 s median. So RTDS is about block time plus
+  0.3 s, roughly 2-3 s ahead of our polling.
+* Subscribe frame: `{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"}]}`,
+  optional `filters` as a JSON string `{"event_slug":..}` or `{"market_slug":..}`,
+  text `PING` every 5 s, no ack. The payload matches the Data API row in
+  camelCase (`proxyWallet`, `asset`, `conditionId`, `transactionHash`,
+  `timestamp` in seconds, envelope timestamp in ms)
+  (Polymarket/real-time-data-client README; kollikrishnarao/polymarket-endpoints-test).
+* **Polymarket's official real-time client is deprecated**, and the new unified
+  SDK (Polymarket/py-sdk, MIT, 2026-11-09) has **no activity/trades stream at
+  all**: only comments, crypto/equity prices, the CLOB market channel (no
+  wallets) and the authenticated user channel. RTDS `activity` is legacy that
+  still works, not a supported product. Polling `/v2/trades` is the supported
+  path.
+
+### Protocol V2 (Dec 1 for sports), from the official SDK
+
+`src/polymarket/_internal/protocol.py` in Polymarket/py-sdk (MIT):
+* A V2 position id is a uint256 with bits 40-103 all zero (`is_v2_position_id`).
+  Legacy CTF token ids are hashes, so they almost never pass that test.
+* Decoding: as 64 hex chars, the first byte is the module id (1, 2 or 3), the
+  first 31 bytes are the bytes31 condition id, and the last byte is the outcome
+  index (0 or 1).
+* The SDK changelog says Data API reads and CLOB asset ids accept V2 ids, so our
+  string-keyed `token_id` handling should carry over. [Likely] Test it on a real
+  V2 market on Nov 23.
+* Order books (`GET /book`, `POST /books` for many): bids ascending, **asks
+  descending (best ask is the last element)**, plus `tick_size`,
+  `min_order_size`, `neg_risk` and `hash`.
+* On-chain only: V2 split/merge/redeem go through `CtfCollateralAdapter` /
+  `NegRiskCtfCollateralAdapter`, so the stakeholder is the adapter, not the
+  wallet (PaulieB14/polymarket-v2-subgraphs). Official gen-2 adapters:
+  `0xAdA100Db00Ca00073811820692005400218FcE1f`,
+  `0xadA2005600Dec949baf300f4C6120000bDB6eAab`
+  (https://docs.polymarket.com/resources/contracts.md).
+  psyberck/polymarket-subgraph-v2 also lists a "third V2 exchange"
+  `0xe2222d002000ba0053cef3375333610f64600036` that the docs do not: unverified.
+* No public indexer reviewed covers ExchangeV3 trades yet.
+
+### Consensus pool: leaderboard counts (2026-11-10)
+
+`GET /v2/leaderboard?time_period=..&category=..&sort_by=PNL`. Finite windows are
+marked-to-market and net of flows.
+
+| Window / category | >= $100k | >= $250k | >= $500k | Rank 50 PnL |
+|---|---|---|---|---|
+| month / overall | **312** | **121** | **52** | **$513k** |
+| month / sports | 116 | 44 | 20 | $215k |
+| month / esports | 51 | 13 | 5 | $100k |
+| month / politics | 97 | 31 | 13 | $181k |
+| month / crypto | 13 | 4 | 2 | $42k |
+| week / overall | 121 | 39 | 9 | $206k |
+| all / overall | 1,991 | 855 | 417 | $3.1M |
+
+Two problems with using the board as the pool:
+
+1. **The board disagrees with Polymarket's own PnL engine.** For the top 120 of
+   the month board, the 30-day change in `/v2/user-pnl` (`interval=1m`,
+   `fidelity=1h`) was a median 0.74x the board figure. Spearman rank correlation
+   was 0.27. 13 of 120 showed under 5% of their board profit. Example:
+   `e46m3`, board +$3.86M, PnL series down from $662k to $510k. [Certain] that
+   they disagree. [Guessing] why: position transfers or marks counted as equity.
+   Use the board to find candidates, never as proof of skill.
+2. **28% look like market makers or bots** (34 of 120) by two cheap
+   `/v2/user-stats` checks. Rebates plus rewards over 30% of profit (the rule
+   from drkxbt/sharps, MIT) flagged 21. Over 100 fills per market flagged 13.
+
+`/v2/user-pnl?interval=max&fidelity=1d` returns a daily cumulative series from
+the wallet's first trade (`source_fidelity` 1d). It could rebuild point-in-time
+30-day PnL for the backtest without hindsight, but given (1) it must be
+validated first. The universe must also come from data available at the time,
+not from today's boards.
+
+### Independent evidence on whether copying works
+
+| Source | Setup | Result |
+|---|---|---|
+| maximusrafla/polymarket-sharps (2026-07/09, 4.7M trades, market-block bootstraps, FDR control) | Skill = outcome minus E[outcome given entry price]. Copy measured against same-market placebo entry times | 26 of 23,956 wallets certified (23 trade 5-min crypto). Thin samples made most of the apparent edge. Long-ledger cohort: copying at 30 s lost to a random-time entry by -1.3c [-2.1, -0.4]. Real-world certified cohort at a 2-min lag: pooled +2.0c/share [+1.2, +2.8] after fees, held-out +2.4c, only ~0.8c of it tied to the wallet's exact moment. **Picking which wallets was noise** (cluster-preserving permutation p=0.23). Forward test: vetted sports cohort -0.4c [-2.2, +1.6], unvetted pool +1.6c [+0.5, +2.6], all in-play. The pooled copy test was never read forward. README verdict: "Copying does not work." |
+| BallesJr/polymarket-copy-trader (paper, 2026-07-03 to 11-02) | 2 screened leaders, $500 conviction, $100 flat, book-walk fills, mirror exits, in-play skip, ~6 min delay | README snapshot (Aug) showed +$171. Full state file: **612 trades, -$1,034, ROI -1.7% [-10.3%, +7.3%]**. After the in-play filter: +0.8% [-9.6%, +11.6%], n=436 |
+| evan-kolberg/prediction-market-backtesting (account-ledger replay) | A public wallet's own 153 trades replayed as IOC limit orders at its own price against historical L2, zero delay | **Only 72 of 153 filled.** The original orders already consumed that liquidity |
+| darrnhard/polymarket-smart-money (3 top sports wallets, 6.8M events) | Behavior study | All three are bots, buys in bursts of 5-7 fills over 60-90 s, 82-87% of markets entered in several sessions. Two wallets overlap in 78.5% of markets: a twin or a shared signal |
+
+What this means for v2:
+* The faint edge lives in **pools of wallets and in-play real-world markets**,
+  not in named wallets. That favours Phase 3b consensus and broad watchlists
+  over a few hand-picked whales, and it means per-wallet rankings should not
+  drive sizing.
+* Every paper strategy needs a **placebo arm**: same market and side, entered at
+  a matched or random time, with the same costs. Then timing can be told apart
+  from market choice.
+* Book-walk fills must allow "not filled". Never assume the whale's price.
+
+### Book-walk fills and fees
+
+* agent-next/polymarket-paper-trader (MIT, 503 stars) walks real asks level by
+  level, charges the fee per filled level, and supports FOK/FAK and a limit
+  price. Our `fees.py` already matches the official formula
+  (`fee = C x feeRate x p x (1 - p)` from `feeSchedule`, makers pay none,
+  https://docs.polymarket.com/trading/fees.md).
+* New since our fee check: a tiered **Taker Rebate Program** and Combos at 0.05.
+  Paper trading should keep charging the full fee (conservative).
+* Historical order books for the 6-month backtest: **PMXT** hourly L2 archive
+  (`r2v2.pmxt.dev`, `r2.pmxt.dev`, files `polymarket_orderbook_YYYY-MM-DDTHH.parquet`,
+  from 2026-02-21, book snapshots plus price changes), and **pmdata.dev**
+  (`/v1/polymarket/{l2,trades}/{date}/{slug}.parquet`, free key). Both are
+  blocked in the build sandbox, so coverage is unchecked. The server can reach
+  them.
+
+### Other data sources seen
+
+* Goldsky: a Kafka topic `polymarket.pnl.user_positions` (per wallet and token:
+  avg price, realized PnL, total bought), which they say backs Polymarket's
+  leaderboards, plus a `matic.raw_logs` webhook pipeline already on the V2
+  exchange addresses. Needs a Goldsky account (goldsky-io/copy-trader, no license).
+* ForesightFlow/datasets (CC-BY 4.0): 8 documented insider cases mapped to 24
+  markets (`ffic-inventory`). That's a small labelled test set for insider
+  features.
+* Read and skipped: wazzenrj-debug/polymarket-sports-consensus and
+  Jeffrobro/consensus-polymarket. Both are top-N leaderboard position overlap
+  dashboards with no validation, nothing beyond lukkr1.
