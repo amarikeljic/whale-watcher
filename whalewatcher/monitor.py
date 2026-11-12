@@ -16,6 +16,7 @@ Only BUY fills open groups. SELL fills are stored for mirror exits (Phase 3b).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -288,13 +289,17 @@ class Monitor:
         app = self.app
         now = app.clock()
         detected_at = float(now) if detected_at is None else detected_at
-        markets = await app.markets.ensure([alert["condition_id"]], refresh_after=300)
+        # The market's details and its order book, asked for together: every tenth of
+        # a second here is price the whale's followers are taking.
+        markets, book = await asyncio.gather(
+            app.markets.ensure([alert["condition_id"]], refresh_after=300),
+            app.clob.book(alert["token_id"]), return_exceptions=True)
+        if isinstance(markets, BaseException):
+            raise markets
         market = markets.get(alert["condition_id"])
-        book: Book | None = None
-        try:
-            book = await app.clob.book(alert["token_id"])
-        except Exception as exc:
-            log.warning("book fetch failed for %s: %s", alert["token_id"], exc)
+        if isinstance(book, BaseException):
+            log.warning("book fetch failed for %s: %s", alert["token_id"], book)
+            book = None
         decided_at = app.wall()
         ask = book.best_ask if book else None
         bid = book.best_bid if book else None

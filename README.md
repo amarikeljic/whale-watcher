@@ -18,8 +18,11 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-On first start it scores wallets (10 to 30 minutes), monitors the top 20, and
-then polls every 60 seconds. Data lives in `./data/whalewatcher.sqlite3`.
+That starts two containers from one image: `whale-watcher-detector` (watches
+trades) and `whale-watcher` (alerts, the paper bot, the nightly review). On
+first start it scores wallets (10 to 30 minutes) and fills the watchlist. Data
+lives in `./data/whalewatcher.sqlite3`. `docker compose logs -f detector`
+shows a line a minute with what the detector published.
 
 Live paper trades take weeks to settle in numbers worth reading. To see what
 the strategy would have made over the last six months now, run the backtest

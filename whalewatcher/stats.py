@@ -209,11 +209,14 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
     inplay = f", {s.clv_inplay_excluded} in-play fills have no closing line" if s.clv_inplay_excluded else ""
     lines.append(f"  CLV: closing line {cents(s.avg_clv)} (n={s.clv_n}{inplay}) | price "
                  f"{app.cfg.bot.markout_seconds // 60} min after our fill {cents(mean(marks))} (n={len(marks)}, every fill)")
+    # Signals we reached too late (a restart, an outage) are already counted as misses
+    # above; averaging minutes-old backlog into this line would hide how fast the bot is.
+    limit = app.cfg.bot.max_signal_age_seconds
     decide = [t["decided_at"] - t["signal_ts"] for t in traded if t["status"] in ("FILLED", "MISSED")
-              and strategy != "placebo_late"]
+              and strategy != "placebo_late" and t["decided_at"] - t["signal_ts"] <= limit]
     if decide:
         lines.append(f"  whale's fill -> our decision: median {median(decide):.1f}s | p90 {_quantile(decide, 0.9):.1f}s "
-                     f"(n={len(decide)})")
+                     f"(n={len(decide)} signals acted on within {limit:g}s)")
     lines.append(f"  price vs the whale, per share: whale -> best ask when we looked {cents(s.avg_detection_cost)} "
                  f"(n={s.detection_n}, missed included) | whale -> our fill {cents(s.avg_latency_cost)} (filled only)")
     done = [t for t in traded if t["closed_at"] is not None and t["zero_pnl"] is not None and t["human_pnl"] is not None]
