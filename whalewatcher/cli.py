@@ -434,6 +434,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--folds", type=int, default=3)
     c.add_argument("--holdout-months", type=int, default=2)
 
+    db = sub.add_parser("dashboard", help="serve the read-only dashboard (tailnet only: binds 127.0.0.1)")
+    db.add_argument("--host", default="127.0.0.1")
+    db.add_argument("--port", type=int, default=8787)
+    db.add_argument("--in-container", action="store_true",
+                    help="allow a non-loopback --host inside Docker, where compose publishes the port on 127.0.0.1 only")
+
     d = sub.add_parser("detector", help="watch trades and publish tracked wallets' fills (its own container)")
     d.add_argument("--cycles", type=int, help="stop after this many feed polls")
 
@@ -490,5 +496,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_watchlist(args, cfg))
     if args.command == "consensus":
         return asyncio.run(_consensus(args, cfg))
+    if args.command == "dashboard":
+        from .dashboard import serve
+        serve(cfg, host=args.host, port=args.port, in_container=args.in_container)
+        return 0
     from . import service  # the live loop and stats, imported lazily
     return asyncio.run(service.run_command(args, cfg))

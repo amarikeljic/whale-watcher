@@ -1,12 +1,14 @@
-# Two containers from one image, sharing the database in ./data (v2 Phase 3):
+# Three containers from one image, sharing the database in ./data:
 #
-#   whale-watcher-detector  watches trades and publishes tracked wallets' fills
-#   whale-watcher           the runner: alerts, the paper bot, nightly review, stats
+#   whale-watcher-detector   watches trades and publishes tracked wallets' fills
+#   whale-watcher            the runner: alerts, the paper bot, nightly review, stats
+#   whale-watcher-dashboard  the read-only web dashboard
 #
-# Separate so that one crashing or restarting never stops the other: the detector
+# Separate so that one crashing or restarting never stops the others: the detector
 # keeps publishing while the runner is down, and the runner resumes from its cursor.
-# Neither has `ports:`. They only make outbound HTTPS requests (Polymarket's
-# read-only APIs, the Discord webhook). Nothing listens.
+# The detector and the runner have no `ports:`. They only make outbound HTTPS
+# requests (Polymarket's read-only APIs, the Discord webhook) and nothing listens.
+# The dashboard is the only thing that listens, and only on this machine's 127.0.0.1.
 x-common: &common
   build: .
   image: whale-watcher
@@ -36,4 +38,22 @@ services:
       interval: 2m
       timeout: 30s
       start_period: 5m
+      retries: 3
+
+  # Read-only: it opens the database read-only, answers GET requests only and makes
+  # no outbound requests. The port is published on 127.0.0.1 ONLY, so nothing on the
+  # LAN or the internet can reach it. To see it from your phone, expose it on your
+  # tailnet yourself:   tailscale serve --bg 8787
+  dashboard:
+    <<: *common
+    container_name: whale-watcher-dashboard
+    command: ["python", "-m", "whalewatcher", "dashboard", "--host", "0.0.0.0", "--in-container"]
+    ports:
+      - "127.0.0.1:8787:8787"
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8787/healthz', timeout=5)"]
+      interval: 2m
+      timeout: 10s
+      start_period: 30s
       retries: 3

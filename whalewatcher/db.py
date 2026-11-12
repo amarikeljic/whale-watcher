@@ -22,8 +22,9 @@ log = logging.getLogger(__name__)
 # 1: the original build. 2: v2 Phase 2, the persistent watchlist (watchlist_membership,
 # watchlist_events, alerts.membership_id, alerts.probation). 3: v2 Phase 3, the bot
 # model (fill_events, bot_trades, alerts.detect_delay, alerts.whale_position). 4: v2
-# Phase 3b, consensus (consensus_signals, consensus_pool_runs, consensus_pool).
-SCHEMA_VERSION = 4
+# Phase 3b, consensus (consensus_signals, consensus_pool_runs, consensus_pool). 5: v2
+# Phase 4, outage_windows (read by the dashboard; Phase 5 records new ones).
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallets (
@@ -396,6 +397,16 @@ CREATE TABLE IF NOT EXISTS consensus_pool (
     PRIMARY KEY (run_id, wallet)
 );
 
+-- Periods when the service could not see Polymarket. Stats and the dashboard can
+-- leave them out, and time-series charts mark them.
+CREATE TABLE IF NOT EXISTS outage_windows (
+    id        INTEGER PRIMARY KEY,
+    start_ts  INTEGER NOT NULL,
+    end_ts    INTEGER,                -- NULL while it is still going on
+    cause     TEXT,
+    source    TEXT NOT NULL           -- owner (reported by hand) | detected (by the service)
+);
+
 CREATE TABLE IF NOT EXISTS service_state (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
@@ -507,6 +518,14 @@ class Database:
             if version < SCHEMA_VERSION:
                 self.conn.executescript(SCHEMA)
                 self._add_columns()
+                if version < 5 and has_data:
+                    # The one outage known before outages were recorded: the owner's ISP
+                    # was down on 2026-11-09 from 11:27 to about 16:46 UTC. Only for a
+                    # database that existed then.
+                    self.conn.execute(
+                        "INSERT INTO outage_windows (start_ts, end_ts, cause, source) "
+                        "SELECT 1794223620, 1794242760, 'ISP outage (reported by the owner)', 'owner' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM outage_windows)")
                 self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @contextmanager
@@ -521,6 +540,22 @@ class Database:
                 yield
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
+
+    @classmethod
+    def readonly(cls, path: str) -> Database:
+        """A connection that cannot write: the file is opened read-only and the
+        connection is set query-only. No schema is created and nothing is migrated."""
+        db = cls.__new__(cls)
+        db.path, db.backup_path = path, None
+        db.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None, check_same_thread=False)
+        db.conn.row_factory = sqlite3.Row
+        db.conn.execute("PRAGMA query_only = ON")
+        db.conn.execute("PRAGMA busy_timeout = 5000")
+        return db
+
+    @property
+    def schema_version(self) -> int:
+        return int(self.conn.execute("PRAGMA user_version").fetchone()[0])
 
     def _add_columns(self) -> None:
         for _version, table, column, decl in ADDED_COLUMNS:

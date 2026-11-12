@@ -18,8 +18,9 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-That starts two containers from one image: `whale-watcher-detector` (watches
-trades) and `whale-watcher` (alerts, the paper bot, the nightly review). On
+That starts three containers from one image: `whale-watcher-detector` (watches
+trades), `whale-watcher` (alerts, the paper bot, the nightly review) and
+`whale-watcher-dashboard` (http://127.0.0.1:8787 on the server). On
 first start it scores wallets (10 to 30 minutes) and fills the watchlist. Data
 lives in `./data/whalewatcher.sqlite3`. `docker compose logs -f detector`
 shows a line a minute with what the detector published.
@@ -49,6 +50,7 @@ python -m whalewatcher watchlist --history          # every add and removal ever
 python -m whalewatcher watchlist --review           # run the nightly review now
 python -m whalewatcher consensus                    # today's consensus pool: counts at $100k/$250k/$500k/top 50, entities
 python -m whalewatcher consensus --backtest         # six months of the consensus strategy, no hindsight, with baselines
+python -m whalewatcher dashboard                    # the read-only web dashboard on 127.0.0.1:8787
 python -m whalewatcher detector                     # watch trades, publish tracked wallets' fills (own container)
 python -m whalewatcher monitor [--no-post] [--cycles N] [--no-detector]   # the runner: alerts + the paper bot
 python -m whalewatcher settle
@@ -176,6 +178,31 @@ section.
 *CLV.* Pre-game fills are compared with the closing line as before. Every fill,
 in-play included, also gets the price 5 minutes after it, which is the only
 honest reference for a bet placed during a game.
+
+**The dashboard** (`dashboard.py`, `dashview.py`, v2 Phase 4). A third
+container that shows everything `stats` prints, as pages: Overview, Edge,
+Wallets (with a page per wallet and the watchlist timeline), Trades (with CSV
+export), Breakdowns and Health. One filter row scopes every number on a page:
+date range, day or week, strategy, venue, wallet, and "exclude outage windows".
+
+* **Read-only.** The database is opened read-only and query-only, every route
+  is a GET, and a test proves a write is refused.
+* **Tailnet only.** Compose publishes the port on the host's `127.0.0.1` and
+  nowhere else, so nothing on the LAN or the internet can reach it. Run
+  directly, the command refuses any address but loopback. To open it from your
+  phone, expose it yourself: `tailscale serve --bg 8787`.
+* **Self-contained and light.** No login, cookies, third-party scripts, fonts
+  or outbound requests; the page's own stylesheet and one small script are
+  served by the app. Charts are drawn in the browser so they fit a phone, and
+  each has a table of the same numbers under it. Light and dark follow the
+  device.
+* **Honest about sample size.** Every figure carries its n, a banner appears
+  under 30 closed trades in the selected range, the interval for mean ROI comes
+  with a plain sentence saying what it does and does not show, and outage
+  windows are shaded on every time chart.
+
+The numbers come from the same code as `stats`, and the tests check each page
+against a small fixture worked out by hand (`tests/dashfix.py`).
 
 **Consensus** (`consensus.py`, v2 Phase 3b). A separate question from copying
 one whale: when several *independent* top traders take the same side, is that
