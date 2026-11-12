@@ -212,6 +212,9 @@ adds is the breakdown and the audit trail:
 * `fees.onramp_cost_pct` (1.5%) is the one-time cost of getting money in. It is
   used by the wallet simulation only, not by per-trade P&L.
 
+On the trades checked so far fees cost about 1.5% of every dollar staked. That
+is the hurdle a copy strategy has to clear before anything else.
+
 ### Time-to-close cutoff (v2.1)
 
 A paper dollar in a market that settles in three months is gone for three
@@ -242,9 +245,6 @@ backtests skip a signal whose market is scheduled to end later than that, and
   were still held longer than 14 days because the market resolved late.
 * **Not covered yet:** the old-rule comparison trader is left as it was, and
   the $100 wallet replay with and without the cutoff arrives with the wallet.
-
-On the trades checked so far fees cost about 1.5% of every dollar staked. That
-is the hurdle a copy strategy has to clear before anything else.
 
 **The dashboard** (`dashboard.py`, `dashview.py`, v2 Phase 4). A third
 container that shows everything `stats` prints, as pages: Overview, Edge,
