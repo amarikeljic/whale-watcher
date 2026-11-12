@@ -25,8 +25,9 @@ log = logging.getLogger(__name__)
 # Phase 3b, consensus (consensus_signals, consensus_pool_runs, consensus_pool). 5: v2
 # Phase 4, outage_windows (read by the dashboard; Phase 5 records new ones). 6: v2.1
 # Part 1, the cost columns on bot_trades and paper_trades (fee rate used, slippage,
-# and a recalculation kept beside the original values).
-SCHEMA_VERSION = 6
+# and a recalculation kept beside the original values). 7: v2.1 Part 3, the
+# time-to-close cutoff (skip code, scheduled end and days to it, real resolution time).
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallets (
@@ -503,6 +504,11 @@ ADDED_COLUMNS = (
     (6, "paper_trades", "fees_recalc", "REAL"),
     (6, "paper_trades", "gross_pnl", "REAL"),
     (6, "paper_trades", "net_pnl_recalc", "REAL"),
+    # v2.1 Part 3.
+    (7, "bot_trades", "skip_code", "TEXT"),        # too_long | no_end_date (Part 2 adds the wallet's codes)
+    (7, "bot_trades", "scheduled_end", "INTEGER"), # the market's endDate as published when we decided
+    (7, "bot_trades", "days_to_close", "REAL"),    # (scheduled_end - decided_at) in days, never negative
+    (7, "bot_trades", "resolved_at", "INTEGER"),   # when the market actually resolved, written at settlement
 )
 
 

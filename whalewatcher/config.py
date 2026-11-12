@@ -201,6 +201,13 @@ class ConsensusConfig:
     ask_premium: float = 0.01           # added to the historical minute price for the spread
 
 
+@dataclass
+class FiltersConfig:
+    """v2.1 Part 3. Applied by every bot runner and by the backtests."""
+    max_days_to_close: float | None = 14.0   # skip a market scheduled to end later than this; null = no limit
+    skip_if_no_end_date: bool = True         # a market with no scheduled end could tie money up for ever
+
+
 def _fee_table() -> list[dict[str, Any]]:
     # https://docs.polymarket.com/trading/fees.md, table read 2026-11-10. `from` is the
     # day a table took effect; add a new entry when Polymarket changes its fees and
@@ -272,6 +279,7 @@ class Config:
     consensus_pool: ConsensusPoolConfig = field(default_factory=ConsensusPoolConfig)
     consensus: ConsensusConfig = field(default_factory=ConsensusConfig)
     fees: FeesConfig = field(default_factory=FeesConfig)
+    filters: FiltersConfig = field(default_factory=FiltersConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
     # Secrets, from the environment only.
     discord_webhook_url: str | None = field(default=None, repr=False)
@@ -301,6 +309,7 @@ _SECTIONS = {
     "consensus_pool": ConsensusPoolConfig,
     "consensus": ConsensusConfig,
     "fees": FeesConfig,
+    "filters": FiltersConfig,
     "api": ApiConfig,
 }
 
@@ -318,6 +327,9 @@ def _build(cls: type, raw: dict[str, Any], where: str, base: Any = None) -> Any:
     values = {}
     for name, value in raw.items():
         default = getattr(base, name)
+        if value is None and "None" in str(known[name].type):
+            values[name] = None         # an optional setting switched off with `null`
+            continue
         if dataclasses.is_dataclass(default):
             values[name] = _build(type(default), value or {}, f"{where}.{name}", default)
             continue
@@ -374,6 +386,9 @@ def validate(cfg: Config) -> None:
     fe = cfg.fees
     if fe.rate_source not in ("market", "table", "higher"):
         raise ConfigError("fees.rate_source must be market, table or higher")
+    fl = cfg.filters
+    if fl.max_days_to_close is not None and not 0 < fl.max_days_to_close <= 3650:
+        raise ConfigError("filters.max_days_to_close must be a number of days above 0 (or null for no limit)")
     if not 0 <= fe.onramp_cost_pct < 50:
         raise ConfigError("fees.onramp_cost_pct must be a percentage between 0 and 50")
     if not isinstance(fe.schedules, list) or not fe.schedules:

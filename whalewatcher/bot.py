@@ -24,7 +24,9 @@ taking no level above ``whale price + max_slippage``. Fees are charged per level
   FILLED   the book absorbed the stake inside the limit
   MISSED   it could not: price already ran, book too thin, market closed, or we
            were too late to call it "seconds after the whale"
-  SKIPPED  a risk limit said no: bankroll, market or event exposure, daily loss
+  SKIPPED  a rule said no before the book was looked at: the time-to-close cutoff
+           (``too_long``, ``no_end_date``; see ``horizon.py``) or a risk limit
+           (bankroll, market or event exposure, daily loss)
 
 Comparison columns on the hold strategies, same stake, never in the headline:
 ``zero_*`` (the whale's own price, as if we had no latency at all) and ``human_*``
@@ -41,7 +43,8 @@ from typing import Any
 from .app import App
 from .config import BOT_STRATEGIES, StrategyConfig
 from .fees import rate_for, taker_fee
-from .paper import VENUE, Walk, result_label, shadow_fill, walk_asks
+from .horizon import close_skip, days_to_close, scheduled_end
+from .paper import Walk, result_label, shadow_fill, walk_asks
 from .polymarket import Book, MarketInfo
 from .timeutil import start_of_day
 
@@ -201,13 +204,24 @@ class Bot:
         event_key = (market.event_slug if market else None) or alert["condition_id"]
         whale_price = alert["whale_price"]
         age = decided_at - signal_ts
+        # The time-to-close cutoff comes before anything else and applies to every
+        # strategy, the placebo included: a control that may enter markets the real
+        # strategies may not is not a control.
+        end = scheduled_end(market.end_date, market.game_start_time) if market else None
+        horizon = (end, days_to_close(end, decided_at))
+        too_far = close_skip(end, decided_at, self.app.cfg.filters) if market is not None else None
         for strategy in self.enabled():
             stake = self.stake_for(strategy, alert["whale_usd"])
+            if too_far is not None:
+                self._insert(strategy, alert, event_key, "SKIPPED", too_far[1], signal_ts, detected_at, decided_at,
+                             stake, whale_price, book, None, skip_code=too_far[0], horizon=horizon)
+                results[strategy] = "SKIPPED"
+                continue
             if strategy == "placebo_late":
                 rng = random.Random(f"{self.runner}:{alert['id']}")     # reproducible, unrelated to the whale
                 due = decided_at + rng.uniform(self.cfg.placebo_min_delay_seconds, self.cfg.placebo_max_delay_seconds)
                 self._insert(strategy, alert, event_key, "PENDING", None, signal_ts, detected_at, decided_at,
-                             stake, whale_price, book, None, due_at=due)
+                             stake, whale_price, book, None, due_at=due, horizon=horizon)
                 results[strategy] = "PENDING"
                 continue
             if age > self.cfg.max_signal_age_seconds:
@@ -222,22 +236,26 @@ class Bot:
             human_due = (decided_at + self.cfg.human_delay_seconds
                          if compare and age <= self.cfg.max_signal_age_seconds else None)
             self._insert(strategy, alert, event_key, decision.status, decision.reason, signal_ts, detected_at,
-                         decided_at, stake, whale_price, book, decision, zero=zero, human_due=human_due)
+                         decided_at, stake, whale_price, book, decision, zero=zero, human_due=human_due,
+                         horizon=horizon)
             results[strategy] = decision.status
         return results
 
     def _insert(self, strategy: str, alert: Any, event_key: str, status: str, reason: str | None, signal_ts: int,
                 detected_at: float, decided_at: float, stake: float, whale_price: float, book: Book | None,
                 decision: Decision | None, *, due_at: float | None = None,
-                zero: tuple[float, float, float, float] | None = None, human_due: float | None = None) -> None:
+                zero: tuple[float, float, float, float] | None = None, human_due: float | None = None,
+                skip_code: str | None = None,
+                horizon: tuple[int | None, float | None] = (None, None)) -> None:
         walk = decision.walk if decision else None
         fees = decision.fees if decision and walk else None
         self.app.db.execute(
             "INSERT OR IGNORE INTO bot_trades (runner, strategy, alert_id, wallet, condition_id, token_id, event_key, "
             "status, reason, signal_ts, detected_at, decided_at, due_at, stake_usd, whale_price, best_ask, "
             "fill_price, contracts, fees, cost, levels, zero_price, zero_contracts, zero_cost, human_due, "
-            "human_done, whale_shares, updated_at, fee_rate, fee_source, slippage_cost) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "human_done, whale_shares, updated_at, fee_rate, fee_source, slippage_cost, skip_code, "
+            "scheduled_end, days_to_close) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.runner, strategy, alert["id"], alert["wallet"], alert["condition_id"], alert["token_id"], event_key,
              status, reason, signal_ts, detected_at, decided_at, due_at, stake, whale_price,
              book.best_ask if book else None,
@@ -247,7 +265,7 @@ class Bot:
              zero[0] if zero else None, zero[1] if zero else None, zero[3] if zero else None,
              human_due, 0 if human_due is not None else 1, alert["whale_shares"], self.app.clock(),
              decision.fee_rate if decision and walk else None, decision.fee_source if decision and walk else None,
-             slippage(walk, book.best_ask if book else None)))
+             slippage(walk, book.best_ask if book else None), skip_code, horizon[0], horizon[1]))
 
     def set_whale_position(self, alert_id: int, shares: float | None) -> None:
         """What the whale held in the outcome when we entered: the base for mirror exits."""
@@ -428,9 +446,11 @@ class Bot:
                 human = 0.0     # the old rule would have missed this one
             app.db.execute(
                 "UPDATE bot_trades SET closed_at = ?, result = ?, payout_per_share = ?, pnl = ?, zero_pnl = ?, "
-                "human_pnl = ?, closing_price = ?, updated_at = ? WHERE id = ? AND closed_at IS NULL",
+                "human_pnl = ?, closing_price = ?, updated_at = ?, resolved_at = ? "
+                "WHERE id = ? AND closed_at IS NULL",
                 (app.clock(), result_label(pps) if filled else None, pps,
                  (t["contracts"] * pps - t["cost"]) if filled else 0.0,
-                 shadow(t["zero_contracts"], t["zero_cost"]), human, closing, app.clock(), t["id"]))
+                 shadow(t["zero_contracts"], t["zero_cost"]), human, closing, app.clock(), market.resolved_at,
+                 t["id"]))
             settled += 1
         return settled

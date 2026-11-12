@@ -32,7 +32,7 @@ def test_overview_shows_the_hand_checked_totals_each_with_its_n(site):
     html = site("/")
     assert "+$2.50" in html and "+5.0%" in html and "60%" in html, "P&L, ROI and win rate of the five closed trades"
     assert "n=5 closed" in html and "on $50 staked" in html
-    assert "8" in html and "5 closed · 1 open · 1 missed · 1 skipped" in html
+    assert "9" in html and "5 closed · 1 open · 1 missed · 2 skipped" in html
     assert "$10.00" in html and "1 open positions, at cost" in html
     assert "Not enough data: 5 closed trades in this range (need at least 30)" in html
     assert "The interval includes zero" in html and "95% interval" in html
@@ -84,12 +84,13 @@ def test_wallets_page_and_a_wallet_page(site):
 
 def test_trades_table_and_its_csv_export(site):
     html = site("/trades")
-    assert "8 rows · page 1 of 1" in html and "SKIPPED" in html and "event exposure: $50.00" in html
+    assert "9 rows · page 1 of 1" in html and "SKIPPED" in html and "event exposure: $50.00" in html
+    assert "too_long: closes in 40.0 days (limit 14)" in html
     assert "Download CSV" in html
     csv_text = site("/trades.csv")
     lines = csv_text.strip().splitlines()
-    assert lines[0].startswith("id,key,status,reason,wallet") and len(lines) == 9
-    assert sum("single/flat_hold" in line for line in lines) == 8
+    assert lines[0].startswith("id,key,status,reason,wallet") and len(lines) == 10
+    assert sum("single/flat_hold" in line for line in lines) == 9
     assert len(site("/trades.csv", wallet=B).strip().splitlines()) == 3
 
 
@@ -100,11 +101,31 @@ def test_breakdowns_by_category_price_hour_and_event(site):
     assert "By hour of day (UTC)" in html and "11:00" in html and "By event" in html
 
 
+def test_breakdowns_show_the_cutoff_and_the_holding_time_bands(site):
+    html = site("/breakdowns")
+    assert "Time-to-close cutoff" in html and "Skipped as too long" in html and "14 days" in html
+    assert "1 of 5 (20%)" in html, "the +4 trade resolved two days after its scheduled end"
+    assert "0 of 5 (0%)" in html, "none of the five was held longer than 14 days"
+    assert "1 filled trades in this view were entered in markets the cutoff now refuses" in html
+    assert "By holding time" in html and "By days to close when entered" in html
+    assert "Under 1 day" in html and "1 to 7 days" in html and "still open" in html
+
+
+def test_the_days_to_close_filter_scopes_every_number(site):
+    week = site("/", close="1-7")
+    assert "n=2 closed" in week and "+$10.00" in week, "+6 and +4"
+    day = site("/", close="lt1")
+    assert "n=3 closed" in day and "-$7.50" in day, "+12.50, -10 and -10"
+    assert "n=0 closed" in site("/", close="gt14"), "the open trade and the skipped signal"
+    assert "n=5 closed" in site("/", close="nonsense"), "an unknown value is ignored"
+    assert 'name="close"' in week and 'value="1-7" selected' in week
+
+
 def test_health_page_shows_delays_heartbeats_and_the_outage(site):
     html = site("/health")
     assert "4s ago" in html and "3s ago" in html, "runner and detector heartbeats"
     assert "ISP outage" in html and "2.0" in html
-    assert "3.0s" in html and "n=9 alerts" in html, "nine alerts: six at 3 s, two at 4 s, one at 5 s"
+    assert "3.0s" in html and "n=10 alerts" in html, "ten alerts: seven at 3 s, two at 4 s, one at 5 s"
     assert "snapshot #2" in html
 
 
@@ -123,7 +144,7 @@ def test_the_dashboard_cannot_write(site):
         db.execute("DELETE FROM bot_trades")
     with pytest.raises(sqlite3.OperationalError):
         db.execute("INSERT INTO service_state (key, value) VALUES ('x', '1')")
-    assert db.one("SELECT COUNT(*) n FROM bot_trades")["n"] == 9
+    assert db.one("SELECT COUNT(*) n FROM bot_trades")["n"] == 10
     db.close()
 
 

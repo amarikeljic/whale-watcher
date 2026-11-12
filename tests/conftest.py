@@ -67,6 +67,10 @@ def cfg() -> Config:
     # Tests work out fees from each market's own rate; the shipped default ("higher")
     # and the table have their own tests in test_costs.py.
     c.fees.rate_source = "market"
+    # Test markets mostly carry no schedule; the time-to-close cutoff (on by default)
+    # has its own tests in test_horizon.py, which switch it back on.
+    c.filters.max_days_to_close = None
+    c.filters.skip_if_no_end_date = False
     return c
 
 

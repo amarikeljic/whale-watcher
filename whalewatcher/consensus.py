@@ -46,6 +46,7 @@ from typing import Any
 from .app import App
 from .backtest import AlertEvent, SimTrade, closed_before, price_after, simulate
 from .config import ConsensusConfig, ConsensusPoolConfig
+from .horizon import close_skip, scheduled_end
 from .polymarket import Activity, MarketInfo
 from .scoring import DAY, analyse, candidate_pool, load_wallet_rows
 from .stats_util import cluster_bootstrap_mean_ci, max_drawdown, mean
@@ -374,6 +375,8 @@ class ConsensusReport:
     stake: float = 10.0
     max_slippage: float = 0.03
     variants: list[VariantResult] = field(default_factory=list)
+    max_days_to_close: float | None = None
+    cutoff_skipped: dict[str, int] = field(default_factory=lambda: defaultdict(int))   # "<group>:<pool>" -> n
 
 
 def _event(market: MarketInfo | None, condition_id: str) -> str:
@@ -510,7 +513,7 @@ async def run_backtest(app: App, cutoffs: list[int], end: int, *, samples: int =
     start = cutoffs[0]
     histories, markets, too_active = await load_histories(app, cutoffs, end, say=say)
     report = ConsensusReport(start, end, len(histories), too_active, rules, pool_rules, cfg.paper.stake_usd,
-                             cfg.bot.max_slippage)
+                             cfg.bot.max_slippage, max_days_to_close=cfg.filters.max_days_to_close)
     stake, delay = cfg.paper.stake_usd, rules.backtest_delay_seconds
     sem = asyncio.Semaphore(16)
 
@@ -524,6 +527,12 @@ async def run_backtest(app: App, cutoffs: list[int], end: int, *, samples: int =
     async def sim(event: AlertEvent, strategy: str, *, anchored: bool = True) -> SimTrade | None:
         market = markets.get(event.condition_id)
         if market is None:
+            return None
+        # The time-to-close cutoff, the same for the signal and for both baselines. The
+        # end date is the one stored today: Gamma keeps no history of it.
+        if close_skip(scheduled_end(market.end_date, market.game_start_time), event.trigger_ts + delay,
+                      cfg.filters) is not None:
+            report.cutoff_skipped[strategy] += 1
             return None
         async with sem:
             price = None if closed_before(market, event.trigger_ts + delay) else \
@@ -681,6 +690,12 @@ def describe(rep: ConsensusReport) -> str:
                      f"any week: {v.merged}")
         lines.append(f"  entity entries of ${r.min_position_usd:,.0f}+: {v.entries} | signals: {len(v.signals)} | "
                      f"would-be signals blocked by an opposing pool entity: {v.blocked}")
+        cut = rep.cutoff_skipped
+        if any(cut.get(f"{g}:{v.label}") for g in ("consensus", "single", "random")):
+            limit = "no end date" if rep.max_days_to_close is None else f"over {rep.max_days_to_close:g} days to close"
+            lines.append(f"  not traded, time-to-close cutoff ({limit} or no end date): "
+                         f"{cut.get(f'consensus:{v.label}', 0)} signals, {cut.get(f'single:{v.label}', 0)} "
+                         f"single entries, {cut.get(f'random:{v.label}', 0)} random draws")
         lines.append(f"  consensus:  {_group_line(v.consensus)}")
         if v.consensus and v.consensus.settled:
             c = v.consensus

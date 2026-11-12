@@ -212,6 +212,37 @@ adds is the breakdown and the audit trail:
 * `fees.onramp_cost_pct` (1.5%) is the one-time cost of getting money in. It is
   used by the wallet simulation only, not by per-trade P&L.
 
+### Time-to-close cutoff (v2.1)
+
+A paper dollar in a market that settles in three months is gone for three
+months. `filters.max_days_to_close` (14) makes every bot runner and both
+backtests skip a signal whose market is scheduled to end later than that, and
+`filters.skip_if_no_end_date` (true) skips a market with no schedule at all.
+
+* **The schedule** is Gamma's `endDate`, or the game's start when that comes
+  first: on 1 sports market in 10 `endDate` trails the game by more than a day.
+  A market already past its scheduled end (a game in play) is 0 days away.
+* **Skips** are rows like any other: status `SKIPPED`, `skip_code` `too_long` or
+  `no_end_date`, and a reason such as `too_long: closes in 21.3 days (limit 14)`.
+  The alert is still posted. The placebo control is skipped too. Exactly 14 days
+  is allowed.
+* **Schedule against reality.** Each trade stores the scheduled end and the days
+  to it when we decided, and at settlement the market's real resolution time.
+  `stats` and the dashboard's Breakdowns page report how many closed trades were
+  held past the limit and how many resolved more than a day late, with P&L by
+  holding time and by days to close (under 1 day, 1 to 7, 7 to 14, over 14).
+  The dashboard has a "Days to close" filter.
+* **Old trades stay.** A trade entered before the cutoff, in a market it would
+  now refuse, is counted and named but never removed from a total.
+* **What it would have done to the stored history** (sandbox copy, 2026-11-12):
+  19% of 21,726 alerts are `too_long` and 1% have no end date. Politics loses
+  29%, geopolitics 36%, sports under 1%. In the three simulated strategies the
+  ROI with and without the cutoff differs by less than one point and every
+  interval still includes zero. Among trades the cutoff allows, 0.6% to 5.2%
+  were still held longer than 14 days because the market resolved late.
+* **Not covered yet:** the old-rule comparison trader is left as it was, and
+  the $100 wallet replay with and without the cutoff arrives with the wallet.
+
 On the trades checked so far fees cost about 1.5% of every dollar staked. That
 is the hurdle a copy strategy has to clear before anything else.
 

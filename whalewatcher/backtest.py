@@ -49,6 +49,7 @@ from typing import Any
 from .app import App
 from .config import ScoringConfig
 from .fees import fee_model
+from .horizon import close_skip, scheduled_end
 from .kalshi import KalshiMarket, KalshiStore, Quote, match, poly_game, quote_at, taker_fee
 from .stats_util import two_way_bootstrap_mean_ci
 from .optimize import LOOSEST, SPEC_REQUIREMENTS, Fold, FoldIndex, FoldWallet, choose, passes_all, search
@@ -425,6 +426,10 @@ async def run_backtest(app: App, folds: list[Fold], *, delay: int = 90, ask_prem
                     report.skipped[(plan.strategy, "market closed")] += 1
                 elif not al.min_price <= ask <= al.max_price:
                     report.skipped[(plan.strategy, f"price outside {al.min_price:g}-{al.max_price:g}")] += 1
+                elif (far := close_skip(scheduled_end(m.end_date, m.game_start_time), e.trigger_ts + delay,
+                                         app.cfg.filters)) is not None:
+                    # The end date is the one stored today: Gamma keeps no history of it.
+                    report.skipped[(plan.strategy, f"time-to-close cutoff ({far[0]})")] += 1
                 else:
                     jobs.append((plan, e))
     lookups = sorted({(e.token_id, e.trigger_ts + delay) for _, e in jobs

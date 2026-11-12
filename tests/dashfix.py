@@ -14,24 +14,29 @@ class Fixture:
         self.db, self.now, self.n = db, now, 0
 
     def market(self, cond: str, *, category: str = "sports", event: str | None = None, question: str | None = None,
-               game_start: int | None = None) -> None:
+               game_start: int | None = None, end_date: int | None = None) -> None:
         self.db.execute(
-            "INSERT OR IGNORE INTO poly_markets (condition_id, question, slug, event_slug, category, game_start_time) "
-            "VALUES (?,?,?,?,?,?)", (cond, question or f"Will {cond} happen?", f"m-{cond}", event or f"e-{cond}",
-                                     category, game_start))
+            "INSERT OR IGNORE INTO poly_markets (condition_id, question, slug, event_slug, category, game_start_time, "
+            "end_date) VALUES (?,?,?,?,?,?,?)", (cond, question or f"Will {cond} happen?", f"m-{cond}",
+                                                 event or f"e-{cond}", category, game_start, end_date))
 
     def trade(self, wallet: str, days_ago: float, *, strategy: str = "flat_hold", status: str = "FILLED",
               pnl: float | None = None, cost: float = 10.0, fill: float = 0.50, whale: float = 0.48,
               closing: float | None = None, markout: float | None = None, reason: str | None = None,
               detect: float | None = 3.0, cond: str | None = None, category: str = "sports", hour: int = 15,
               zero_pnl: float | None = None, human_pnl: float | None = None, probation: int | None = 0,
-              hold_days: float = 0.5, event: str | None = None) -> int:
-        """One signal and what one strategy did with it. ``pnl`` set means it has closed."""
+              hold_days: float = 0.5, event: str | None = None, end_days: float | None = None,
+              skip_code: str | None = None) -> int:
+        """One signal and what one strategy did with it. ``pnl`` set means it has closed.
+        ``end_days``: the market's scheduled end, in days after our decision (None: no end date).
+        ``hold_days``: when it really resolved, in days after the signal."""
         self.n += 1
         cond = cond or f"0xc{self.n}"
         ts = self.now - int(days_ago * DAY)
         ts = ts - ts % DAY + hour * 3600 + self.n % 50
-        self.market(cond, category=category, event=event)
+        decided = ts + (detect or 3) + 1
+        end = None if end_days is None else int(decided + end_days * DAY)
+        self.market(cond, category=category, event=event, end_date=end)
         existing = self.db.one("SELECT id FROM alerts WHERE wallet = ? AND condition_id = ? AND first_fill_ts = ?",
                                (wallet, cond, ts))
         if existing:
@@ -49,12 +54,14 @@ class Fixture:
             "INSERT INTO bot_trades (runner, strategy, alert_id, wallet, condition_id, token_id, event_key, status, "
             "reason, signal_ts, detected_at, decided_at, stake_usd, whale_price, best_ask, fill_price, contracts, fees, "
             "cost, zero_price, zero_pnl, human_done, human_pnl, closed_at, result, pnl, closing_price, markout_price, "
-            "markout_done, updated_at) VALUES ('single',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,1,?)",
+            "markout_done, updated_at, skip_code, scheduled_end, days_to_close, resolved_at) "
+            "VALUES ('single',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,1,?,?,?,?,?)",
             (strategy, alert_id, wallet, cond, f"{cond}-t0", event or f"e-{cond}", status, reason, ts, ts + (detect or 3),
              ts + (detect or 3) + 1, 10.0, whale, fill, fill if filled or status == "MISSED" else None,
              cost / fill if filled else None, 0.0 if filled else None, cost if filled else None, whale, zero_pnl,
              human_pnl, closed_at, ("WIN" if (pnl or 0) > 0 else "LOSS") if filled and pnl is not None else None,
-             pnl if filled else (0.0 if closed_at else None), closing, markout, ts))
+             pnl if filled else (0.0 if closed_at else None), closing, markout, ts, skip_code, end, end_days,
+             closed_at))
         return alert_id
 
     def old_rule(self, wallet: str, days_ago: float, pnl: float) -> None:
@@ -102,16 +109,27 @@ class Fixture:
 
 def small(path: str, now: int) -> Fixture:
     """Five closed flat_hold trades: +12.50, -10, +6, +4, -10 on $10 each.
-    Total +$2.50 on $50: ROI +5.0%, 3 wins of 5 (60%). One of them (-10) is inside the outage."""
+    Total +$2.50 on $50: ROI +5.0%, 3 wins of 5 (60%). One of them (-10) is inside the outage.
+
+    Time to close: three were scheduled to end within a day (+12.50, -10, -10 = -$7.50) and two
+    in 1 to 7 days (+6, +4 = +$10). The +4 was scheduled for 1 day and resolved after 3: two days
+    late. The open trade is 30 days out (entered before the cutoff existed) and one signal was
+    skipped as too long."""
     fx = Fixture(Database(path), now)
-    fx.trade(A, 6, pnl=12.5, closing=0.55, markout=0.52, detect=3.0, zero_pnl=14.0, human_pnl=9.0, category="sports")
-    fx.trade(A, 5, pnl=-10.0, closing=0.47, markout=0.49, detect=4.0, zero_pnl=-10.0, human_pnl=-10.0, category="sports")
-    fx.trade(A, 4, pnl=6.0, markout=0.51, detect=5.0, zero_pnl=7.0, human_pnl=0.0, category="politics")
-    fx.trade(B, 4, pnl=4.0, detect=3.0, category="politics")
-    fx.trade(B, 3, pnl=-10.0, detect=4.0, hour=11, category="crypto")          # 11:00-12:00 UTC: inside the outage
-    fx.trade(A, 2, detect=3.0)                                                   # open
-    fx.trade(A, 2, status="MISSED", reason="price ran: filling $10 costs 0.560 a share, limit 0.510", fill=0.56)
-    fx.trade(A, 1, status="SKIPPED", reason="event exposure: $50.00 open in this event, limit $50")
+    fx.trade(A, 6, pnl=12.5, closing=0.55, markout=0.52, detect=3.0, zero_pnl=14.0, human_pnl=9.0, category="sports",
+             end_days=0.5)
+    fx.trade(A, 5, pnl=-10.0, closing=0.47, markout=0.49, detect=4.0, zero_pnl=-10.0, human_pnl=-10.0,
+             category="sports", end_days=0.5)
+    fx.trade(A, 4, pnl=6.0, markout=0.51, detect=5.0, zero_pnl=7.0, human_pnl=0.0, category="politics", end_days=3,
+             hold_days=3)
+    fx.trade(B, 4, pnl=4.0, detect=3.0, category="politics", end_days=1, hold_days=3)
+    fx.trade(B, 3, pnl=-10.0, detect=4.0, hour=11, category="crypto", end_days=0.2)   # 11:00-12:00 UTC: in the outage
+    fx.trade(A, 2, detect=3.0, end_days=30)                                      # open
+    fx.trade(A, 2, status="MISSED", reason="price ran: filling $10 costs 0.560 a share, limit 0.510", fill=0.56,
+             end_days=0.5)
+    fx.trade(A, 1, status="SKIPPED", reason="event exposure: $50.00 open in this event, limit $50", end_days=0.5)
+    fx.trade(A, 1, status="SKIPPED", reason="too_long: closes in 40.0 days (limit 14)", skip_code="too_long",
+             end_days=40)
     fx.trade(A, 6, strategy="placebo_late", pnl=-3.0)
     fx.old_rule(A, 9, 2.0)
     fx.member(A, 40)

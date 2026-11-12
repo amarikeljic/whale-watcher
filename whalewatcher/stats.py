@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .app import App
+from .horizon import DAY, NO_END_DATE, TOO_LONG, days_to_close, held_days, scheduled_end
+from .horizon import bucket as horizon_bucket
 from .stats_util import max_drawdown, mean, median, two_way_bootstrap_mean_ci
 from .timeutil import iso
 
@@ -38,7 +40,8 @@ QUERY = """
 SELECT p.*, a.wallet, a.kind, a.outcome, a.whale_price, a.whale_usd, a.first_fill_ts, a.last_fill_ts,
        a.trigger_fill_ts,
        a.detected_at, a.posted_at, a.status AS alert_status, a.snapshot_run_id, a.probation, a.membership_id,
-       m.category, m.question, m.slug, m.event_slug, m.game_start_time
+       m.category, m.question, m.slug, m.event_slug, m.game_start_time,
+       m.end_date AS market_end, m.resolved_at AS market_resolved_at
 FROM paper_trades p
 JOIN alerts a ON a.id = p.alert_id
 LEFT JOIN poly_markets m ON m.condition_id = p.condition_id
@@ -87,7 +90,27 @@ class Summary:
 
 def load_trades(app: App) -> list[dict]:
     from .costs import apply_policy
-    return [apply_policy(dict(r)) for r in app.db.query(QUERY)]
+    return [horizon_fields(apply_policy(dict(r)), r["fill_ts"] or r["alert_ts"]) for r in app.db.query(QUERY)]
+
+
+def horizon_fields(d: dict, entered: float | None) -> dict:
+    """Time-to-close, as scheduled and as it turned out (v2.1 Part 3).
+
+    ``days_to_close``: scheduled end minus the entry, in days. Stored on the row since
+    schema 7; for an older row it is worked out from the market's end date as stored
+    today. ``held_days``: entry to the real end of the position (a mirror exit, else
+    the market's resolution). Only a closed trade has one."""
+    end = (d.get("scheduled_end") if d.get("scheduled_end") is not None else
+           scheduled_end(d.get("market_end"), d.get("game_start_time")))
+    days = d.get("days_to_close")
+    if days is None:
+        days = days_to_close(end, entered) if entered is not None else None
+    resolved = d.get("resolved_at") if d.get("resolved_at") is not None else d.get("market_resolved_at")
+    done = d.get("exit_at") or (resolved if d.get("closed_at") or d.get("settled_at") else None)
+    d.update(scheduled_end=end, days_to_close=days, resolved_ts=resolved,
+             held_days=held_days(entered, done) if d["status"] == "FILLED" else None,
+             late_days=(resolved - end) / DAY if resolved is not None and end is not None else None)
+    return d
 
 
 # -- the bot model (v2 Phase 3) -------------------------------------------------------
@@ -95,7 +118,8 @@ def load_trades(app: App) -> list[dict]:
 BOT_HEADLINE = "flat_hold"
 BOT_QUERY = """
 SELECT b.*, a.kind, a.outcome, a.whale_usd, a.probation, a.membership_id, a.detect_delay, a.trigger_fill_ts,
-       a.snapshot_run_id, m.category, m.question, m.slug, m.event_slug, m.game_start_time
+       a.snapshot_run_id, m.category, m.question, m.slug, m.event_slug, m.game_start_time,
+       m.end_date AS market_end, m.resolved_at AS market_resolved_at
 FROM bot_trades b
 LEFT JOIN alerts a ON a.id = b.alert_id
 LEFT JOIN poly_markets m ON m.condition_id = b.condition_id
@@ -114,7 +138,7 @@ def load_bot_trades(app: App) -> list[dict]:
                  fill_ts=d["decided_at"] if d["status"] == "FILLED" else None,
                  # the whale's price is the zero-latency reference on every strategy
                  zero_price=d["zero_price"] if d["zero_price"] is not None else d["whale_price"])
-        out.append(d)
+        out.append(horizon_fields(d, d["decided_at"]))
     return out
 
 
@@ -260,12 +284,72 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
                        "no difference shown: the whale's timing has not been shown to matter")
             lines.append(f"  {runner}: flat_hold minus placebo_late, ROI per trade on the {n} signals both filled: "
                          f"{_pct(m)}, 95% CI {ci} -> {verdict}")
+    for runner in sorted({r for r, _ in by}):
+        lines += cutoff_lines(app, runner, by.get((runner, BOT_HEADLINE), []))
     lines += detection_lines(app)
     if with_breakdowns:
         headline = [t for t in trades if t["strategy"] == BOT_HEADLINE and t["status"] != "SKIPPED"]
         if headline:
             lines += _breakdown_lines(headline, f" ({BOT_HEADLINE})",
-                                      ("watchlist status", "month", "category", "entry price", "wallet"))
+                                      ("watchlist status", "month", "category", "days to close when entered",
+                                       "holding time", "entry price", "wallet"))
+    return lines
+
+
+@dataclass
+class Cutoff:
+    """What the time-to-close cutoff did, and how the schedule compared with reality."""
+    limit: float | None
+    too_long: int = 0
+    no_end_date: int = 0
+    closed: int = 0            # filled trades that are closed and have a known holding time
+    held_over: int = 0         # ...held longer than the limit
+    resolved: int = 0          # filled trades whose market resolved and had a scheduled end
+    late: int = 0              # ...resolved more than a day after that end
+    would_skip: int = 0        # filled before the cutoff existed, in a market it would now refuse
+    would_skip_pnl: float = 0.0
+
+
+def cutoff_report(app: App, rows: list[dict], *, today: int | None = None) -> Cutoff:
+    """``today``: count only signals from this timestamp on (the daily summary)."""
+    limit = app.cfg.filters.max_days_to_close
+    c = Cutoff(limit)
+    for t in rows:
+        if today is not None and t["alert_ts"] < today:
+            continue
+        code = t.get("skip_code")
+        c.too_long += code == TOO_LONG
+        c.no_end_date += code == NO_END_DATE
+        if t["status"] != "FILLED":
+            continue
+        if t.get("held_days") is not None:
+            c.closed += 1
+            c.held_over += limit is not None and t["held_days"] > limit
+        if t.get("late_days") is not None:
+            c.resolved += 1
+            c.late += t["late_days"] > 1
+        days = t.get("days_to_close")
+        if (days is None and app.cfg.filters.skip_if_no_end_date) or (
+                days is not None and limit is not None and days > limit):
+            c.would_skip += 1
+            c.would_skip_pnl += t["pnl"] if t["settled_at"] is not None and t["pnl"] is not None else 0.0
+    return c
+
+
+def cutoff_lines(app: App, runner: str, rows: list[dict]) -> list[str]:
+    c = cutoff_report(app, rows)
+    limit = "off" if c.limit is None else f"{c.limit:g} days"
+    lines = [f"  {runner}: time-to-close cutoff ({limit}): {c.too_long + c.no_end_date} signals skipped "
+             f"({TOO_LONG} {c.too_long}, {NO_END_DATE} {c.no_end_date})"]
+    if c.closed and c.limit is not None:
+        lines.append(f"    of {c.closed} closed {BOT_HEADLINE} trades, {c.held_over} ({c.held_over / c.closed:.0%}) "
+                     f"were held longer than {c.limit:g} days")
+    if c.resolved:
+        lines.append(f"    of {c.resolved} whose market resolved, {c.late} ({c.late / c.resolved:.0%}) resolved more "
+                     "than a day after the scheduled end")
+    if c.would_skip:
+        lines.append(f"    {c.would_skip} filled trades were entered in markets the cutoff now refuses "
+                     f"(P&L of the closed ones {_money(c.would_skip_pnl)}); they stay in the record")
     return lines
 
 
@@ -356,6 +440,8 @@ BREAKDOWN_KEYS: dict[str, Callable[[dict], str]] = {
     "month": lambda t: iso(t["alert_ts"])[:7],
     "wallet": lambda t: t["wallet"],
     "category": lambda t: t["category"] or "unknown",
+    "days to close when entered": lambda t: horizon_bucket(t.get("days_to_close")),
+    "holding time": lambda t: horizon_bucket(t.get("held_days")) if t.get("held_days") is not None else "still open",
     "venue": lambda t: t["venue"],
     "entry price": lambda t: bucket(t["fill_price"] if t["fill_price"] is not None else t["alert_ask"]),
     # Frozen on the alert when it fired (monitor._trigger), never recomputed.

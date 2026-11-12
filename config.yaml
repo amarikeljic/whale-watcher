@@ -120,6 +120,13 @@ consensus:
   backtest_delay_seconds: 5       # the bot acts this long after the fill that completes the consensus
   ask_premium: 0.01               # added to the historical minute price for the spread
 
+# Time-to-close cutoff (v2.1). Applied by every bot runner and by the backtests.
+# The end date is the market's scheduled end (Gamma `endDate`). It is a rule about
+# the schedule: the real resolution time is recorded at settlement and reported.
+filters:
+  max_days_to_close: 14       # skip a market scheduled to end later than this (null = no limit)
+  skip_if_no_end_date: true   # a market with no scheduled end could tie money up for ever
+
 # Costs (v2.1). Every paper fill pays the taker fee, on the buy and on a mirror-exit
 # sell:  fee = shares x rate x price x (1 - price).  No rebate is ever counted.
 fees:

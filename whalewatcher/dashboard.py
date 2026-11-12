@@ -30,7 +30,10 @@ from . import dashview as v
 from .config import Config
 from .costs import breakdown
 from .db import SCHEMA_VERSION, Database
-from .stats import (bucket, event_key, in_play, load_bot_trades, load_trades, summarise)
+from .horizon import BUCKETS as CLOSE_BUCKETS
+from .horizon import UNKNOWN as NO_END
+from .horizon import bucket as horizon_bucket
+from .stats import (bucket, cutoff_report, event_key, in_play, load_bot_trades, load_trades, summarise)
 from .stats_util import mean, median
 from .timeutil import iso, now_ts, parse_as_of, start_of_day
 
@@ -86,6 +89,11 @@ def outages(app: Any) -> list[tuple[int, int]]:
     return [(r["start_ts"], r["end_ts"] or now) for r in rows]
 
 
+# Query value -> the band of horizon.bucket() it selects.
+CLOSE_FILTERS = {"all": None, "lt1": CLOSE_BUCKETS[0], "1-7": CLOSE_BUCKETS[1], "7-14": CLOSE_BUCKETS[2],
+                 "gt14": CLOSE_BUCKETS[3], "none": NO_END}
+
+
 @dataclass
 class Filters:
     preset: str = "all"
@@ -96,6 +104,7 @@ class Filters:
     venue: str = "all"
     wallet: str = "all"
     no_outages: bool = False
+    close: str = "all"               # days to the scheduled close when the trade was entered
     since: str = ""
     until: str = ""
 
@@ -106,6 +115,7 @@ class Filters:
         f.venue = q.get("venue") or "all"
         f.wallet = (q.get("wallet") or "all").lower()
         f.no_outages = q.get("outages") == "exclude"
+        f.close = q.get("close") if q.get("close") in CLOSE_FILTERS else "all"
         want = q.get("strategy") or ""
         f.strategy = want if want in strategies else (
             DEFAULT_STRATEGY if DEFAULT_STRATEGY in strategies or not strategies else strategies[0])
@@ -137,6 +147,8 @@ class Filters:
             p["wallet"] = self.wallet
         if self.no_outages:
             p["outages"] = "exclude"
+        if self.close != "all":
+            p["close"] = self.close
         p.update(change)
         if p.get("range") != "custom":
             p.pop("from", None)
@@ -181,6 +193,8 @@ class Ctx:
             if (f.start is not None and ts < f.start) or (f.end is not None and ts >= f.end):
                 continue
             if f.no_outages and any(a <= ts < b for a, b in self.windows):
+                continue
+            if f.close != "all" and horizon_bucket(r.get("days_to_close")) != CLOSE_FILTERS[f.close]:
                 continue
             out.append(r)
         return out
@@ -247,6 +261,7 @@ def filters_html(c: Ctx) -> str:
                   f'<label>To<input type="date" name="to" value="{v.esc(f.until)}"></label>'
                   '<button type="submit">Apply</button>')
     wallets = [("all", "All wallets")] + [(w, f"{w[:6]}…{w[-4:]}") for w in c.wallets]
+    closes = [(k, "Any" if band is None else band.capitalize()) for k, band in CLOSE_FILTERS.items()]
     return (f'<form class="filters" method="get" action="{c.path}">'
             f'<label>Range<span class="presets">{presets}'
             f'<a href="{c.path}?{f.qs(range="custom")}" class="{"on" if f.preset == "custom" else ""}">Custom</a></span></label>'
@@ -255,6 +270,7 @@ def filters_html(c: Ctx) -> str:
             f'<label>Group by{select("group", [("day", "Day"), ("week", "Week")], f.group)}</label>'
             f'<label>Venue{select("venue", [("all", "All venues"), ("polymarket", "Polymarket")], f.venue)}</label>'
             f'<label>Wallet{select("wallet", wallets, f.wallet)}</label>'
+            f'<label>Days to close{select("close", closes, f.close)}</label>'
             f'<label class="check"><input type="checkbox" name="outages" value="exclude"'
             f'{" checked" if f.no_outages else ""}>Exclude outage windows</label></form>')
 
@@ -558,12 +574,15 @@ def trades_csv(c: Ctx) -> str:
     return buf.getvalue()
 
 
-def breakdown_table(c: Ctx, rows: list[dict], key: Any, first: str, *, limit: int = 0, order: str = "n") -> tuple[str, list]:
+def breakdown_table(c: Ctx, rows: list[dict], key: Any, first: str, *, limit: int = 0,
+                    order: Any = "n") -> tuple[str, list]:
+    """``order``: "n" (most closed trades first), "label", or a function of the label."""
     groups: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         groups[str(key(r))].append(r)
     stats = [(g, summarise(g, rs, samples=600)) for g, rs in groups.items()]
-    stats.sort(key=(lambda x: x[0]) if order == "label" else (lambda x: (-x[1].settled, -x[1].alerts, x[0])))
+    stats.sort(key=(lambda x: order(x[0])) if callable(order) else (lambda x: x[0]) if order == "label" else
+               (lambda x: (-x[1].settled, -x[1].alerts, x[0])))
     more = max(0, len(stats) - limit) if limit else 0
     if limit:
         stats = stats[:limit]
@@ -580,6 +599,28 @@ def breakdown_table(c: Ctx, rows: list[dict], key: Any, first: str, *, limit: in
     return html_, stats
 
 
+def cutoff_card(c: Ctx) -> str:
+    """What the time-to-close cutoff did in this view, and schedule against reality."""
+    rep = cutoff_report(c.app, c.scope())
+    fl = c.app.cfg.filters
+    limit = "off" if rep.limit is None else f"{rep.limit:g} days"
+
+    def share(k: int, n: int) -> str:
+        return "-" if not n else f"{k} of {n} ({k / n:.0%})"
+
+    tiles = (v.tile("Cutoff", limit, "no end date: " + ("skipped" if fl.skip_if_no_end_date else "allowed"))
+             + v.tile("Skipped as too long", str(rep.too_long), "signals")
+             + v.tile("Skipped, no end date", str(rep.no_end_date), "signals")
+             + v.tile("Held past the limit", share(rep.held_over, rep.closed), "closed trades")
+             + v.tile("Resolved a day or more late", share(rep.late, rep.resolved), "against the scheduled end"))
+    note = ("The cutoff reads the market's scheduled end. Resolution can come later, so a trade inside the limit "
+            "can still be held past it.")
+    if rep.would_skip:
+        note += (f" {rep.would_skip} filled trades in this view were entered in markets the cutoff now refuses "
+                 f"(closed P&L {v.money(rep.would_skip_pnl)}). They stay in every total.")
+    return v.card("Time-to-close cutoff", f'<div class="tiles">{tiles}</div>', note=note, wide=True)
+
+
 def breakdowns(c: Ctx) -> str:
     rows = traded(c.scope())
     total = summarise("x", rows, samples=1)
@@ -590,6 +631,20 @@ def breakdowns(c: Ctx) -> str:
     body += v.card("By entry price", breakdown_table(
         c, rows, lambda r: bucket(r["fill_price"] if r.get("fill_price") is not None else r.get("alert_ask")),
         "Price", order="label")[0], note="Our fill price (the best ask for a miss).", wide=True)
+    body += cutoff_card(c)
+    order = {b: i for i, b in enumerate((*CLOSE_BUCKETS, NO_END, "still open"))}
+    for title, key, first, note_ in (
+            ("By holding time", lambda r: "still open" if r.get("held_days") is None else horizon_bucket(r["held_days"]),
+             "Held for", "From our fill to the end of the position: the market's real resolution, or a mirror exit. "
+                         "Missed signals have no position and sit under still open."),
+            ("By days to close when entered", lambda r: horizon_bucket(r.get("days_to_close")), "Scheduled close",
+             "The market's scheduled end minus the moment we decided. This is what the cutoff reads.")):
+        html_, stats = breakdown_table(c, rows, key, first, order=lambda g: order.get(g, 99))
+        bars = [{"label": g, "v": round(s.total_pnl, 2), "n": s.settled} for g, s in stats]
+        body += v.card(title, v.chart(
+            "bars", {"bars": bars, "y": "usd", "signed": True}, table_headers=[first, "P&L", "Closed"],
+            table_rows=[[b["label"], v.money(b["v"]), str(b["n"])] for b in bars],
+            legend=[("Gain", "pos"), ("Loss", "neg")]) + html_, note=note_, wide=True)
     hour_html, hour_stats = breakdown_table(c, rows, lambda r: f"{time.gmtime(r['alert_ts']).tm_hour:02d}:00",
                                             "Hour (UTC)", order="label")
     bars = [{"label": g[:2], "v": round(s.total_pnl, 2), "n": s.settled} for g, s in hour_stats]
