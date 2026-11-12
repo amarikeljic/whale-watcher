@@ -128,8 +128,8 @@ class Bot:
         today = start_of_day(self.app.clock())
         r = self.app.db.one(
             "SELECT COALESCE(SUM(CASE WHEN closed_at IS NULL THEN cost END), 0) AS open_cost, "
-            "COALESCE(SUM(CASE WHEN closed_at IS NOT NULL THEN pnl END), 0) AS realized, "
-            "COALESCE(SUM(CASE WHEN closed_at >= ? THEN pnl END), 0) AS today "
+            "COALESCE(SUM(CASE WHEN closed_at IS NOT NULL THEN COALESCE(net_pnl_recalc, pnl) END), 0) AS realized, "
+            "COALESCE(SUM(CASE WHEN closed_at >= ? THEN COALESCE(net_pnl_recalc, pnl) END), 0) AS today "
             "FROM bot_trades WHERE runner = ? AND strategy = ? AND status = 'FILLED'",
             (today, self.runner, strategy))
         return Account(strategy, self.strategy_cfg(strategy).starting_bankroll, r["open_cost"], r["realized"],

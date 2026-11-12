@@ -124,11 +124,13 @@ consensus:
 # sell:  fee = shares x rate x price x (1 - price).  No rebate is ever counted.
 fees:
   # Where the rate comes from:
+  #   higher  whichever of the two below is higher: the pessimistic choice (the default).
   #   market  the market's own published rate. This is what the venue charges, and it
   #           does not always match the table (sports markets carry 0.03 as well as 0.05).
   #   table   the category table below.
-  #   higher  whichever of the two is higher: the pessimistic choice.
-  rate_source: market
+  # Changing this re-costs every existing trade into the *_recalc columns; the fee each
+  # trade was originally charged stays in `fees`.
+  rate_source: higher
   onramp_cost_pct: 1.5            # one-time cost of getting money in; used by the wallet simulation only
   schedules:                      # add a new entry when Polymarket changes fees; trades use the one in force at their time
     - from: "2026-03-31"          # https://docs.polymarket.com/trading/fees.md, table read 2026-11-10

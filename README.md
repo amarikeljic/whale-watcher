@@ -187,12 +187,14 @@ mirror exit pays it again on the sell. No rebate is ever counted. What v2.1
 adds is the breakdown and the audit trail:
 
 * **Fee** = `shares x rate x price x (1 - price)`, charged per order-book level.
-  `fees.rate_source` picks the rate: `market` (the default: the market's own
-  published rate, which is what the venue charges), `table` (the dated category
-  table in `config.yaml`) or `higher` (the worse of the two). The table is not
-  the default because live markets do not all follow it: on 2026-11-12, 311 open
-  sports markets carried 0.03 beside 479 at 0.05. The rate used and where it
-  came from are stored on every fill.
+  `fees.rate_source` picks the rate: `higher` (the default, chosen by the
+  owner: the worse of the next two), `market` (the market's own published rate,
+  which is what the venue charges) or `table` (the dated category table in
+  `config.yaml`). The two differ: on 2026-11-12, 311 open sports markets
+  carried 0.03 beside 479 at 0.05, and 111 markets tagged geopolitics carried
+  0.04 where the table says 0. Under `higher` a market the venue marks fee-free
+  still pays its category's table rate. The rate each trade was charged and
+  where it came from are stored on the fill.
 * **Slippage** is what a fill paid beyond the best ask (and lost below the best
   bid on an exit), in dollars, stored per trade.
 * **Breakdown:** gross (top of the book, no fees), fees, slippage, net. The
@@ -200,8 +202,13 @@ adds is the breakdown and the audit trail:
   already inside gross.
 * **Existing trades** are recalculated into new columns (`fee_rate`,
   `fee_source`, `fees_recalc`, `slippage_cost`, `gross_pnl`, `net_pnl_recalc`).
-  The original `fees`, `cost` and `pnl` are never rewritten, and
-  `audit --costs` lists any trade where the two disagree by more than a cent.
+  The original `fees`, `cost` and `pnl` (what the trade was charged when it was
+  made) are never rewritten. Reports use the recalculated figures, so one fee
+  policy applies to every trade however old, and changing `rate_source` re-costs
+  them all. `audit --costs` shows both and checks every charged fee against the
+  formula.
+* **Migration backups** are pruned to the oldest (the data before any migration)
+  and the newest two. A backup made by hand is never touched.
 * `fees.onramp_cost_pct` (1.5%) is the one-time cost of getting money in. It is
   used by the wallet simulation only, not by per-trade P&L.
 

@@ -22,6 +22,7 @@ is already inside the gross figure.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -71,50 +72,95 @@ def _one_level_fee(shares: float | None, price: float | None, rate: float, expon
     return polymarket_taker_fee(shares, price, rate, exponent)
 
 
-def recalculate(app: App) -> dict[str, int]:
-    """Fill the v2.1 cost columns for every fill that lacks them. Safe to run again:
-    it only touches rows where a column is still empty, and never the original values.
+POLICY_KEY = "cost_policy"
 
-    The recalculated fee uses the trade's average fill price as one level (the levels
-    walked were not kept), so it can differ from the stored per-level fee by a
-    fraction of a cent. A larger difference means the rate changed or the trade was
-    priced wrongly, and `audit --costs` lists every such trade."""
+
+def policy(app: App) -> str:
+    """What decides a recalculated fee: change either and every trade is costed again."""
+    f = app.cfg.fees
+    return json.dumps({"rate_source": f.rate_source, "schedules": f.schedules}, sort_keys=True)
+
+
+def recalculate(app: App) -> dict[str, int]:
+    """Cost every fill under the CURRENT fee policy into the ``*_recalc`` columns.
+
+    ``fees`` / ``cost`` / ``pnl`` (what the trade was charged when it was made) are
+    never touched, so the two can always be compared. ``fee_rate`` / ``fee_source``
+    record that original charge. Reports and the dashboard use the recalculated
+    figures, so one fee policy applies to every trade however old.
+
+    Runs for rows that lack the columns, and for every row when the policy changed."""
+    current = policy(app)
+    everything = app.db.get_state(POLICY_KEY) != current
     done = {"bot_trades": 0, "paper_trades": 0}
     for table, closed_col, ts_col in (("bot_trades", "closed_at", "signal_ts"), ("paper_trades", "settled_at", "alert_ts")):
-        rows = app.db.query(
-            f"SELECT * FROM {table} WHERE status = 'FILLED' AND (fees_recalc IS NULL OR "
-            f"({closed_col} IS NOT NULL AND net_pnl_recalc IS NULL))")
+        where = "" if everything else (f" AND (fees_recalc IS NULL OR ({closed_col} IS NOT NULL "
+                                       "AND net_pnl_recalc IS NULL))")
+        rows = app.db.query(f"SELECT * FROM {table} WHERE status = 'FILLED'{where}")
         markets = app.markets.get_many({r["condition_id"] for r in rows})
         with app.db.tx() as conn:
             for t in rows:
                 market = markets.get(t["condition_id"])
                 if market is None or t["fill_price"] is None or not t["contracts"]:
                     continue
-                if t["fee_rate"] is not None:
-                    rate, source = t["fee_rate"], t["fee_source"] or "market"
-                else:
-                    rate, source = rate_for(market, t[ts_col])
                 exponent = market.fee_exponent or 1.0
-                fee = _one_level_fee(t["contracts"], t["fill_price"], rate, exponent)
                 stored = t["fees"] or 0.0
+                charged, charged_by = t["fee_rate"], t["fee_source"]
+                if charged is None:         # a trade from before the rate was recorded: infer it from its fee
+                    base = t["contracts"] * t["fill_price"] * (1 - t["fill_price"])
+                    charged = round(stored / base, 4) if base > 0 else 0.0
+                    charged_by = "market"
+                rate, _ = rate_for(market, t[ts_col], app.cfg.fees)
                 slip = t["slippage_cost"]
-                if table == "bot_trades":
-                    if t["exit_price"] is not None:
+                leaving = table == "bot_trades" and t["exit_price"] is not None
+                if leaving:
+                    stored += t["exit_fees"] or 0.0
+                if table == "bot_trades" and slip is None and t["best_ask"] is not None:
+                    slip = max(0.0, (t["fill_price"] - t["best_ask"]) * t["contracts"])
+                if charged > 0:
+                    # The fee is proportional to the rate, so the fee actually charged (per
+                    # level, to the cent) scales exactly: no approximation, and no change at
+                    # all when the policy rate is the rate that was charged.
+                    fee = stored * rate / charged
+                else:
+                    fee = _one_level_fee(t["contracts"], t["fill_price"], rate, exponent)
+                    if leaving:
                         fee += _one_level_fee(t["contracts"], t["exit_price"], rate, exponent)
-                        stored += t["exit_fees"] or 0.0
-                    if slip is None and t["best_ask"] is not None:
-                        slip = max(0.0, (t["fill_price"] - t["best_ask"]) * t["contracts"])
                 gross = net = None
                 if t[closed_col] is not None and t["pnl"] is not None:
                     gross = t["pnl"] + stored + (slip or 0.0)
                     net = t["pnl"] + stored - fee
                 conn.execute(
                     f"UPDATE {table} SET fee_rate = ?, fee_source = ?, slippage_cost = ?, fees_recalc = ?, "
-                    "gross_pnl = ?, net_pnl_recalc = ? WHERE id = ?", (rate, source, slip, round(fee, 5), gross, net, t["id"]))
+                    "gross_pnl = ?, net_pnl_recalc = ? WHERE id = ?",
+                    (charged, charged_by, slip, round(fee, 5), gross, net, t["id"]))
                 done[table] += 1
+    app.db.set_state(POLICY_KEY, current)
     if any(done.values()):
-        log.info("cost columns filled for %d bot trades and %d old-rule trades", done["bot_trades"], done["paper_trades"])
+        log.info("costs recalculated for %d bot trades and %d old-rule trades (fees.rate_source = %s)",
+                 done["bot_trades"], done["paper_trades"], app.cfg.fees.rate_source)
     return done
+
+
+def apply_policy(t: dict) -> dict:
+    """For reports: a trade as the current fee policy costs it. The stored values move
+    to ``*_charged``; ``pnl``, ``fees`` and ``cost`` become the recalculated ones."""
+    if t.get("fees_recalc") is None or t.get("status") != "FILLED":
+        return t
+    stored = (t.get("fees") or 0.0) + (t.get("exit_fees") or 0.0)
+    extra = t["fees_recalc"] - stored
+    entry = (t.get("contracts") or 0.0) * (t.get("fill_price") or 0.0) * (1 - (t.get("fill_price") or 0.0))
+    leave = (t.get("contracts") or 0.0) * t["exit_price"] * (1 - t["exit_price"]) if t.get("exit_price") is not None else 0.0
+    entry_share = entry / (entry + leave) if entry + leave > 0 else 1.0
+    t["pnl_charged"], t["fees_charged"], t["cost_charged"] = t.get("pnl"), stored, t.get("cost")
+    if t.get("cost") is not None:
+        t["cost"] = t["cost"] - (t.get("fees") or 0.0) + t["fees_recalc"] * entry_share
+    t["fees"], t["exit_fees"] = t["fees_recalc"] * entry_share, t["fees_recalc"] * (1 - entry_share)
+    if t.get("net_pnl_recalc") is not None:
+        t["pnl"] = t["net_pnl_recalc"]
+    elif t.get("pnl") is not None:
+        t["pnl"] = t["pnl"] - extra
+    return t
 
 
 # -- the audit: gross, fee and net side by side ---------------------------------------------------
@@ -141,11 +187,17 @@ def audit_rows(app: App, *, strategy: str = "flat_hold", n: int = 5) -> dict[str
             continue
         gross, fees, slip, net = parts
         table = table_rate(t["category"], t["signal_ts"], app.cfg.fees)
+        # An independent check of the fee that was charged: the formula at the average
+        # fill price (and the exit price). Per-level rounding can move it a fraction of a cent.
+        by_hand = (t["contracts"] or 0) * (t["fee_rate"] or 0) * t["fill_price"] * (1 - t["fill_price"])
+        if "exit_price" in t.keys() and t["exit_price"] is not None:
+            by_hand += t["contracts"] * (t["fee_rate"] or 0) * t["exit_price"] * (1 - t["exit_price"])
         out.append({"id": t["id"], "question": t["question"] or t["condition_id"][:16], "category": t["category"],
                     "price": t["fill_price"], "shares": t["contracts"], "rate": t["fee_rate"], "source": t["fee_source"],
                     "table_rate": table, "gross": gross, "fees": fees, "slippage": slip, "net": net,
                     "fees_recalc": t["fees_recalc"], "net_recalc": t["net_pnl_recalc"],
-                    "differs": t["fees_recalc"] is not None and abs(t["fees_recalc"] - fees) > 0.01,
+                    "by_hand": by_hand, "differs": abs(by_hand - fees) > 0.01,
+                    "policy": app.cfg.fees.rate_source,
                     "rate_differs": table is not None and t["fee_rate"] is not None and abs(table - t["fee_rate"]) > 1e-9})
     return {"kind": kind, "strategy": strategy, "rows": out, "shown": out[:n], "total": breakdown(rows)}
 
@@ -160,8 +212,8 @@ def render_audit(rep: dict[str, Any]) -> str:
     lines.append(f"  {'trade':>6} {'category':<11} {'price':>6} {'shares':>8} {'rate':>6} {'gross P&L':>10} {'fee':>8} "
                  f"{'slippage':>9} {'net P&L':>9}   fee check")
     for r in rep["shown"]:
-        check = "stored = recalculated" if not r["differs"] else (
-            f"stored {r['fees']:.4f} vs recalculated {r['fees_recalc']:.4f}")
+        check = "charged = formula" if not r["differs"] else (
+            f"CHARGED {r['fees']:.4f} BUT THE FORMULA GIVES {r['by_hand']:.4f}")
         if r["rate_differs"]:
             check += f"; table says {r['table_rate']:g}, market charges {r['rate']:g}"
         lines.append(f"  {r['id']:>6} {(r['category'] or '?')[:11]:<11} {r['price']:>6.3f} {r['shares']:>8.2f} "
@@ -170,13 +222,17 @@ def render_audit(rep: dict[str, Any]) -> str:
         lines.append(f"         {r['question'][:70]}")
         expect = r["shares"] * (r["rate"] or 0) * r["price"] * (1 - r["price"])
         lines.append(f"         by hand: {r['shares']:.2f} x {(r['rate'] or 0):g} x {r['price']:.3f} x "
-                     f"{1 - r['price']:.3f} = {expect:.4f}")
+                     f"{1 - r['price']:.3f} = {expect:.4f}" + ("" if abs(r["by_hand"] - expect) < 1e-9 else
+                                                              f" on the buy, {r['by_hand']:.4f} with the sell"))
     lines.append("")
     lines.append(f"  All {c.n} closed trades: gross {c.gross:+,.2f} | fees -{c.fees:,.2f} | slippage -{c.slippage:,.2f} "
                  f"| net {c.net:+,.2f}")
     bad = sum(1 for r in rows if r["differs"])
     off_table = sum(1 for r in rows if r["rate_differs"])
-    lines.append(f"  Stored fee differs from the recalculation by more than a cent on {bad} of {len(rows)} trades.")
-    lines.append(f"  The market's own rate differs from the config table on {off_table} of {len(rows)} trades "
-                 "(fees.rate_source decides which is charged; today it is the market's).")
+    recalc = sum(r["fees_recalc"] or 0.0 for r in rows)
+    lines.append(f"  The table above is what each trade was CHARGED when it was made. Recalculated under today's "
+                 f"policy (fees.rate_source = {rows[0]['policy']}): fees -{recalc:,.2f} | net "
+                 f"{c.gross - recalc - c.slippage:+,.2f}. Reports use the recalculated figures.")
+    lines.append(f"  The fee charged differs from the formula by more than a cent on {bad} of {len(rows)} trades.")
+    lines.append(f"  The rate charged differs from the config table on {off_table} of {len(rows)} trades.")
     return "\n".join(lines)

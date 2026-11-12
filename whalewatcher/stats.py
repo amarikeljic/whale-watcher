@@ -86,7 +86,8 @@ class Summary:
 
 
 def load_trades(app: App) -> list[dict]:
-    return [dict(r) for r in app.db.query(QUERY)]
+    from .costs import apply_policy
+    return [apply_policy(dict(r)) for r in app.db.query(QUERY)]
 
 
 # -- the bot model (v2 Phase 3) -------------------------------------------------------
@@ -104,9 +105,10 @@ ORDER BY b.signal_ts, b.id
 
 def load_bot_trades(app: App) -> list[dict]:
     """Bot ledger rows, with the names ``summarise`` and the breakdowns read."""
+    from .costs import apply_policy
     out = []
     for r in app.db.query(BOT_QUERY):
-        d = dict(r)
+        d = apply_policy(dict(r))
         d.update(venue=f"bot:{d['runner']}", settled_at=d["closed_at"], miss_reason=d["reason"],
                  alert_ts=d["signal_ts"], alert_ask=d["best_ask"], atask_pnl=None,
                  fill_ts=d["decided_at"] if d["status"] == "FILLED" else None,

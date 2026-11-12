@@ -64,7 +64,20 @@ def fake_http() -> FakeHttp:
 def cfg() -> Config:
     c = Config(database_path=":memory:")
     c.api.rate_limits = {}
+    # Tests work out fees from each market's own rate; the shipped default ("higher")
+    # and the table have their own tests in test_costs.py.
+    c.fees.rate_source = "market"
     return c
+
+
+@pytest.fixture(autouse=True)
+def _fee_policy():
+    """The fee policy is process-wide (set by open_app). Start every test from the same one."""
+    from whalewatcher import fees
+    from whalewatcher.config import FeesConfig
+    fees.configure(FeesConfig(rate_source="market"))
+    yield
+    fees.configure(None)
 
 
 @pytest.fixture

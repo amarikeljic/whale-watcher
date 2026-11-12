@@ -44,13 +44,20 @@ def test_geopolitics_is_free_in_the_table_and_an_unknown_category_pays_the_other
 def test_the_rate_can_come_from_the_market_the_table_or_the_higher_of_the_two():
     ufc = market(category="sports", fee_rate=0.03)              # a sports market that charges 0.03, as some do
     free = market(category="geopolitics", fee_rate=0.0)
-    assert fees.rate_for(ufc, NOW, FeesConfig()) == (0.03, "market"), "default: what the venue charges"
+    own = FeesConfig(rate_source="market")
+    assert FeesConfig().rate_source == "higher", "the shipped default is the pessimistic one"
+    assert fees.rate_for(ufc, NOW, own) == (0.03, "market"), "what the venue charges"
     assert fees.rate_for(ufc, NOW, FeesConfig(rate_source="table")) == (0.05, "table")
-    assert fees.rate_for(ufc, NOW, FeesConfig(rate_source="higher")) == (0.05, "table")
-    assert fees.rate_for(free, NOW, FeesConfig()) == (0.0, "market")
+    assert fees.rate_for(ufc, NOW, FeesConfig()) == (0.05, "table"), "higher: the table's 0.05 beats the market's 0.03"
+    dear = market(category="geopolitics", fee_rate=0.04)        # the table says geopolitics is free; this market is not
+    assert fees.rate_for(dear, NOW, FeesConfig()) == (0.04, "market"), "higher: the market's 0.04 beats the table's 0"
+    assert fees.rate_for(free, NOW, own) == (0.0, "market") and fees.rate_for(free, NOW, FeesConfig()) == (0.0, "market")
+    waived = market(category="sports", fee_rate=0.0)             # the venue marks it fee-free
+    assert fees.rate_for(waived, NOW, own) == (0.0, "market")
+    assert fees.rate_for(waived, NOW, FeesConfig()) == (0.05, "table"), "higher still charges the category rate"
     silent = market(category="crypto", fee_rate=0.0)
     silent.fees_enabled = True                                   # charges a fee, publishes no rate
-    assert fees.rate_for(silent, NOW, FeesConfig()) == (0.07, "table"), "the table is the fallback"
+    assert fees.rate_for(silent, NOW, own) == (0.07, "table"), "the table is the fallback"
 
 
 def test_a_fee_change_applies_from_its_date_and_not_before():
@@ -116,8 +123,8 @@ async def test_a_closed_trade_splits_into_gross_fees_slippage_and_net(live_app, 
     assert t["pnl"] == pytest.approx(shares - 10 - t["fees"]), "net: payout minus stake minus fee"
     assert t["gross_pnl"] == pytest.approx(shares - shares * 0.50), "gross: the same shares bought at the best ask, no fee"
     assert t["gross_pnl"] == pytest.approx(t["pnl"] + t["fees"] + t["slippage_cost"])
-    assert t["fees_recalc"] == pytest.approx(t["fees"], abs=0.001), "one-level recalculation agrees to a tenth of a cent"
-    assert t["net_pnl_recalc"] == pytest.approx(t["pnl"], abs=0.001)
+    assert t["fees_recalc"] == pytest.approx(t["fees"]), "same rate: the recalculation is the fee charged, exactly"
+    assert t["net_pnl_recalc"] == pytest.approx(t["pnl"])
 
     c = costs.breakdown(live_app.db.query("SELECT * FROM bot_trades WHERE strategy = 'flat_hold'"))
     assert c.n == 1 and c.net == pytest.approx(c.gross - c.fees - c.slippage)
@@ -172,7 +179,34 @@ async def test_old_rule_trades_are_recalculated_into_new_columns_only(live_app, 
     text = costs.render_audit(rep)
     assert rep["kind"] == "old rule" and "by hand: 20.00 x 0.05 x 0.500 x 0.500 = 0.2500" in text
     assert "gross +10.00 | fees -0.25 | slippage -0.00 | net +9.75" in text
-    assert "differs from the recalculation by more than a cent on 0 of 1 trades" in text
+    assert "differs from the formula by more than a cent on 0 of 1 trades" in text
+
+
+async def test_switching_to_the_pessimistic_rate_recosts_old_trades_beside_the_originals(live_app, fake_http, clock):
+    world, monitor, bot = setup(live_app, fake_http, asks=[(0.50, 5000)], fee_rate=0.03)      # the market charges 0.03
+    world.trade(WHALE, NOW - 3, COND, size=1300, price=0.50, usdc=650, feed=True)
+    await monitor.poll_once()
+    world.markets[COND].resolved_at, world.markets[COND].payouts = clock.now + 60, [1.0, 0.0]
+    clock.advance(700)
+    await bot.settle()
+    costs.recalculate(live_app)
+    t = one(live_app)
+    assert t["fees"] == pytest.approx(0.15) and t["fees_recalc"] == pytest.approx(0.15) and t["pnl"] == pytest.approx(9.85)
+
+    live_app.cfg.fees.rate_source = "higher"                    # the table's 0.05 for sports now applies
+    fees.configure(live_app.cfg.fees)
+    assert costs.recalculate(live_app)["bot_trades"] >= 1, "a policy change re-costs every trade"
+    t = one(live_app)
+    assert (t["fees"], t["pnl"], t["fee_rate"]) == (pytest.approx(0.15), pytest.approx(9.85), 0.03), "what it was charged stays"
+    assert t["fees_recalc"] == pytest.approx(0.25) and t["net_pnl_recalc"] == pytest.approx(9.75)
+    from whalewatcher.stats import load_bot_trades
+    (shown,) = [x for x in load_bot_trades(live_app) if x["strategy"] == "flat_hold"]
+    assert shown["pnl"] == pytest.approx(9.75) and shown["cost"] == pytest.approx(10.25), "reports use the re-costed trade"
+    assert shown["pnl_charged"] == pytest.approx(9.85)
+    assert bot.account("flat_hold").realized == pytest.approx(9.75)
+    assert "net +$9.75" in render(live_app, with_breakdowns=False)
+    assert "Recalculated under today's policy (fees.rate_source = higher): fees -0.25 | net +9.75" in \
+        costs.render_audit(costs.audit_rows(live_app))
 
 
 async def test_the_audit_flags_a_stored_fee_that_does_not_match_and_a_rate_off_the_table(live_app, fake_http, clock):
@@ -185,6 +219,22 @@ async def test_the_audit_flags_a_stored_fee_that_does_not_match_and_a_rate_off_t
     costs.recalculate(live_app)
     live_app.db.execute("UPDATE bot_trades SET fees = 0.90 WHERE strategy = 'flat_hold'")       # a wrong stored fee
     text = costs.render_audit(costs.audit_rows(live_app))
-    assert "stored 0.9000 vs recalculated 0.1500" in text
+    assert "CHARGED 0.9000 BUT THE FORMULA GIVES 0.1500" in text
     assert "table says 0.05, market charges 0.03" in text
     assert "more than a cent on 1 of 1 trades" in text and "differs from the config table on 1 of 1 trades" in text
+
+
+def test_superseded_migration_backups_are_pruned_but_the_first_and_any_hand_made_one_stay(tmp_path):
+    from whalewatcher.db import Database
+    db = Database(str(tmp_path / "ww.sqlite3"))
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    names = [f"ww.sqlite3.2026111{i}T000000Z.pre-v{i + 2}" for i in range(5)]
+    for name in names + ["ww.sqlite3.20261110T170049Z", "notes.txt"]:
+        (folder / name).write_text("x")
+    removed = db.prune_migration_backups()
+    assert removed == names[1:3], "the middle ones go"
+    left = sorted(p.name for p in folder.iterdir())
+    assert left == sorted([names[0], names[3], names[4], "ww.sqlite3.20261110T170049Z", "notes.txt"])
+    assert db.prune_migration_backups() == []
+    db.close()

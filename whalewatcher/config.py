@@ -216,11 +216,11 @@ class FeesConfig:
     No rebate is ever counted.
 
     ``rate_source`` says where the rate comes from:
+      higher  whichever of the two below is higher: the pessimistic choice, and the default.
       market  the market's own published rate (feeSchedule.rate). What the venue charges.
       table   the category table below.
-      higher  whichever of the two is higher (the pessimistic choice).
     The table is always the fallback for a fee-charging market that publishes no rate."""
-    rate_source: str = "market"
+    rate_source: str = "higher"
     onramp_cost_pct: float = 1.5        # one-time cost of getting money in, used by the wallet simulation only
     schedules: list = field(default_factory=_fee_table)
 

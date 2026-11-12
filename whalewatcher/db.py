@@ -543,6 +543,8 @@ class Database:
                         "SELECT 1794223620, 1794242760, 'ISP outage (reported by the owner)', 'owner' "
                         "WHERE NOT EXISTS (SELECT 1 FROM outage_windows)")
                 self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                if self.backup_path:
+                    self.prune_migration_backups()
 
     @contextmanager
     def _migration_lock(self) -> Iterator[None]:
@@ -578,6 +580,23 @@ class Database:
             have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             if column not in have:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+    KEEP_NEWEST_MIGRATION_BACKUPS = 2
+
+    def prune_migration_backups(self) -> list[str]:
+        """Each migration leaves a full copy of the database. Keep the ones worth
+        having: the OLDEST (the data before any migration ever ran) and the newest
+        two. Only files this class wrote (``<db name>.<time>.pre-v<N>``) are ever
+        considered; a backup made by hand, under any other name, is never touched."""
+        src = Path(self.path)
+        mine = sorted(p for p in (src.parent / "backups").glob(f"{src.name}.*.pre-v*")
+                      if p.is_file() and p.suffix.startswith(".pre-v") and p.suffix[6:].isdigit())
+        doomed = mine[1:-self.KEEP_NEWEST_MIGRATION_BACKUPS] if len(mine) > self.KEEP_NEWEST_MIGRATION_BACKUPS + 1 else []
+        for p in doomed:
+            p.unlink()
+            log.warning("removed superseded migration backup %s (kept: the oldest and the newest %d)",
+                        p.name, self.KEEP_NEWEST_MIGRATION_BACKUPS)
+        return [p.name for p in doomed]
 
     def backup(self, label: str) -> str:
         """Copy the whole database to ``<db dir>/backups/<name>.<UTC time>.<label>`` with
