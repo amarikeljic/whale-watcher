@@ -327,6 +327,25 @@ async def _watchlist(args, cfg) -> int:
     return 0
 
 
+async def _consensus(args, cfg) -> int:
+    from . import consensus as cs
+    from .timeutil import add_months
+    say = lambda m: print(f"  .. {m}", file=sys.stderr)   # noqa: E731
+    async with open_app(cfg) as app:
+        if args.backtest:
+            end = start_of_day(now_ts())
+            if args.cutoffs:
+                cutoffs = sorted(parse_as_of(c) for c in args.cutoffs.split(","))
+            else:
+                cutoffs = [add_months(end, -args.holdout_months * (args.folds - k)) for k in range(args.folds)]
+            rep = await cs.run_backtest(app, cutoffs, end, progress=say)
+            print(cs.describe(rep))
+        else:
+            pool = await cs.live_pool(app, progress=say)
+            print(cs.describe_pool(pool, cfg.consensus_pool))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m whalewatcher",
                                 description="Find skilled Polymarket wallets and paper trade their entries. "
@@ -407,6 +426,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run the nightly review now (score, add, keep, remove), then show the result")
     w.add_argument("--as-of", help="with --review: use data up to this date (default: today 00:00 UTC)")
 
+    c = sub.add_parser("consensus", help="the consensus pool today, or --backtest the consensus strategy")
+    c.add_argument("--backtest", action="store_true",
+                   help="replay the last months with the pool rebuilt each day from that day's data only")
+    c.add_argument("--cutoffs", help="comma-separated YYYY-MM-DD dates at which candidates are searched for "
+                                     "(default: --folds periods of --holdout-months ending today)")
+    c.add_argument("--folds", type=int, default=3)
+    c.add_argument("--holdout-months", type=int, default=2)
+
     d = sub.add_parser("detector", help="watch trades and publish tracked wallets' fills (its own container)")
     d.add_argument("--cycles", type=int, help="stop after this many feed polls")
 
@@ -461,5 +488,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_audit(args, cfg))
     if args.command == "watchlist":
         return asyncio.run(_watchlist(args, cfg))
+    if args.command == "consensus":
+        return asyncio.run(_consensus(args, cfg))
     from . import service  # the live loop and stats, imported lazily
     return asyncio.run(service.run_command(args, cfg))

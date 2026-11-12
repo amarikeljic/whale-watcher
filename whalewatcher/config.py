@@ -176,6 +176,32 @@ class BotConfig:
 
 
 @dataclass
+class ConsensusPoolConfig:
+    """Who counts as a "top trader" for the consensus strategy (v2 Phase 3b). Separate
+    from the watchlist: this pool is broad and is judged as a crowd, not wallet by wallet."""
+    min_profit_30d_usd: float = 100_000.0
+    top_n: int = 0                      # > 0: instead keep the top N by 30-day profit
+    min_trades_per_day: float = 5.0     # transactions a day, averaged over the 30 days
+    max_trades_per_day: float = 200.0   # above this it is probably a market maker or a bot
+    max_two_sided_ratio: float = 0.40   # share of its markets where it bought both sides
+    # Two wallets are treated as one entity when either of these holds over the last 30 days.
+    entity_min_jaccard: float = 0.60    # overlap of the sets of markets they bought (at least 5 each)
+    entity_min_cotrades: int = 10       # ...or this many buys of the same outcome within 10 s of each other
+    entity_min_cotrade_share: float = 0.30   # ...making up this share of the less active wallet's buys
+
+
+@dataclass
+class ConsensusConfig:
+    """When the pool "agrees" (v2 Phase 3b)."""
+    min_agreeing_entities: int = 3
+    min_position_usd: float = 1000.0    # an entity's net position in the outcome, at cost
+    max_opposing_entities: int = 0      # pool entities holding another outcome of the same market
+    window_hours: float = 48.0          # agreeing entries older than this are not fresh agreement
+    backtest_delay_seconds: int = 5     # the bot acts this long after the completing fill
+    ask_premium: float = 0.01           # added to the historical minute price for the spread
+
+
+@dataclass
 class ApiConfig:
     # https://docs.polymarket.com/api-reference/rate-limits.md (verified 2026-11-07)
     data_api: str = "https://data-api.polymarket.com"
@@ -219,6 +245,8 @@ class Config:
     rescore: RescoreConfig = field(default_factory=RescoreConfig)
     watchlist: WatchlistConfig = field(default_factory=WatchlistConfig)
     bot: BotConfig = field(default_factory=BotConfig)
+    consensus_pool: ConsensusPoolConfig = field(default_factory=ConsensusPoolConfig)
+    consensus: ConsensusConfig = field(default_factory=ConsensusConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
     # Secrets, from the environment only.
     discord_webhook_url: str | None = field(default=None, repr=False)
@@ -245,6 +273,8 @@ _SECTIONS = {
     "rescore": RescoreConfig,
     "watchlist": WatchlistConfig,
     "bot": BotConfig,
+    "consensus_pool": ConsensusPoolConfig,
+    "consensus": ConsensusConfig,
     "api": ApiConfig,
 }
 
@@ -315,6 +345,13 @@ def validate(cfg: Config) -> None:
                                   w.entry.max_fills_per_market <= w.exit.max_fills_per_market)):
         if not entry_stricter:
             raise ConfigError(f"watchlist.entry.{name} must be at least as strict as watchlist.exit.{name}")
+    c = cfg.consensus
+    if c.min_agreeing_entities < 2:
+        raise ConfigError("consensus.min_agreeing_entities must be at least 2 (one wallet is not a consensus)")
+    if c.window_hours <= 0 or c.min_position_usd <= 0:
+        raise ConfigError("consensus.window_hours and consensus.min_position_usd must be positive")
+    if cfg.consensus_pool.min_trades_per_day > cfg.consensus_pool.max_trades_per_day:
+        raise ConfigError("consensus_pool.min_trades_per_day cannot exceed max_trades_per_day")
     b = cfg.bot
     if b.feed_poll_seconds < 0.5:
         raise ConfigError("bot.feed_poll_seconds must be at least 0.5 (the feed's rate limit is shared)")

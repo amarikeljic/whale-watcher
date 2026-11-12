@@ -47,6 +47,8 @@ python -m whalewatcher watchlist                    # who is being watched: metr
 python -m whalewatcher watchlist --last             # what the latest nightly review added, kept, removed, and why
 python -m whalewatcher watchlist --history          # every add and removal ever (never deleted)
 python -m whalewatcher watchlist --review           # run the nightly review now
+python -m whalewatcher consensus                    # today's consensus pool: counts at $100k/$250k/$500k/top 50, entities
+python -m whalewatcher consensus --backtest         # six months of the consensus strategy, no hindsight, with baselines
 python -m whalewatcher detector                     # watch trades, publish tracked wallets' fills (own container)
 python -m whalewatcher monitor [--no-post] [--cycles N] [--no-detector]   # the runner: alerts + the paper bot
 python -m whalewatcher settle
@@ -174,6 +176,37 @@ section.
 *CLV.* Pre-game fills are compared with the closing line as before. Every fill,
 in-play included, also gets the price 5 minutes after it, which is the only
 honest reference for a bet placed during a game.
+
+**Consensus** (`consensus.py`, v2 Phase 3b). A separate question from copying
+one whale: when several *independent* top traders take the same side, is that
+side more likely to win?
+
+* *The pool* is broad and judged as a crowd: the 30-day profit leaderboard
+  (polymarket.com, the international platform), minus wallets that trade fewer
+  than 5 or more than 200 times a day or buy both sides in over 40% of their
+  markets.
+* *Entities.* Wallets that are probably one person are merged, and consensus
+  counts entities, not wallets: the same set of markets (overlap of 60% or
+  more), or repeatedly buying the same outcome within 10 seconds of each other.
+  The brief's third test, "funded from the same address", is **not done**: it
+  needs a chain node and this project uses free APIs only. Some twins will get
+  through.
+* *The signal.* Three or more entities each hold $1,000 or more of one outcome,
+  their entries are within 48 hours of each other, and no pool entity holds
+  another outcome of that market. It fires on the fill that completes it, and
+  every signal is stored with who agreed, when, at what price, and how far the
+  price had already moved.
+* *The backtest comes first.* On each day of the replay the pool is rebuilt
+  from that day's past only: profit is what a wallet realised on markets that
+  resolved in the previous 30 days, and a wallet cannot be in the pool before
+  the date a leak-free candidate search first found it. It is compared with two
+  baselines over the same period: copying any single pool entity, and buying a
+  random other market at a similar price at the same moment.
+
+Two gaps between that backtest and the live pool, printed with every result:
+history has no leaderboard, so the backtest ranks on realised profit while the
+live board is marked to market; and the backtest only knows wallets our
+candidate search found, a sample, not every trader.
 
 **The watchlist** (`watchlist.py`, v2). The monitored set is a list that
 grows, not a nightly top 20. Every night the service scores candidates with
@@ -554,6 +587,61 @@ span zero widely and are not evidence.
 The replay prices a copy at the minute price plus a cent. Right after a $1,000+
 buy in a thin market the real ask is often higher, so the true result is likely
 worse.
+
+## Does agreement among top traders predict anything? (2026-11-12)
+
+**No, on this evidence.** `python -m whalewatcher consensus --backtest` replayed
+2026-05-07 to 2026-11-12: 731 wallets found by leak-free candidate searches,
+the pool rebuilt every day from that day's past, a signal when 3 or more
+entities each held $1,000+ of one outcome within 48 hours with no pool entity
+on the other side, a $10 fill 5 seconds later at the minute price plus a cent,
+fees, held to resolution.
+
+| Pool (30-day realised profit) | Settled signals (events) | ROI | Mean per trade, 95% CI | Win rate |
+|---|---|---|---|---|
+| $100k+ | 34 (29) | -35.2% | -35.1% [-62.9%, -6.4%] | 35% |
+| $250k+ | 7 (6) | -33.0% | [-81.2%, +29.1%] | 43% |
+| $500k+ | 1 (1) | n/a | one trade | n/a |
+| top 50 that pass the rules | 183 (165) | -7.0% | -7.0% [-19.8%, +6.6%] | 59% |
+
+Baselines over the same period, same fill rule:
+
+| Baseline | Settled | Mean per trade, 95% CI |
+|---|---|---|
+| any single pool entity's entry (top-50 pool) | 1,378 | -5.2% [-10.0%, -0.2%] |
+| any single pool entity's entry ($100k pool) | 1,363 | -5.3% [-10.9%, +0.6%] |
+| consensus minus a random similar-priced market at the same moment (top-50 pool, 181 pairs) | | -16.8% [-40.9%, +3.4%] |
+
+What the numbers say:
+
+* No pool's interval is above zero, and the $100k pool's is wholly below it.
+  That one is 34 signals bunched in May and July, so read it as "no support",
+  not as "consensus is a reliable fade".
+* Consensus did not beat copying a single pool wallet, and did not beat buying
+  a random market at a similar price.
+* The price had not run away: it moved only +0.5c to +3.4c between the first
+  entity's entry and our fill, and agreement took about 9 to 10 hours to form.
+  The idea fails on the outcomes, not on being late.
+* CLV was negative too (-0.014 and -0.016 on pre-game fills): the market kept
+  moving against these positions after the signal.
+* Most apparent agreement is not agreement: 8,028 would-be signals in the
+  top-50 pool were blocked because another pool entity held the other side.
+
+Limits: the backtest pool is ranked on realised profit of resolved markets (no
+historical leaderboard exists) and only knows the wallets our candidate search
+found, so its $100k pool held a median of 5 wallets a day against 161 on
+today's real board. The top-50 pool is the closest stand-in for a broad live
+pool. Fills use minute prices, not real books. Entity merging has no funding
+check.
+
+Today's live pool, for comparison (`python -m whalewatcher consensus`):
+
+| Definition | On the board | Pass the activity rules | Entities |
+|---|---|---|---|
+| $100k+ | 313 | 161 | 159 |
+| $250k+ | 120 | 53 | 51 |
+| $500k+ | 56 | 23 | 23 |
+| top 50 by profit | 50 | 21 | 21 |
 
 ## Known limits
 

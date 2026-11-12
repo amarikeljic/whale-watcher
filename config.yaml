@@ -99,6 +99,27 @@ bot:
     max_event_exposure_usd: 50
     daily_loss_limit_usd: 100
 
+# The consensus strategy (v2 Phase 3b): does agreement among independent top traders
+# predict anything? `python -m whalewatcher consensus` shows today's pool at each
+# profit bar; `consensus --backtest` replays six months with the pool rebuilt every
+# day from that day's data only.
+consensus_pool:
+  min_profit_30d_usd: 100000      # the profit bar. 100k / 250k / 500k / top 50 are all reported
+  top_n: 0                        # > 0: keep the top N by 30-day profit instead of using the bar
+  min_trades_per_day: 5           # transactions a day over the 30 days
+  max_trades_per_day: 200         # above this it is probably a market maker or a bot
+  max_two_sided_ratio: 0.40       # share of its markets where it bought both sides
+  entity_min_jaccard: 0.60        # two wallets are one entity if their sets of markets overlap this much...
+  entity_min_cotrades: 10         # ...or they bought the same outcome within 10 s this many times...
+  entity_min_cotrade_share: 0.30  # ...making up this share of the less active one's buys
+consensus:
+  min_agreeing_entities: 3
+  min_position_usd: 1000          # an entity's net position in the outcome, at cost
+  max_opposing_entities: 0        # pool entities allowed on another outcome of the same market
+  window_hours: 48                # entries older than this are not fresh agreement
+  backtest_delay_seconds: 5       # the bot acts this long after the fill that completes the consensus
+  ask_premium: 0.01               # added to the historical minute price for the spread
+
 stats:
   min_settled_for_conclusions: 30
   bootstrap_samples: 10000

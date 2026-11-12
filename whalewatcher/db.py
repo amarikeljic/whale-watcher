@@ -21,8 +21,9 @@ log = logging.getLogger(__name__)
 
 # 1: the original build. 2: v2 Phase 2, the persistent watchlist (watchlist_membership,
 # watchlist_events, alerts.membership_id, alerts.probation). 3: v2 Phase 3, the bot
-# model (fill_events, bot_trades, alerts.detect_delay, alerts.whale_position).
-SCHEMA_VERSION = 3
+# model (fill_events, bot_trades, alerts.detect_delay, alerts.whale_position). 4: v2
+# Phase 3b, consensus (consensus_signals, consensus_pool_runs, consensus_pool).
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallets (
@@ -343,6 +344,57 @@ CREATE TABLE IF NOT EXISTS bot_trades (
     UNIQUE (runner, strategy, alert_id)
 );
 CREATE INDEX IF NOT EXISTS bot_trades_open ON bot_trades (runner, strategy, closed_at);
+
+-- Consensus (v2 Phase 3b). One row per signal: who agreed, when, at what price, and
+-- how far the price had moved since the first of them entered.
+CREATE TABLE IF NOT EXISTS consensus_signals (
+    id                INTEGER PRIMARY KEY,
+    source            TEXT NOT NULL,      -- backtest:<pool> | live
+    condition_id      TEXT NOT NULL,
+    token_id          TEXT NOT NULL,
+    outcome           TEXT,
+    signal_ts         INTEGER NOT NULL,   -- block time of the fill that completed the consensus
+    trigger_wallet    TEXT,
+    trigger_price     REAL,               -- the market price when the signal fired
+    entities          INTEGER NOT NULL,
+    opposing          INTEGER NOT NULL DEFAULT 0,
+    first_entry_ts    INTEGER,
+    first_entry_price REAL,
+    runup             REAL,               -- trigger_price - first_entry_price
+    details           TEXT,               -- JSON: [{entity, entry_ts, entry_price, usd}]
+    status            TEXT,               -- FILLED | MISSED | UNPRICED
+    miss_reason       TEXT,
+    fill_ts           INTEGER,
+    fill_price        REAL,
+    cost              REAL,
+    pnl               REAL,
+    payout_per_share  REAL,
+    settled_at        INTEGER,
+    created_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS consensus_signals_source ON consensus_signals (source, signal_ts);
+
+-- The consensus pool as it stood at each refresh, wallet by wallet, with why.
+CREATE TABLE IF NOT EXISTS consensus_pool_runs (
+    id          INTEGER PRIMARY KEY,
+    as_of       INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL,
+    rules_json  TEXT NOT NULL,
+    counts_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS consensus_pool (
+    run_id          INTEGER NOT NULL REFERENCES consensus_pool_runs(id),
+    wallet          TEXT NOT NULL,
+    name            TEXT,
+    entity          TEXT,                 -- wallets sharing this are counted as one
+    rank            INTEGER,              -- on the 30-day profit leaderboard
+    profit_30d      REAL,
+    trades_per_day  REAL,
+    two_sided_ratio REAL,
+    passed          INTEGER NOT NULL,     -- the activity rules (the profit bar is applied on top)
+    reasons         TEXT,                 -- JSON list
+    PRIMARY KEY (run_id, wallet)
+);
 
 CREATE TABLE IF NOT EXISTS service_state (
     key    TEXT PRIMARY KEY,
