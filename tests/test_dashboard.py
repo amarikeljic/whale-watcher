@@ -36,6 +36,7 @@ def test_overview_shows_the_hand_checked_totals_each_with_its_n(site):
     assert "$10.00" in html and "1 open positions, at cost" in html
     assert "Not enough data: 5 closed trades in this range (need at least 30)" in html
     assert "The interval includes zero" in html and "95% interval" in html
+    assert "Where the money went" in html and "Costs paid" in html and "Every other figure on this dashboard is net" in html
     assert "Cumulative P&amp;L by strategy" in html and "Control: same outcome, later n=1" in html
     assert "Old rule: human delay n=1" in html, "the old paper trades are their own line"
 

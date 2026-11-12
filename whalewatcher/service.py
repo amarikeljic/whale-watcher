@@ -31,6 +31,7 @@ import time
 from .app import App, open_app
 from .bot import Bot
 from .config import Config
+from .costs import recalculate
 from .detector import HEARTBEAT_KEY as DETECTOR_HEARTBEAT_KEY
 from .detector import Detector
 from .discord import DiscordWebhook, NullSink, Sink
@@ -88,6 +89,7 @@ class Service:
         app, cfg = self.app, self.app.cfg
         if seed_from_monitored(app):          # first start after the v2 upgrade
             sync_monitored(app, None)
+        recalculate(app)                      # v2.1: cost columns for trades made before they existed
         if not self.monitor.wallets():
             log.info("no monitored wallets yet: scoring now")
             await self._rescore()
@@ -184,6 +186,7 @@ class Service:
         if now - int(app.db.get_state("last_settle_at", 0)) >= cfg.paper.settle_interval_seconds:
             settled = await self.paper.settle()
             closed = await self.bot.settle()
+            recalculate(app)                 # cost columns for anything filled or closed since
             app.db.set_state("last_settle_at", now)
             if settled or closed:
                 log.info("settled %d old-rule paper trades and %d bot trades", settled, closed)

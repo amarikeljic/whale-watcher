@@ -201,6 +201,30 @@ class ConsensusConfig:
     ask_premium: float = 0.01           # added to the historical minute price for the spread
 
 
+def _fee_table() -> list[dict[str, Any]]:
+    # https://docs.polymarket.com/trading/fees.md, table read 2026-11-10. `from` is the
+    # day a table took effect; add a new entry when Polymarket changes its fees and
+    # every trade is costed with the table in force at its own time.
+    return [{"from": "2026-03-31", "rates": {
+        "crypto": 0.07, "sports": 0.05, "politics": 0.04, "finance": 0.04, "economics": 0.05, "culture": 0.05,
+        "weather": 0.05, "other": 0.05, "mentions": 0.04, "tech": 0.04, "geopolitics": 0.0, "combos": 0.05}}]
+
+
+@dataclass
+class FeesConfig:
+    """Taker fee = shares x rate x price x (1 - price), on every buy and every sell.
+    No rebate is ever counted.
+
+    ``rate_source`` says where the rate comes from:
+      market  the market's own published rate (feeSchedule.rate). What the venue charges.
+      table   the category table below.
+      higher  whichever of the two is higher (the pessimistic choice).
+    The table is always the fallback for a fee-charging market that publishes no rate."""
+    rate_source: str = "market"
+    onramp_cost_pct: float = 1.5        # one-time cost of getting money in, used by the wallet simulation only
+    schedules: list = field(default_factory=_fee_table)
+
+
 @dataclass
 class ApiConfig:
     # https://docs.polymarket.com/api-reference/rate-limits.md (verified 2026-11-07)
@@ -247,6 +271,7 @@ class Config:
     bot: BotConfig = field(default_factory=BotConfig)
     consensus_pool: ConsensusPoolConfig = field(default_factory=ConsensusPoolConfig)
     consensus: ConsensusConfig = field(default_factory=ConsensusConfig)
+    fees: FeesConfig = field(default_factory=FeesConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
     # Secrets, from the environment only.
     discord_webhook_url: str | None = field(default=None, repr=False)
@@ -275,6 +300,7 @@ _SECTIONS = {
     "bot": BotConfig,
     "consensus_pool": ConsensusPoolConfig,
     "consensus": ConsensusConfig,
+    "fees": FeesConfig,
     "api": ApiConfig,
 }
 
@@ -345,6 +371,20 @@ def validate(cfg: Config) -> None:
                                   w.entry.max_fills_per_market <= w.exit.max_fills_per_market)):
         if not entry_stricter:
             raise ConfigError(f"watchlist.entry.{name} must be at least as strict as watchlist.exit.{name}")
+    fe = cfg.fees
+    if fe.rate_source not in ("market", "table", "higher"):
+        raise ConfigError("fees.rate_source must be market, table or higher")
+    if not 0 <= fe.onramp_cost_pct < 50:
+        raise ConfigError("fees.onramp_cost_pct must be a percentage between 0 and 50")
+    if not isinstance(fe.schedules, list) or not fe.schedules:
+        raise ConfigError("fees.schedules needs at least one table")
+    for entry in fe.schedules:
+        rates = entry.get("rates") if isinstance(entry, dict) else None
+        if not isinstance(rates, dict) or "from" not in entry:
+            raise ConfigError("each fees.schedules entry needs `from` (YYYY-MM-DD) and `rates`")
+        for cat, rate in rates.items():
+            if not isinstance(rate, (int, float)) or isinstance(rate, bool) or not 0 <= rate <= 0.5:
+                raise ConfigError(f"fees.schedules rate for {cat} must be a number between 0 and 0.5")
     c = cfg.consensus
     if c.min_agreeing_entities < 2:
         raise ConfigError("consensus.min_agreeing_entities must be at least 2 (one wallet is not a consensus)")

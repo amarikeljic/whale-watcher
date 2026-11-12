@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Any
 
 from .polymarket import MarketInfo
+from .timeutil import parse_as_of
 
 Fill = tuple[float, float]  # (price, shares)
-FeeModel = Callable[[Sequence[Fill], MarketInfo], float]
+FeeModel = Callable[..., float]   # (fills, market[, ts]) -> USD
 
 _FIVE_DP = Decimal("0.00001")
 
@@ -38,16 +40,66 @@ def polymarket_taker_fee(shares: float, price: float, rate: float, exponent: flo
     return float(raw.quantize(_FIVE_DP, rounding=ROUND_HALF_UP))
 
 
-def polymarket_fee_model(fills: Sequence[Fill], market: MarketInfo) -> float:
-    """Each price level crossed is a separate match against a resting maker, so
-    each is charged and rounded on its own. The rate is the market's own
-    ``feeSchedule.rate``, not the category table: live markets differ from the
-    table (a UFC market at 0.03 where the table says sports pay 0.05), and the
-    2026-03-31 changelog says to calculate from ``feeSchedule``."""
-    if not market.fees_enabled or market.fee_rate <= 0:
+# -- which rate applies ------------------------------------------------------------------
+
+_ACTIVE: Any = None      # the FeesConfig in force; set once by open_app (configure)
+
+
+def configure(fees_cfg: Any) -> None:
+    global _ACTIVE
+    _ACTIVE = fees_cfg
+
+
+def table_rate(category: str | None, ts: int | None = None, fees_cfg: Any = None) -> float | None:
+    """The category table's rate in force at ``ts`` (now if omitted), or None if no
+    table is configured. A category the table does not name pays its ``other`` rate."""
+    cfg = fees_cfg if fees_cfg is not None else _ACTIVE
+    if cfg is None or not cfg.schedules:
+        return None
+    dated = sorted(((parse_as_of(str(e["from"])), e["rates"]) for e in cfg.schedules), key=lambda x: x[0])
+    rates = dated[0][1]                       # a trade older than every table uses the oldest
+    for start, table in dated:
+        if ts is None or start <= ts:
+            rates = table
+    key = (category or "other").lower()
+    return float(rates.get(key, rates.get("other", 0.0)))
+
+
+def rate_for(market: MarketInfo, ts: int | None = None, fees_cfg: Any = None) -> tuple[float, str]:
+    """(rate, where it came from) for a taker trade in ``market`` at ``ts``.
+
+    The market's own ``feeSchedule.rate`` is what the venue charges, and it does not
+    always equal the published category table: on 2026-11-12 open sports markets
+    carried 0.03 (311 of them) as well as 0.05 (479), and 111 markets tagged
+    geopolitics carried 0.04 where the table says 0. So the market's rate is the
+    default; ``fees.rate_source`` can switch to the table or to the higher of the two."""
+    cfg = fees_cfg if fees_cfg is not None else _ACTIVE
+    own = market.fee_rate if market.fees_enabled and market.fee_rate > 0 else 0.0
+    table = table_rate(market.category, ts, cfg)
+    source = getattr(cfg, "rate_source", "market") if cfg is not None else "market"
+    if table is None:
+        return own, "market"
+    if source == "table":
+        return table, "table"
+    if source == "higher":
+        return (own, "market") if own >= table else (table, "table")
+    if market.fees_enabled and market.fee_rate <= 0:
+        return table, "table"                 # it charges a fee but publishes no rate: fall back
+    return own, "market"
+
+
+def taker_fee(fills: Sequence[Fill], rate: float, exponent: float = 1.0) -> float:
+    """Each price level crossed is a separate match against a resting maker, so each
+    is charged and rounded on its own."""
+    if rate <= 0:
         return 0.0
-    return round(sum(polymarket_taker_fee(shares, price, market.fee_rate, market.fee_exponent)
-                     for price, shares in fills), 5)
+    return round(sum(polymarket_taker_fee(shares, price, rate, exponent) for price, shares in fills), 5)
+
+
+def polymarket_fee_model(fills: Sequence[Fill], market: MarketInfo, ts: int | None = None) -> float:
+    """The fee for one order, at the rate ``rate_for`` picks for this market and time."""
+    rate, _ = rate_for(market, ts)
+    return taker_fee(fills, rate, market.fee_exponent or 1.0)
 
 
 FEE_MODELS: dict[str, FeeModel] = {"polymarket": polymarket_fee_model}

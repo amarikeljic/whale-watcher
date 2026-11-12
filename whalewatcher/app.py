@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from .config import Config
+from . import fees
 from .db import Database
 from .http import HttpClient
 from .markets import MarketStore
@@ -77,6 +78,7 @@ async def open_app(cfg: Config, *, http: HttpClient | None = None, db: Database 
     own_db = db is None
     db = db or Database(cfg.database_path)
     await http.start()
+    fees.configure(cfg.fees)
     data = DataApi(http, cfg.api.data_api)
     gamma = Gamma(http, cfg.api.gamma_api)
     clob = Clob(http, cfg.api.clob_api)

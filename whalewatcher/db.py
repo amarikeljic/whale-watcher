@@ -23,8 +23,10 @@ log = logging.getLogger(__name__)
 # watchlist_events, alerts.membership_id, alerts.probation). 3: v2 Phase 3, the bot
 # model (fill_events, bot_trades, alerts.detect_delay, alerts.whale_position). 4: v2
 # Phase 3b, consensus (consensus_signals, consensus_pool_runs, consensus_pool). 5: v2
-# Phase 4, outage_windows (read by the dashboard; Phase 5 records new ones).
-SCHEMA_VERSION = 5
+# Phase 4, outage_windows (read by the dashboard; Phase 5 records new ones). 6: v2.1
+# Part 1, the cost columns on bot_trades and paper_trades (fee rate used, slippage,
+# and a recalculation kept beside the original values).
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallets (
@@ -487,6 +489,20 @@ ADDED_COLUMNS = (
     (2, "alerts", "probation", "INTEGER"),
     (3, "alerts", "detect_delay", "REAL"),      # detector saw the triggering fill this long after its block
     (3, "alerts", "whale_position", "REAL"),    # shares the whale held in the outcome when the alert fired
+    # v2.1 Part 1. The original fees / cost / pnl columns are never rewritten; these sit beside them.
+    (6, "bot_trades", "fee_rate", "REAL"),        # the taker rate charged
+    (6, "bot_trades", "fee_source", "TEXT"),      # market (its own feeSchedule) | table (config)
+    (6, "bot_trades", "slippage_cost", "REAL"),   # dollars paid beyond the best ask (and lost below the best bid on exit)
+    (6, "bot_trades", "exit_best_bid", "REAL"),
+    (6, "bot_trades", "fees_recalc", "REAL"),     # entry + exit fee recomputed from price, shares and rate
+    (6, "bot_trades", "gross_pnl", "REAL"),       # P&L before fees and slippage
+    (6, "bot_trades", "net_pnl_recalc", "REAL"),  # P&L with fees_recalc in place of the stored fees
+    (6, "paper_trades", "fee_rate", "REAL"),
+    (6, "paper_trades", "fee_source", "TEXT"),
+    (6, "paper_trades", "slippage_cost", "REAL"),
+    (6, "paper_trades", "fees_recalc", "REAL"),
+    (6, "paper_trades", "gross_pnl", "REAL"),
+    (6, "paper_trades", "net_pnl_recalc", "REAL"),
 )
 
 

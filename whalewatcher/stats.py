@@ -145,6 +145,14 @@ def detection_lines(app: App) -> list[str]:
                if late else "")]
 
 
+def cost_line(rows: list[dict]) -> str:
+    """Gross, costs and net of the closed trades. Every headline figure is already net."""
+    from .costs import breakdown
+    c = breakdown(rows)
+    return (f"  costs (n={c.n} closed): gross {_money(c.gross)} | fees -${c.fees:,.2f} | slippage "
+            f"-${c.slippage:,.2f} | net {_money(c.net)}   (P&L, ROI and the interval above are all net)")
+
+
 def _paired(a: list[dict], b: list[dict], samples: int) -> tuple[int, float | None, float | None, float | None]:
     """Mean P&L difference (a - b) on the signals both strategies filled and closed."""
     other = {t["alert_id"]: t for t in b if t["status"] == "FILLED" and t["closed_at"] is not None}
@@ -196,6 +204,7 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
         if verdict:
             lines.append(f"  -> {verdict}")
         lines.append(f"  max drawdown {_money(-s.max_drawdown) if s.max_drawdown else '$0.00'}")
+        lines.append(cost_line(traded))
     else:
         lines.append("  no closed trades yet, so no P&L.")
     if brief:
@@ -457,6 +466,8 @@ def render(app: App, *, with_breakdowns: bool = True, brief_backtest: bool = Fal
     for (venue, strategy), group in _per_strategy(live):
         summary = summarise(f"{venue} / {strategy}", group, samples=samples)
         lines += _brief_summary(summary, threshold) if bot and brief_backtest else _render_summary(summary, threshold)
+        if summary.settled and not (bot and brief_backtest):
+            lines.append(cost_line(group))
     if with_breakdowns and live:
         lines += _breakdown_lines(live, " (old rule)" if bot else "", BREAKDOWN_KEYS)
 

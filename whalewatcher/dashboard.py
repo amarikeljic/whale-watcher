@@ -28,6 +28,7 @@ from aiohttp import web
 
 from . import dashview as v
 from .config import Config
+from .costs import breakdown
 from .db import SCHEMA_VERSION, Database
 from .stats import (bucket, event_key, in_play, load_bot_trades, load_trades, summarise)
 from .stats_util import mean, median
@@ -272,6 +273,7 @@ def overview(c: Ctx) -> str:
     rows = c.scope()
     tr = traded(rows)
     s = summarise(label_of(c.f.strategy), tr, samples=SAMPLES)
+    costs = breakdown(tr)
     skipped = len(rows) - len(tr)
     open_cost = sum(r["cost"] or 0.0 for r in tr if r["status"] == "FILLED" and r["settled_at"] is None)
     n = f"n={s.settled} closed"
@@ -281,10 +283,21 @@ def overview(c: Ctx) -> str:
         v.tile("Win rate", "-" if s.win_rate is None else f"{s.win_rate:.0%}", n),
         v.tile("Max drawdown", f"${s.max_drawdown:,.2f}" if s.settled else "-", n),
         v.tile("Open exposure", f"${open_cost:,.2f}", f"{s.open} open positions, at cost"),
+        v.tile("Costs paid", f"${costs.fees + costs.slippage:,.2f}",
+               f"fees ${costs.fees:,.2f} + slippage ${costs.slippage:,.2f}, n={costs.n} closed"),
         v.tile("Signals", str(len(rows)), f"{s.settled} closed · {s.open} open · {s.missed} missed · {skipped} skipped"),
     ])
     kind, note = ci_note(s, c.threshold)
     body = size_banner(c, s.settled) + f'<div class="tiles">{tiles}</div>' + v.banner(note, kind)
+    scale = max(abs(costs.gross), abs(costs.net), costs.fees, costs.slippage, 0.01)
+    cost_card = v.card("Where the money went", v.table(["", "Amount", ""], [
+        ["Gross P&L (top of the book, no fees)", (v.money(costs.gross), costs.gross), (v.hbar(costs.gross, scale), 0)],
+        ["Taker fees (buys, and sells on mirror exits)", (v.money(-costs.fees), -costs.fees), (v.hbar(-costs.fees, scale), 0)],
+        ["Slippage (paid beyond the best ask)", (v.money(-costs.slippage), -costs.slippage), (v.hbar(-costs.slippage, scale), 0)],
+        ["Net P&L", (v.money(costs.net), costs.net, v.tone(costs.net)), (v.hbar(costs.net, scale), 0)],
+    ], sortable=False) if costs.n else '<p class="empty">No closed trades in this range yet.</p>',
+        note=f"n={costs.n} closed trades. Every other figure on this dashboard is net of these costs. No rebates "
+             "are counted.", wide=True)
 
     # Cumulative P&L, one line per live strategy, over the same range and filters.
     by_key: dict[str, list[dict]] = defaultdict(list)
@@ -310,7 +323,7 @@ def overview(c: Ctx) -> str:
                   table_headers=["Period"] + [label_of(k) for k in keys], table_rows=table_rows,
                   legend=[(label_of(k), SERIES[k]) for k in keys])
     counts = ", ".join(f"{label_of(k)} n={len(by_key[k])}" for k in keys)
-    body += '<div class="grid">' + v.card(
+    body += '<div class="grid">' + cost_card + v.card(
         "Cumulative P&L by strategy", cum, wide=True,
         note=f"Closed trades only, by the date they closed. Shaded bands are outage windows. {counts}")
 

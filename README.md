@@ -43,6 +43,7 @@ python -m whalewatcher optimize                      # walk-forward search for t
 python -m whalewatcher backtest                      # simulated paper trades for the past 6 months, shown by `stats`
 python -m whalewatcher backtest --kalshi             # ...and the same alerts copied on Kalshi, where it lists the game
 python -m whalewatcher fresh-wallets                # test copying large buys by brand-new wallets (non-sports)
+python -m whalewatcher audit --costs                # gross P&L, fee, slippage and net side by side; checks every stored fee
 python -m whalewatcher audit                        # hand-check settled paper trades and their shadow fills
 python -m whalewatcher watchlist                    # who is being watched: metrics, days on the list, status
 python -m whalewatcher watchlist --last             # what the latest nightly review added, kept, removed, and why
@@ -178,6 +179,34 @@ section.
 *CLV.* Pre-game fills are compared with the closing line as before. Every fill,
 in-play included, also gets the price 5 minutes after it, which is the only
 honest reference for a bet placed during a game.
+
+**Costs** (`fees.py`, `costs.py`, v2.1 Part 1). Every P&L, ROI and interval in
+`stats`, the daily summary and the dashboard is **net**. The paper model has
+charged the taker fee from the start (`cost = price x shares + fee`), and a
+mirror exit pays it again on the sell. No rebate is ever counted. What v2.1
+adds is the breakdown and the audit trail:
+
+* **Fee** = `shares x rate x price x (1 - price)`, charged per order-book level.
+  `fees.rate_source` picks the rate: `market` (the default: the market's own
+  published rate, which is what the venue charges), `table` (the dated category
+  table in `config.yaml`) or `higher` (the worse of the two). The table is not
+  the default because live markets do not all follow it: on 2026-11-12, 311 open
+  sports markets carried 0.03 beside 479 at 0.05. The rate used and where it
+  came from are stored on every fill.
+* **Slippage** is what a fill paid beyond the best ask (and lost below the best
+  bid on an exit), in dollars, stored per trade.
+* **Breakdown:** gross (top of the book, no fees), fees, slippage, net. The
+  spread is not a separate line because the bot buys at the ask, so it is
+  already inside gross.
+* **Existing trades** are recalculated into new columns (`fee_rate`,
+  `fee_source`, `fees_recalc`, `slippage_cost`, `gross_pnl`, `net_pnl_recalc`).
+  The original `fees`, `cost` and `pnl` are never rewritten, and
+  `audit --costs` lists any trade where the two disagree by more than a cent.
+* `fees.onramp_cost_pct` (1.5%) is the one-time cost of getting money in. It is
+  used by the wallet simulation only, not by per-trade P&L.
+
+On the trades checked so far fees cost about 1.5% of every dollar staked. That
+is the hurdle a copy strategy has to clear before anything else.
 
 **The dashboard** (`dashboard.py`, `dashview.py`, v2 Phase 4). A third
 container that shows everything `stats` prints, as pages: Overview, Edge,

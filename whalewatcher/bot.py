@@ -40,7 +40,7 @@ from typing import Any
 
 from .app import App
 from .config import BOT_STRATEGIES, StrategyConfig
-from .fees import fee_model
+from .fees import rate_for, taker_fee
 from .paper import VENUE, Walk, result_label, shadow_fill, walk_asks
 from .polymarket import Book, MarketInfo
 from .timeutil import start_of_day
@@ -73,6 +73,13 @@ def walk_bids(book: Book, shares: float, *, floor_price: float | None = None) ->
     return Walk(proceeds / shares, shares, fills, len(fills))
 
 
+def slippage(walk: Walk | None, best_ask: float | None) -> float | None:
+    """Dollars paid beyond the best ask: what walking past the top of the book cost."""
+    if walk is None or best_ask is None:
+        return None
+    return max(0.0, (walk.vwap - best_ask) * walk.contracts)
+
+
 @dataclass(slots=True)
 class Account:
     strategy: str
@@ -98,6 +105,8 @@ class Decision:
     walk: Walk | None = None
     fees: float = 0.0
     would_pay: float | None = None      # what an unlimited walk would have cost, on a miss
+    fee_rate: float | None = None       # the taker rate charged, and where it came from
+    fee_source: str | None = None
 
 
 class Bot:
@@ -177,7 +186,9 @@ class Bot:
         if book.min_order_size and walk.contracts < book.min_order_size - 1e-9:
             return Decision("MISSED", f"below the minimum order size ({walk.contracts:.1f} of "
                                       f"{book.min_order_size:g} shares)")
-        return Decision("FILLED", None, walk, fee_model(VENUE)(walk.fills, market))
+        rate, source = rate_for(market, self.app.clock())
+        return Decision("FILLED", None, walk, taker_fee(walk.fills, rate, market.fee_exponent or 1.0),
+                        fee_rate=rate, fee_source=source)
 
     # -- entering on a signal ----------------------------------------------------------------
 
@@ -225,7 +236,8 @@ class Bot:
             "INSERT OR IGNORE INTO bot_trades (runner, strategy, alert_id, wallet, condition_id, token_id, event_key, "
             "status, reason, signal_ts, detected_at, decided_at, due_at, stake_usd, whale_price, best_ask, "
             "fill_price, contracts, fees, cost, levels, zero_price, zero_contracts, zero_cost, human_due, "
-            "human_done, whale_shares, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "human_done, whale_shares, updated_at, fee_rate, fee_source, slippage_cost) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.runner, strategy, alert["id"], alert["wallet"], alert["condition_id"], alert["token_id"], event_key,
              status, reason, signal_ts, detected_at, decided_at, due_at, stake, whale_price,
              book.best_ask if book else None,
@@ -233,7 +245,9 @@ class Bot:
              walk.contracts if walk else None, fees,
              (walk.vwap * walk.contracts + fees) if walk else None, walk.levels if walk else None,
              zero[0] if zero else None, zero[1] if zero else None, zero[3] if zero else None,
-             human_due, 0 if human_due is not None else 1, alert["whale_shares"], self.app.clock()))
+             human_due, 0 if human_due is not None else 1, alert["whale_shares"], self.app.clock(),
+             decision.fee_rate if decision and walk else None, decision.fee_source if decision and walk else None,
+             slippage(walk, book.best_ask if book else None)))
 
     def set_whale_position(self, alert_id: int, shares: float | None) -> None:
         """What the whale held in the outcome when we entered: the base for mirror exits."""
@@ -279,12 +293,17 @@ class Bot:
                 app.db.execute("UPDATE bot_trades SET exit_tried_at = ? WHERE id = ?", (now, t["id"]))
                 continue
             market = app.markets.get(t["condition_id"])
-            fees = fee_model(VENUE)(walk.fills, market) if market is not None else 0.0
+            # A mirror exit sells into the bids: it is a taker trade and pays the fee too.
+            rate = rate_for(market, app.clock())[0] if market is not None else 0.0
+            fees = taker_fee(walk.fills, rate, (market.fee_exponent or 1.0) if market else 1.0)
             proceeds = walk.vwap * walk.contracts
+            below_best = max(0.0, (book.best_bid - walk.vwap) * walk.contracts) if book.best_bid is not None else 0.0
             app.db.execute(
                 "UPDATE bot_trades SET exit_at = ?, exit_price = ?, exit_fees = ?, proceeds = ?, closed_at = ?, "
-                "result = 'EXIT', pnl = ?, exit_tried_at = ?, updated_at = ? WHERE id = ? AND closed_at IS NULL",
-                (now, walk.vwap, fees, proceeds, app.clock(), proceeds - fees - t["cost"], now, app.clock(), t["id"]))
+                "result = 'EXIT', pnl = ?, exit_tried_at = ?, updated_at = ?, exit_best_bid = ?, "
+                "slippage_cost = COALESCE(slippage_cost, 0) + ? WHERE id = ? AND closed_at IS NULL",
+                (now, walk.vwap, fees, proceeds, app.clock(), proceeds - fees - t["cost"], now, app.clock(),
+                 book.best_bid, below_best, t["id"]))
             done += 1
         return done
 
@@ -321,11 +340,13 @@ class Bot:
             walk = decision.walk
             app.db.execute(
                 "UPDATE bot_trades SET status = ?, reason = ?, decided_at = ?, best_ask = ?, fill_price = ?, "
-                "contracts = ?, fees = ?, cost = ?, levels = ?, updated_at = ? WHERE id = ? AND status = 'PENDING'",
+                "contracts = ?, fees = ?, cost = ?, levels = ?, updated_at = ?, fee_rate = ?, fee_source = ?, "
+                "slippage_cost = ? WHERE id = ? AND status = 'PENDING'",
                 (decision.status, decision.reason, now, book.best_ask if book else None,
                  walk.vwap if walk else decision.would_pay, walk.contracts if walk else None,
                  decision.fees if walk else None, (walk.vwap * walk.contracts + decision.fees) if walk else None,
-                 walk.levels if walk else None, app.clock(), t["id"]))
+                 walk.levels if walk else None, app.clock(), decision.fee_rate if walk else None,
+                 decision.fee_source if walk else None, slippage(walk, book.best_ask if book else None), t["id"]))
         return len(rows)
 
     async def _humans(self, now: float) -> int:
@@ -350,7 +371,7 @@ class Bot:
             walk = walk_asks(book, t["stake_usd"]) if book is not None and open_market else None
             if walk is not None and not (t["best_ask"] is not None
                                          and walk.vwap - t["best_ask"] > app.cfg.paper.max_slippage + 1e-9):
-                fees = fee_model(VENUE)(walk.fills, market)
+                fees = taker_fee(walk.fills, rate_for(market, app.clock())[0], market.fee_exponent or 1.0)
                 price, contracts, cost = walk.vwap, walk.contracts, walk.vwap * walk.contracts + fees
             app.db.execute("UPDATE bot_trades SET human_done = 1, human_price = ?, human_contracts = ?, human_cost = ? "
                            "WHERE id = ?", (price, contracts, cost, t["id"]))

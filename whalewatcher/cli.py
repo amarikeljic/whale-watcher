@@ -287,6 +287,11 @@ async def _backtest(args, cfg) -> int:
 async def _audit(args, cfg) -> int:
     from .audit import monitored_wallets, render, run_audit
     async with open_app(cfg) as app:
+        if args.costs:
+            from . import costs
+            costs.recalculate(app)
+            print(costs.render_audit(costs.audit_rows(app, strategy=args.strategy, n=args.trades)))
+            return 0
         rep = run_audit(app, n=args.trades, pick="random" if args.random else "gap", ids=args.id)
         print(render(rep, monitored_wallets(app)))
     return 0
@@ -409,6 +414,9 @@ def build_parser() -> argparse.ArgumentParser:
     au.add_argument("--random", action="store_true", help="show a seeded random sample instead of the trades "
                                                             "that make the zero-latency vs alert-time gap")
     au.add_argument("--id", type=int, action="append", help="show this paper trade id (repeatable)")
+    au.add_argument("--costs", action="store_true",
+                    help="show gross P&L, fee, slippage and net side by side, and check every stored fee")
+    au.add_argument("--strategy", default="flat_hold", help="with --costs: which bot strategy to audit")
 
     fr = sub.add_parser("fresh-wallets", help="test copying large buys by brand-new wallets in non-sports markets")
     fr.add_argument("--start", default="2026-05-07", help="markets resolved from this date (UTC)")
