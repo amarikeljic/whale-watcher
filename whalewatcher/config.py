@@ -220,6 +220,20 @@ class BankrollConfig:
     min_order_usd: float = 1.0
     max_per_event_fraction: float = 0.2   # of equity, at cost, in one event
     mark_interval_seconds: int = 300      # how often open positions' best bids are recorded
+    # How big each stake is.
+    #   auto   sized from the evidence so far (bankroll.py): nothing until the settled
+    #          signals have shown an edge, then a fraction of the Kelly stake, never
+    #          above the fixed stake
+    #   fixed  always equity x deploy_fraction / max_open_positions
+    stake_mode: str = "auto"
+    kelly_fraction: float = 0.25          # auto: the share of the full Kelly stake to bet
+    # The bar for "an edge has been shown" is the project's own decision rule: at least
+    # 100 settled signals and a 95% interval for the return per dollar that excludes zero.
+    auto_min_history: int = 100           # auto: settled signals needed before any edge is believed
+    auto_confidence_z: float = 1.96       # auto: standard errors taken off the measured edge first
+    # auto, while no edge is shown: "none" places no order (the Kelly stake for no edge
+    # is zero); "smallest" places the smallest order the venue takes, to see a path.
+    auto_no_edge_stake: str = "none"
 
 
 def _fee_table() -> list[dict[str, Any]]:
@@ -411,6 +425,16 @@ def validate(cfg: Config) -> None:
             f"bankroll: each stake would be {br.deploy_fraction / br.max_open_positions:.0%} of equity "
             f"(deploy_fraction / max_open_positions) but max_per_event_fraction allows {br.max_per_event_fraction:.0%}: "
             "no trade could ever be taken")
+    if br.stake_mode not in ("auto", "fixed"):
+        raise ConfigError("bankroll.stake_mode must be auto or fixed")
+    if not 0 < br.kelly_fraction <= 1:
+        raise ConfigError("bankroll.kelly_fraction must be above 0 and at most 1")
+    if br.auto_no_edge_stake not in ("none", "smallest"):
+        raise ConfigError("bankroll.auto_no_edge_stake must be none or smallest")
+    if br.auto_min_history < 2:
+        raise ConfigError("bankroll.auto_min_history must be at least 2")
+    if br.auto_confidence_z < 0:
+        raise ConfigError("bankroll.auto_confidence_z cannot be negative")
     if br.mark_interval_seconds < 30:
         raise ConfigError("bankroll.mark_interval_seconds must be at least 30")
     fl = cfg.filters

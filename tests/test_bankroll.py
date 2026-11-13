@@ -266,7 +266,8 @@ def test_the_amount_defaults_to_100_and_is_kept_in_settings(live_app):
 def test_changing_the_amount_ends_the_run_and_starts_a_new_one_and_old_runs_are_frozen(live_app, clock):
     app = live_app
     assert br.sync_runs(app, ["single"]) == [
-        "single: started run #1 with $100.00, 80% deployed over 10 positions, 20% per event, $1 minimum, 1.5% on-ramp"]
+        "single: started run #1 with $100.00, fixed stake of 8.0% of equity, up to 10 positions, 20% per event, "
+        "$1 minimum, 1.5% on-ramp"]
     assert br.sync_runs(app, ["single"]) == [], "nothing changed, nothing happens"
     first = br.open_run(app.db, "single")
     signals = {"bot:single": [sig(1, first["started_at"] + 10, 0.50, settle=first["started_at"] + 20, payout=1.0)]}
@@ -293,7 +294,7 @@ def test_changing_a_bankroll_setting_also_starts_a_new_run(live_app, clock):
     br.sync_runs(app, ["single"])
     app.cfg.bankroll.max_open_positions = 5
     changes = br.sync_runs(app, ["single"])
-    assert changes[0] == "single: ended run #1 (bankroll settings changed)" and "over 5 positions" in changes[1]
+    assert changes[0] == "single: ended run #1 (bankroll settings changed)" and "up to 5 positions" in changes[1]
     app.cfg.filters.max_days_to_close = 7
     assert br.sync_runs(app, ["single"]) == [], "the cutoff is not a bankroll setting"
 
@@ -406,7 +407,7 @@ async def test_the_runner_notices_a_new_amount_and_the_reports_show_the_wallet(l
     assert live_app.db.one("SELECT COUNT(*) n FROM bankroll_runs")["n"] == 2
 
     text = render(live_app)
-    assert "SMALL WALLET: the same signals through $250.00, 80% deployed over 10 positions" in text
+    assert "SMALL WALLET: the same signals through $250.00, fixed stake of 8.0% of equity, up to 10 positions" in text
     assert "Bot, runner single: $250.00 wallet" in text and "live, run #2: $250.00 from" in text
     assert "replay of every signal, with the cutoff:    equity $" in text and "without the cutoff" in text
     assert "taken 1 of 1 signals" in text and "⚠ only 0 settled wallet trades in this run" in text
@@ -436,3 +437,131 @@ def test_the_wallet_command_sets_and_shows_the_amount(tmp_path, monkeypatch, cap
     assert main(["wallet", "set"]) == 2 and "needs an amount" in capsys.readouterr().err
     assert main(["wallet", "show"]) == 0
     assert "wallet amount: $400.50 (set from the cli on " in capsys.readouterr().out
+
+
+# -- the automatic stake ---------------------------------------------------------------------------------
+
+T = 10_000.0                         # the wallet in these tests starts here, after the history
+
+
+def history(wins: int, losses: int, price: float = 0.50) -> list[Signal]:
+    """Signals that settled before T: what the source has shown so far."""
+    return [sig(1000 + i, 100 + i, price, settle=200 + i, payout=1.0 if i < wins else 0.0)
+            for i in range(wins + losses)]
+
+
+def auto(**kw) -> Params:
+    base = dict(amount=100.0, onramp_cost_pct=0.0, stake_mode="auto", kelly_fraction=0.1, min_history=30,
+                confidence_z=1.0, no_edge_stake="none")
+    return Params(**{**base, **kw})
+
+
+def test_with_no_edge_shown_the_automatic_stake_is_nothing():
+    res = run([sig(1, T + 1)], auto(), start=T)
+    (e,) = res.entries
+    assert e.status == "SKIPPED" and e.code == "no_edge" and res.cash == 100.0
+    assert e.reason == "no_edge: no edge can be judged from 0 settled signals (need 30)"
+    losing = run(history(10, 30) + [sig(1, T + 1)], auto(), start=T).entries[0]
+    assert losing.code == "no_edge" and losing.reason.startswith("no_edge: no edge shown: -6"), \
+        "10 wins in 40 at 50 cents: a loss of half of every dollar, less a standard error"
+    assert losing.reason.endswith("a dollar after 40 settled signals")
+
+
+def test_or_the_smallest_order_the_venue_takes_when_told_to_probe():
+    res = run([sig(1, T + 1, 0.50)], auto(no_edge_stake="smallest"), start=T)
+    (e,) = res.entries
+    assert e.status == "TAKEN" and e.stake == pytest.approx(5 * 0.50 * 1.0005), "5 shares, a hair over"
+    assert e.contracts == pytest.approx(5.0025) and e.sizing.endswith("; the smallest order")
+    tiny = run([sig(1, T + 1, 0.90)], auto(no_edge_stake="smallest", amount=50.0), start=T).entries[0]
+    assert tiny.code == "below_minimum", "5 shares at 90 cents is $4.50: more than 8% of a $50 wallet"
+
+
+def test_a_shown_edge_is_staked_at_a_fraction_of_kelly():
+    """30 wins and 10 losses at 50 cents: returns of +1 (30 times) and -1 (10 times).
+    Mean +0.5, sample variance (30 x 0.25 + 10 x 2.25) / 39 = 0.76923, standard error
+    0.87706 / sqrt(40) = 0.138675. One standard error off: an edge of +0.361325 a dollar.
+    Kelly for a share at cost c paying $1 is c x edge / (1 - c)."""
+    past = history(30, 10)
+    even = run(past + [sig(1, T + 1, 0.50)], auto(), start=T).entries[0]
+    assert even.status == "TAKEN" and even.stake == pytest.approx(100 * 0.1 * 0.361325, rel=1e-5), \
+        "at 50 cents Kelly is the edge itself: 36.1%, and a tenth of that is 3.61% of equity"
+    assert "edge +36.1% a dollar after 40 settled signals: 0.1 of Kelly (36.1%) is 3.6% of equity" in even.sizing
+    favourite = run(past + [sig(1, T + 1, 0.80)], auto(), start=T).entries[0]
+    assert favourite.stake == pytest.approx(8.0), "0.8 x 0.3613 / 0.2 = 145%: capped at the fixed 8%"
+    longshot = run(past + [sig(1, T + 1, 0.20)], auto(), start=T).entries[0]
+    assert longshot.stake == pytest.approx(5 * 0.20 * 1.0005), \
+        "0.2 x 0.3613 / 0.8 = 9.0% Kelly, 0.9% of equity is 90 cents: raised to the smallest order"
+
+
+def test_the_bar_for_an_edge_is_the_number_of_signals_and_the_standard_errors():
+    past = history(30, 10)
+    assert run(past + [sig(1, T + 1)], auto(min_history=41), start=T).entries[0].code == "no_edge"
+    strict = run(past + [sig(1, T + 1)], auto(confidence_z=1.96, kelly_fraction=0.25), start=T).entries[0]
+    assert "edge +22.8% a dollar" in strict.sizing, "0.5 - 1.96 x 0.138675"
+    assert strict.stake == pytest.approx(100 * 0.25 * (0.5 - 1.96 * 0.138675), rel=1e-4)
+    assert run(history(22, 18) + [sig(1, T + 1)], auto(confidence_z=1.96), start=T).entries[0].code == "no_edge", \
+        "55% winners in 40 is not distinguishable from a coin"
+
+
+def test_a_result_that_came_in_after_the_decision_is_not_evidence():
+    late = [sig(1000 + i, 100 + i, 0.50, settle=T + 500 + i, payout=1.0) for i in range(40)]    # all win, later
+    first = run(late + [sig(1, T + 1)], auto(), start=T).entries[0]
+    assert first.code == "no_edge" and "from 0 settled signals" in first.reason
+    after = run(late + [sig(1, T + 1), sig(2, T + 1000)], auto(), start=T, as_of=T + 2000).entries
+    assert [e.code for e in after] == ["no_edge", None] and after[1].status == "TAKEN", \
+        "once they have settled they count, for decisions made after that"
+
+
+def test_fees_and_missed_orders_are_part_of_the_evidence_the_right_way():
+    paid = [sig(1000 + i, 100 + i, 0.50, settle=200 + i, payout=1.0 if i < 30 else 0.0, fee_rate=0.05)
+            for i in range(40)]
+    e = run(paid + [sig(1, T + 1, 0.50, fee_rate=0.05)], auto(), start=T).entries[0]
+    assert "edge +32.8% a dollar" in e.sizing, \
+        "a winner returns 1 / 0.5125 - 1 = +95.1%, not +100%: mean +46.3%, less a standard error of 13.5%"
+    missed = [sig(2000 + i, 100 + i, 0.50, settle=200 + i, payout=1.0, status="MISSED") for i in range(40)]
+    assert run(missed + [sig(1, T + 1)], auto(), start=T).entries[0].code == "no_edge", \
+        "an order that never filled made no money, whatever the market did"
+
+
+def test_the_fixed_stake_is_untouched_and_the_two_are_different_runs():
+    fixed = Params(amount=100.0, onramp_cost_pct=0.0)
+    assert fixed.stake_mode == "fixed" and run([sig(1, 100)], fixed).entries[0].stake == pytest.approx(8.0)
+    assert fixed.fingerprint != auto().fingerprint
+    assert auto().fingerprint != auto(no_edge_stake="smallest").fingerprint != auto(min_history=50).fingerprint
+    assert "fixed stake of 8.0% of equity" in fixed.describe()
+    assert "automatic stake (no order until 30 settled signals show an edge, then 0.1 of Kelly" in auto().describe()
+
+
+def test_the_shipped_setting_is_the_automatic_stake_at_the_projects_own_decision_rule(tmp_path):
+    from whalewatcher.config import ConfigError, load
+    b = load("config.yaml", env={}).bankroll
+    assert (b.stake_mode, b.kelly_fraction, b.auto_min_history, b.auto_confidence_z, b.auto_no_edge_stake) == (
+        "auto", 0.25, 100, 1.96, "none")
+    p = Params.of(load("config.yaml", env={}), 100.0)
+    assert (p.stake_mode, p.min_history, p.confidence_z, p.no_edge_stake) == ("auto", 100, 1.96, "none")
+    f = tmp_path / "c.yaml"
+    for bad, why in (("stake_mode: big", "auto or fixed"), ("kelly_fraction: 0", "kelly_fraction"),
+                     ("auto_no_edge_stake: some", "none or smallest"), ("auto_min_history: 1", "auto_min_history"),
+                     ("auto_confidence_z: -1", "auto_confidence_z")):
+        f.write_text(f"bankroll:\n  {bad}\n")
+        with pytest.raises(ConfigError, match=why):
+            load(str(f), env={})
+
+
+def test_stake_sizes_are_compared_on_the_same_signals(cfg):
+    signals = history(30, 10) + [sig(1, T + 1, 0.50, settle=T + 5, payout=1.0), sig(2, T + 10, 0.50)]
+    cfg.fees.onramp_cost_pct = 0.0
+    rows = br.stake_comparison(signals, cfg, 100.0, Marks(), T + 100)
+    names = [name for name, _ in rows]
+    assert names == ["Automatic, no order without an edge", "Automatic, smallest order without an edge",
+                     "Fixed 1% of equity", "Fixed 2% of equity", "Fixed 4% of equity", "Fixed 8% of equity (in use)"]
+    by = dict(rows)
+    assert by["Fixed 8% of equity (in use)"].entries[0].stake == pytest.approx(8.0)
+    assert by["Fixed 2% of equity"].entries[0].code == "below_minimum", "2% of $100 buys 4 shares: under the 5 minimum"
+    assert by["Fixed 4% of equity"].entries[0].stake == pytest.approx(4.0)
+    assert by["Fixed 1% of equity"].entries[0].code == "below_minimum"
+    assert by["Automatic, no order without an edge"].params.no_edge_stake == "none"
+    text = "\n".join(br.comparison_lines(rows))
+    assert "choosing the best row afterwards is hindsight" in text and "Fixed 4% of equity" in text
+    cfg.bankroll.stake_mode, cfg.bankroll.auto_no_edge_stake = "auto", "smallest"
+    assert br.stake_comparison(signals, cfg, 100.0, Marks(), T + 100)[1][0].endswith("(in use)")

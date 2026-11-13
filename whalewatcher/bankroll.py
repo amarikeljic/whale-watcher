@@ -63,6 +63,7 @@ HEADLINE = "flat_hold"          # the strategy whose signals the wallet follows
 DEFAULT_MIN_SHARES = 5.0        # used when a signal did not store its market's minimum
 
 NO_SLOT, NO_CASH, BELOW_MINIMUM, EVENT_CAP = "no_slot", "no_cash", "below_minimum", "event_cap"
+NO_EDGE = "no_edge"             # automatic stake: the settled signals have not shown an edge
 TAKEN, SKIPPED, MISSED = "TAKEN", "SKIPPED", "MISSED"
 # A fixed-stake trade that missed for one of these reasons says something about a $10
 # order, not about ours: with the book stored we walk it again at our own stake.
@@ -119,15 +120,31 @@ class Params:
     max_per_event_fraction: float = 0.2
     max_days_to_close: float | None = None     # the cutoff this run applies; None and False below = none
     skip_if_no_end_date: bool = False
+    stake_mode: str = "fixed"                  # fixed | auto (a run stored before the setting existed was fixed)
+    kelly_fraction: float = 0.25
+    min_history: int = 100
+    confidence_z: float = 1.96
+    no_edge_stake: str = "none"                # auto, while no edge is shown: none | smallest
 
     @classmethod
-    def of(cls, cfg: Config, amount: float, *, cutoff: bool = True) -> Params:
+    def of(cls, cfg: Config, amount: float, *, cutoff: bool = True, stake_mode: str | None = None,
+           stake_fraction: float | None = None, no_edge_stake: str | None = None) -> Params:
+        """``stake_fraction`` overrides the fixed stake (as a share of equity), for comparisons."""
         b: BankrollConfig = cfg.bankroll
-        return cls(amount=amount, onramp_cost_pct=cfg.fees.onramp_cost_pct, deploy_fraction=b.deploy_fraction,
+        deploy = b.deploy_fraction if stake_fraction is None else stake_fraction * b.max_open_positions
+        return cls(amount=amount, onramp_cost_pct=cfg.fees.onramp_cost_pct, deploy_fraction=deploy,
                    max_open_positions=b.max_open_positions, min_order_usd=b.min_order_usd,
                    max_per_event_fraction=b.max_per_event_fraction,
                    max_days_to_close=cfg.filters.max_days_to_close if cutoff else None,
-                   skip_if_no_end_date=cfg.filters.skip_if_no_end_date if cutoff else False)
+                   skip_if_no_end_date=cfg.filters.skip_if_no_end_date if cutoff else False,
+                   stake_mode=stake_mode or b.stake_mode, kelly_fraction=b.kelly_fraction,
+                   min_history=b.auto_min_history, confidence_z=b.auto_confidence_z,
+                   no_edge_stake=no_edge_stake or b.auto_no_edge_stake)
+
+    @property
+    def stake_fraction(self) -> float:
+        """The fixed stake, and the most the automatic stake may ever be, as a share of equity."""
+        return self.deploy_fraction / self.max_open_positions
 
     @property
     def cutoff(self) -> FiltersConfig | None:
@@ -138,11 +155,18 @@ class Params:
     @property
     def fingerprint(self) -> str:
         """What makes a run a different run: the amount and the bankroll settings."""
+        sizing = (f"auto|{self.kelly_fraction:g}|{self.min_history}|{self.confidence_z:g}|{self.no_edge_stake}"
+                  if self.stake_mode == "auto" else "fixed")
         return (f"{self.amount:.2f}|{self.onramp_cost_pct:g}|{self.deploy_fraction:g}|{self.max_open_positions}|"
-                f"{self.min_order_usd:g}|{self.max_per_event_fraction:g}")
+                f"{self.min_order_usd:g}|{self.max_per_event_fraction:g}|{sizing}")
 
     def describe(self) -> str:
-        return (f"${self.amount:,.2f}, {self.deploy_fraction:.0%} deployed over {self.max_open_positions} positions, "
+        before = "no order" if self.no_edge_stake == "none" else "the smallest order"
+        stake = (f"automatic stake ({before} until {self.min_history} settled signals show an edge, then "
+                 f"{self.kelly_fraction:g} of Kelly, at most {self.stake_fraction:.1%} of equity)"
+                 if self.stake_mode == "auto" else
+                 f"fixed stake of {self.stake_fraction:.1%} of equity")
+        return (f"${self.amount:,.2f}, {stake}, up to {self.max_open_positions} positions, "
                 f"{self.max_per_event_fraction:.0%} per event, ${self.min_order_usd:g} minimum, "
                 f"{self.onramp_cost_pct:g}% on-ramp")
 
@@ -187,6 +211,7 @@ class Entry:
     contracts: float = 0.0
     fee: float = 0.0
     optimistic: bool = False         # priced from a smaller order's fill, no depth stored
+    sizing: str = ""                 # how the stake was chosen (automatic stakes only)
     closed_ts: float | None = None
     proceeds: float | None = None
 
@@ -279,6 +304,8 @@ class Result:
             "skipped": dict(self.skipped), "missed": self.missed, "settled": len(settled),
             "wins": sum(1 for e in settled if (e.pnl or 0) > 0), "open": len(self.taken) - len(settled),
             "fees": round(self.fees, 4), "onramp_cost": round(self.onramp_cost, 4), "optimistic": self.optimistic,
+            "lowest_equity": round(min([p.equity for p in self.curve] or [self.start_cash]), 4),
+            "staked": round(sum(e.stake for e in self.taken), 4), "stake_mode": self.params.stake_mode,
         }
 
 
@@ -348,6 +375,85 @@ def price_order(sig: Signal, budget: float) -> tuple[float, float, float, bool] 
     return price, contracts, fee, optimistic
 
 
+# -- the automatic stake ----------------------------------------------------------------------------
+
+
+class Evidence:
+    """What the source's own settled signals say about its edge, as of any moment,
+    and the stake that follows from it.
+
+    The record is every signal of the source that a fixed-stake order filled and
+    whose result was known by then, whether or not this wallet took it: those
+    results are public the moment the market settles. Each contributes its return
+    per dollar, fee included: ``payout / (price + fee per share) - 1``.
+
+    The stake, as a share of equity:
+
+      * fewer than ``min_history`` settled signals, or an edge that is not above
+        zero after taking ``confidence_z`` standard errors off the mean: no edge
+        has been shown, and the Kelly stake for no edge is zero. The signal is
+        skipped (``no_edge``). The wallet does not need to bet to learn: the
+        record keeps growing from the fixed-stake ledger either way. With
+        ``no_edge_stake = smallest`` it places the venue's smallest order instead.
+        The defaults (100 signals, 1.96 standard errors) are the project's own
+        decision rule for "copying has an edge". A lower bar is passed by luck:
+        with 30 signals and one standard error, replays of signals that lose money
+        overall sized up on a hot streak and gave it all back.
+      * otherwise ``kelly_fraction`` of the Kelly stake for a share bought at
+        all-in cost c that pays $1:  f* = c x edge / (1 - c).  A favourite gets a
+        larger stake than a long shot for the same edge, because it loses less often.
+      * never more than the fixed stake, and never less than the smallest order.
+
+    Nothing after the decision is used: a result that came in later is not evidence yet."""
+
+    def __init__(self, signals: list[Signal], params: Params) -> None:
+        self.params = params
+        self.history = sorted(
+            (s for s in signals if s.base_status == "FILLED" and s.settle_ts is not None and s.payout is not None
+             and s.price is not None and 0 < s.price < 1), key=lambda s: (s.settle_ts, s.id))
+        self._i, self.n, self._sum, self._sumsq = 0, 0, 0.0, 0.0
+
+    def edge(self, ts: float) -> float | None:
+        """The conservative edge per dollar known at ``ts``, or None with too little history."""
+        while self._i < len(self.history) and self.history[self._i].settle_ts <= ts:
+            s = self.history[self._i]
+            r = s.payout / (s.price + _fee_per_share(s.price, s.fee_rate, s.fee_exponent)) - 1
+            self.n, self._sum, self._sumsq, self._i = self.n + 1, self._sum + r, self._sumsq + r * r, self._i + 1
+        if self.n < max(2, self.params.min_history):
+            return None
+        mean = self._sum / self.n
+        var = max(0.0, self._sumsq - self.n * mean * mean) / (self.n - 1)
+        return mean - self.params.confidence_z * (var / self.n) ** 0.5
+
+    def stake(self, sig: Signal, equity: float, cash: float) -> tuple[float, str]:
+        """(dollars, how it was chosen). Zero dollars means: no edge shown, place no order."""
+        p = self.params
+        edge = self.edge(sig.ts)
+        ref = sig.asks[0][0] if sig.asks else sig.price
+        cost = None if ref is None or not 0 < ref < 1 else ref + _fee_per_share(ref, sig.fee_rate, sig.fee_exponent)
+        ceiling = min(equity * p.stake_fraction, cash)
+        if edge is None:
+            fraction, why = 0.0, f"no edge can be judged from {self.n} settled signals (need {p.min_history})"
+        elif edge <= 0 or cost is None or cost >= 1:
+            fraction, why = 0.0, f"no edge shown: {edge:+.1%} a dollar after {self.n} settled signals"
+        else:
+            kelly = cost * edge / (1 - cost)
+            fraction = min(p.kelly_fraction * kelly, p.stake_fraction)
+            why = (f"edge {edge:+.1%} a dollar after {self.n} settled signals: {p.kelly_fraction:g} of Kelly "
+                   f"({kelly:.1%}) is {fraction:.1%} of equity")
+        stake = min(equity * fraction, ceiling)
+        # The smallest order the venue takes: the market's minimum shares, a hair over
+        # so that rounding in the fill cannot leave it short.
+        floor = max(p.min_order_usd, sig.min_shares * cost * 1.0005) if cost is not None else p.min_order_usd
+        if fraction <= 0 and p.no_edge_stake == "none":
+            return 0.0, f"{NO_EDGE}: {why}"
+        if stake < floor:
+            if floor > ceiling + 1e-9:
+                return stake, f"auto: {why}; the smallest order (${floor:,.2f}) is more than this wallet may stake"
+            return floor, f"auto: {why}; the smallest order"
+        return stake, f"auto: {why}"
+
+
 # -- the engine -------------------------------------------------------------------------------------
 
 
@@ -362,6 +468,7 @@ def run(signals: list[Signal], params: Params, *, marks: Marks | None = None, st
     cash = res.start_cash
     open_: list[Entry] = []
     cutoff = params.cutoff
+    evidence = Evidence(signals, params) if params.stake_mode == "auto" else None
 
     def value(e: Entry, ts: float) -> float:
         bid = marks.at(e.signal.token_id, ts)
@@ -403,7 +510,12 @@ def run(signals: list[Signal], params: Params, *, marks: Marks | None = None, st
         if cash < params.min_order_usd:
             entry.code, entry.reason = NO_CASH, f"{NO_CASH}: ${cash:,.2f} free, the smallest order is ${params.min_order_usd:g}"
             continue
-        stake = min(equity * params.deploy_fraction / params.max_open_positions, cash)
+        stake = min(equity * params.stake_fraction, cash)
+        if evidence is not None:
+            stake, entry.sizing = evidence.stake(sig, equity, cash)
+            if entry.sizing.startswith(NO_EDGE):
+                entry.code, entry.reason = NO_EDGE, entry.sizing
+                continue
         if stake < params.min_order_usd:
             entry.code = BELOW_MINIMUM
             entry.reason = f"{BELOW_MINIMUM}: the stake would be ${stake:,.2f}, the smallest order is ${params.min_order_usd:g}"
@@ -588,6 +700,7 @@ class View:
     replay_no_cutoff: Result
     live: Result | None = None
     run_row: Any = None
+    comparison: list[tuple[str, Result]] = field(default_factory=list)
 
     @property
     def simulated(self) -> bool:
@@ -600,7 +713,8 @@ def live_runners(signals: dict[str, list[Signal]]) -> list[str]:
 
 
 def views(records: list[dict], cfg: Config, db: Any, now: float, *, amount: float | None = None,
-          only: str | None = None) -> list[View]:
+          only: str | None = None, compare: str | bool = False) -> list[View]:
+    """``compare``: True adds the stake-size comparison to every view, a source key to that one only."""
     amount = wallet_amount(db) if amount is None else amount
     signals = signals_by_source(records, cfg)
     marks = load_marks(db)
@@ -625,8 +739,43 @@ def views(records: list[dict], cfg: Config, db: Any, now: float, *, amount: floa
                 view.run_row = row
                 view.live = run(sigs, run_params(row, cfg), marks=marks, start=row["started_at"], as_of=now,
                                 label=run_label(row))
+        if sigs and (compare is True or compare == key):
+            view.comparison = stake_comparison(sigs, cfg, amount, marks, now)
         out.append(view)
     return out
+
+
+SWEEP_FRACTIONS = (0.01, 0.02, 0.04)
+
+
+def stake_comparison(signals: list[Signal], cfg: Config, amount: float, marks: Marks, now: float,
+                     ) -> list[tuple[str, Result]]:
+    """The same signals through the automatic stake and through fixed stakes of several
+    sizes, all with the cutoff. A description of the past, not a way to choose: the
+    row that did best was picked by the same outcomes it is judged on."""
+    configured = round(cfg.bankroll.deploy_fraction / cfg.bankroll.max_open_positions, 6)
+    auto, rows = cfg.bankroll.stake_mode == "auto", []
+    for choice, name in (("none", "Automatic, no order without an edge"),
+                         ("smallest", "Automatic, smallest order without an edge")):
+        tag = " (in use)" if auto and cfg.bankroll.auto_no_edge_stake == choice else ""
+        rows.append((name + tag, run(signals, Params.of(cfg, amount, stake_mode="auto", no_edge_stake=choice),
+                                     marks=marks, as_of=now)))
+    for f in sorted({*SWEEP_FRACTIONS, configured}):
+        tag = " (in use)" if f == configured and cfg.bankroll.stake_mode == "fixed" else ""
+        rows.append((f"Fixed {f:.0%} of equity{tag}",
+                     run(signals, Params.of(cfg, amount, stake_mode="fixed", stake_fraction=f), marks=marks, as_of=now)))
+    return rows
+
+
+def comparison_lines(rows: list[tuple[str, Result]]) -> list[str]:
+    lines = ["    stake sizes compared (replay with the cutoff; choosing the best row afterwards is hindsight):"]
+    for name, res in rows:
+        s = res.summary()
+        skipped = sum(s["skipped"].values())
+        lines.append(f"      {name:<50} equity {_usd(s['equity']):>10} ({s['total_return']:+6.1%}) | lowest "
+                     f"{_usd(s['lowest_equity']):>9} | max drawdown {s['max_drawdown_pct']:5.1%} | taken "
+                     f"{s['taken']:4d}, skipped {skipped:5d} | staked {_usd(s['staked'])}")
+    return lines
 
 
 def past_runs(db: Any) -> list[Any]:
@@ -669,6 +818,8 @@ def view_lines(view: View, threshold: int, *, brief: bool = False) -> list[str]:
             if res.optimistic:
                 lines.append(f"    ⚠ {res.label}: {res.optimistic} of {len(res.taken)} fills are priced from a "
                              "smaller order or the best ask, with no depth stored: optimistic")
+    if view.comparison and not brief:
+        lines += comparison_lines(view.comparison)
     if view.live is None and len(view.replay.settled) < threshold:
         lines.append(f"    ⚠ only {len(view.replay.settled)} settled wallet trades: not enough to draw conclusions "
                      f"(need {threshold})")
@@ -679,7 +830,7 @@ def render(records: list[dict], cfg: Config, db: Any, now: float, *, brief: bool
            simulated: bool = True) -> list[str]:
     """The wallet section of ``stats`` and of the daily summary."""
     out: list[str] = []
-    for view in views(records, cfg, db, now):
+    for view in views(records, cfg, db, now, compare=not brief):
         if view.simulated and not simulated:
             continue
         out += view_lines(view, cfg.stats.min_settled_for_conclusions, brief=brief)
@@ -687,6 +838,6 @@ def render(records: list[dict], cfg: Config, db: Any, now: float, *, brief: bool
         return []
     p = Params.of(cfg, wallet_amount(db))
     head = [f"SMALL WALLET: the same signals through {p.describe()} (paper only)",
-            "  stake = equity x deployed share / positions, fee included, never more than the cash. Open "
-            "positions are valued at their last recorded best bid, or at the price paid when none was recorded."]
+            "  The fee is inside the stake and a stake is never more than the cash. Open positions are valued "
+            "at their last recorded best bid, or at the price paid when none was recorded."]
     return head + out

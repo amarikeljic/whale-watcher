@@ -81,6 +81,9 @@ def cfg() -> Config:
     # has its own tests in test_horizon.py, which switch it back on.
     c.filters.max_days_to_close = None
     c.filters.skip_if_no_end_date = False
+    # Wallet arithmetic in the older tests is for a fixed 8% stake; the automatic
+    # stake (the shipped default) has its own tests in test_bankroll.py.
+    c.bankroll.stake_mode = "fixed"
     return c
 
 

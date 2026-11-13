@@ -140,6 +140,21 @@ bankroll:
   min_order_usd: 1.00
   max_per_event_fraction: 0.2   # of equity, at cost, in one event
   mark_interval_seconds: 300    # how often open positions' best bids are recorded
+  # How big each stake is.
+  #   auto   sized from the evidence so far. It takes the mean return per dollar of
+  #          the signals that have settled, subtracts auto_confidence_z standard
+  #          errors, and bets kelly_fraction of the Kelly stake for that edge, never
+  #          more than the fixed stake. The bar is this project's own decision rule:
+  #          100 settled signals and a 95% interval that excludes zero. Until then no
+  #          edge has been shown and the right stake is nothing.
+  #   fixed  always equity x deploy_fraction / max_open_positions (8% as set above).
+  stake_mode: auto
+  kelly_fraction: 0.25
+  auto_min_history: 100
+  auto_confidence_z: 1.96
+  # While no edge is shown: none (place no order) or smallest (the smallest order the
+  # venue takes, 5 shares, to watch a path; on past signals this still lost money).
+  auto_no_edge_stake: none
 
 # Costs (v2.1). Every paper fill pays the taker fee, on the buy and on a mirror-exit
 # sell:  fee = shares x rate x price x (1 - price).  No rebate is ever counted.

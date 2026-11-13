@@ -22,6 +22,7 @@ def site(tmp_path):
     fx = small(path, NOW)
     fx.db.close()
     cfg = Config(database_path=path)
+    cfg.bankroll.stake_mode = "fixed"       # the hand calculations below are for a fixed 8% stake
 
     def get(url: str, **query) -> str:
         return dash.render(cfg, path, url, query, now=NOW)[1]
@@ -156,6 +157,17 @@ def test_the_wallet_page_replays_the_fixture_to_the_hand_checked_equity(site):
     assert "With and without the time-to-close cutoff" in html and "Old rule (v1), human delay" in html
     assert "The runner has not started a wallet run yet" in html
     assert 'action="/settings/wallet-amount"' in html and 'value="100.00"' in html
+    assert "Stake sizes compared" in html and "Automatic, no order without an edge" in html
+    assert "Fixed 8% of equity (in use)" in html and "choosing the best row afterwards is hindsight" in html
+
+
+def test_with_the_automatic_stake_the_wallet_page_says_why_nothing_was_bet(site):
+    site.cfg.bankroll.stake_mode = "auto"
+    html = site("/bankroll")
+    assert "automatic stake (no order until 100 settled signals show an edge, then 0.25 of Kelly" in html
+    assert "$98.50" in html and "0 / 8" in html, "nothing taken: the 5 settled signals show no edge"
+    assert "no_edge" in html and "the settled signals have not shown an edge, so the right stake is nothing" in html
+    assert "no edge can be judged from" in html and "Automatic, no order without an edge (in use)" in html
 
 
 def test_the_wallet_page_follows_the_saved_amount_and_shows_runs(site):

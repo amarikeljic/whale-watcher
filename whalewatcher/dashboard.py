@@ -670,6 +670,7 @@ SKIP_MEANING = {
     "no_cash": "Less cash was free than the smallest order.",
     "below_minimum": "The stake was under the smallest order, in dollars or in shares.",
     "event_cap": "The event already held its share of the wallet.",
+    "no_edge": "Automatic stake: the settled signals have not shown an edge, so the right stake is nothing.",
     "too_long": "The market was scheduled to end beyond the time-to-close cutoff.",
     "no_end_date": "The market had no scheduled end date.",
 }
@@ -761,9 +762,9 @@ def bankroll_page(c: Ctx, query: Any) -> tuple[str, str]:
     title = f"${amount:,.2f} wallet"
     body = wallet_form(amount, query.get("saved") or "", (query.get("error") or "")[:200])
     params = bankroll.Params.of(app.cfg, amount)
-    body += (f'<p class="card-note">{v.esc(params.describe())}. The stake is equity times the deployed share, divided '
-             "by the number of positions, with the fee inside it and never more than the cash. Open positions are "
-             "valued at their last recorded best bid, or at the price paid when none was recorded.</p>")
+    body += (f'<p class="card-note">{v.esc(params.describe())}. The fee is inside the stake and a stake is never '
+             "more than the cash. Open positions are valued at their last recorded best bid, or at the price paid "
+             "when none was recorded.</p>")
     if view is None:
         return title, body + v.banner("No signals yet.", "info")
     body += '<nav class="tabs" aria-label="Signal source">' + "".join(
@@ -818,6 +819,25 @@ def bankroll_page(c: Ctx, query: Any) -> tuple[str, str]:
             ("Skipped", "skipped"), ("Settled", "settled"), ("Fees", "fees"))], sortable=False),
         note="One path each. The two wallets take different trades from the first skip on, so a gap between the "
              "lines is mostly the luck of which trades each happened to hold.", wide=True)
+
+    compare_rows = []
+    for name, res in (bankroll.stake_comparison(bankroll.signals_by_source(c.records, app.cfg).get(view.key, []),
+                                                app.cfg, amount, bankroll.load_marks(app.db), c.now)):
+        s = res.summary()
+        compare_rows.append([name, (v.money(s["equity"], signed=False), s["equity"]),
+                             (v.pct(s["total_return"]), s["total_return"], v.tone(s["total_return"])),
+                             (v.money(s["lowest_equity"], signed=False), s["lowest_equity"]),
+                             (f"{s['max_drawdown_pct']:.1%}", s["max_drawdown_pct"]), (str(s["taken"]), s["taken"]),
+                             (str(sum(s["skipped"].values())), sum(s["skipped"].values())),
+                             (v.money(s["staked"], signed=False), s["staked"])])
+    body += v.card("Stake sizes compared", v.table(
+        ["Stake", "Final equity", "Return", "Lowest equity", "Max drawdown", "Taken", "Skipped", "Total staked"],
+        compare_rows, numeric_from=1),
+        note="The same signals, with the cutoff, through the automatic stake and through fixed stakes. The automatic "
+             "stake bets a fraction of the Kelly stake once the settled signals have shown an edge (100 settled, 95% "
+             "interval above zero), and until then either nothing or the smallest order the venue takes. This "
+             "describes the past: choosing the best row afterwards is hindsight.",
+        wide=True)
 
     skips = replay.skipped
     body += v.card("Why signals were skipped", v.table(

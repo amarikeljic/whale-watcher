@@ -260,16 +260,27 @@ wallet: `python -m whalewatcher wallet show`, or the **Sim wallet** page.
 * **Amount.** $100 by default. Set it on the dashboard or with
   `wallet set 250` (above $0, at most $100,000, two decimals). It lives in the
   `settings` table, the only thing the dashboard may write.
-* **Stake** = equity x `deploy_fraction` (0.8) / `max_open_positions` (10),
-  never more than the cash. The stake is all-in: it buys the shares and pays
-  the taker fee, so cash never goes below zero. The on-ramp cost (1.5%) comes
-  off the starting amount once.
+* **Stake size** (`bankroll.stake_mode`):
+  * `auto` (the default) sizes the stake from the evidence. It takes the return
+    per dollar of this source's signals that have settled, subtracts 1.96
+    standard errors, and bets a quarter of the Kelly stake for that edge
+    (`f* = cost x edge / (1 - cost)` for a share paying $1), never more than
+    the fixed stake. The bar is the project's own decision rule: 100 settled
+    signals and a 95% interval above zero. Until then no edge has been shown,
+    the Kelly stake is zero and the signal is skipped as `no_edge`. The wallet
+    does not need to bet to learn: the record grows from the fixed-stake ledger.
+    `auto_no_edge_stake: smallest` places the venue's smallest order instead.
+  * `fixed` is equity x `deploy_fraction` (0.8) / `max_open_positions` (10): 8%.
+  * Either way the stake is all-in (shares plus taker fee, so cash never goes
+    below zero), never more than the cash, and the on-ramp cost (1.5%) comes
+    off the starting amount once. Only results known at the moment of a
+    decision are used.
 * **Equity** = cash + open positions at their last recorded best bid. The bot
   records each open position's best bid every 5 minutes. A position with no
   mark (everything before schema 8) is worth its shares at the price paid.
-* **Skips:** `no_slot` (all positions open), `no_cash`, `below_minimum`,
-  `event_cap` (one event over 20% of equity), plus the cutoff's `too_long` and
-  `no_end_date`. An order that would not have filled is a miss, not a skip.
+* **Skips:** `no_edge` (automatic stake, no edge shown), `no_slot` (all
+  positions open), `no_cash`, `below_minimum`, `event_cap` (one event over 20%
+  of equity), plus the cutoff's `too_long` and `no_end_date`. An order that would not have filled is a miss, not a skip.
 * **Minimum order.** Polymarket's real minimum is per market and in shares
   (`min_order_size` on the book, 5 on every book sampled), not dollars.
   `min_order_usd` is our own floor on top of it. Both apply.
@@ -291,10 +302,34 @@ wallet: `python -m whalewatcher wallet show`, or the **Sim wallet** page.
   per-trade ROI interval is the evidence, and the page says when there are too
   few settled trades.
 
-On the sandbox copy (2026-11-12, $100): the bot's 55 live signals leave $85.55
-after 10 trades taken, with 20 signals lost to `no_slot`. The three simulated
-strategies end between $0.00 and $75.02. An 8% stake on signals with a negative
-edge compounds down fast, and one replay peaked at $231 before reaching zero.
+**Stake sizes compared** (sandbox copy, 2026-11-13, $100, with the cutoff).
+`wallet show` and the Sim wallet page print this table for every source. It
+describes the past: choosing the best row afterwards is hindsight.
+
+| Stake | Bot, 55 live signals | Sim walk-forward | Sim spec | Sim fresh-wallet |
+| --- | --- | --- | --- | --- |
+| Automatic, no order without an edge | $98.50, 0 taken | $103.76, 35 taken | $97.97, 8 taken | $98.50, 0 taken |
+| Automatic, smallest order without an edge | $97.05 | $89.32 | $11.68 | $1.15 |
+| Fixed 1% | $98.50, 0 taken | $98.50, 0 taken | $98.50, 0 taken | $98.50, 0 taken |
+| Fixed 2% | $96.47 | $49.85 | $47.54 | $43.96 |
+| Fixed 4% | $98.42 | $24.72 | $23.88 | $15.48 |
+| Fixed 8% | $85.55 | $0.00 | $11.91 | $5.66 |
+
+What it shows:
+
+* Smaller fixed stakes lose more slowly, and still lose. These signals have a
+  negative return after fees, so every stake size ends below the start.
+* A $100 wallet cannot stake 1%: $0.985 is under the $1 floor, and 5 shares
+  cost more than that on almost every market.
+* Even the smallest order loses most of the wallet over thousands of signals.
+  As equity falls, 5 shares fit under the cap only on cheap long shots, which
+  win least often.
+* The automatic stake's answer today is not to bet. On the bot's live signals
+  it takes nothing. In two simulated runs a hot streak briefly passed the bar
+  (35 and 8 trades) and the wallet ended within a few dollars of the start.
+* A first version used a lower bar (30 signals, one standard error). It sized
+  up on lucky streaks and lost 88% to 96% in the simulated runs. That is why
+  the bar is the pre-set decision rule and not something tuned to look good.
 
 **The dashboard** (`dashboard.py`, `dashview.py`, v2 Phase 4). A third
 container that shows everything `stats` prints, as pages: Overview, Edge,
