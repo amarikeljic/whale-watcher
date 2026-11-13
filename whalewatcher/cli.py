@@ -388,6 +388,14 @@ async def _wallet(args, cfg) -> int:
     return 0
 
 
+async def _us(args, cfg) -> int:
+    """`us match`: how many recent alerts have the same bet on Polymarket US (read-only)."""
+    from .polymarket_us import match_report
+    async with open_app(cfg) as app:
+        print("\n".join(await match_report(app, days=args.days)))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m whalewatcher",
                                 description="Find skilled Polymarket wallets and paper trade their entries. "
@@ -489,6 +497,10 @@ def build_parser() -> argparse.ArgumentParser:
     wa.add_argument("action", choices=("show", "set"))
     wa.add_argument("amount", nargs="?", help="dollars, for `set` (above 0, at most 100,000)")
 
+    us = sub.add_parser("us", help="Polymarket US (read-only public data): `us match` gives the match rate")
+    us.add_argument("action", choices=("match",))
+    us.add_argument("--days", type=int, default=14, help="look at the alerts of this many days (default 14)")
+
     d = sub.add_parser("detector", help="watch trades and publish tracked wallets' fills (its own container)")
     d.add_argument("--cycles", type=int, help="stop after this many feed polls")
 
@@ -548,6 +560,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("error: `wallet set` needs an amount, such as `wallet set 250`", file=sys.stderr)
             return 2
         return asyncio.run(_wallet(args, cfg))
+    if args.command == "us":
+        return asyncio.run(_us(args, cfg))
     if args.command == "dashboard":
         from .dashboard import serve
         serve(cfg, host=args.host, port=args.port, in_container=args.in_container)

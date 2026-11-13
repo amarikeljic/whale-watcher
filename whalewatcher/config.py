@@ -236,6 +236,20 @@ class BankrollConfig:
     auto_no_edge_stake: str = "none"
 
 
+@dataclass
+class PolymarketUsConfig:
+    """v2.1 Part 3b, row A: the same signals priced on Polymarket US (polymarket_us.py).
+    Read-only, public market data, no account and no key."""
+    enabled: bool = True
+    exclude_categories: list = field(default_factory=list)   # e.g. [sports]: never priced on Polymarket US
+    # Crypto up/down exists on both venues for the same window but settles on a
+    # different price index on Polymarket US, so it is not the same bet.
+    include_different_index: bool = False
+    fallback_fee_coefficient: float = 0.095   # used only if a market publishes none (the under-$10k tier)
+    bypass_cache: bool = True                 # ask for a fresh book: a plain request is up to 30 s old
+    market_cache_seconds: int = 600           # how long a US market's details are reused
+
+
 def _fee_table() -> list[dict[str, Any]]:
     # https://docs.polymarket.com/trading/fees.md, table read 2026-11-10. `from` is the
     # day a table took effect; add a new entry when Polymarket changes its fees and
@@ -268,6 +282,8 @@ class ApiConfig:
     clob_api: str = "https://clob.polymarket.com"
     # Kalshi public market data (no key): https://docs.kalshi.com/openapi.yaml servers
     kalshi_api: str = "https://api.elections.kalshi.com/trade-api/v2"
+    # Polymarket US public market data (no key): https://docs.polymarket.us/api-reference/introduction.md
+    us_gateway: str = "https://gateway.polymarket.us"
     user_agent: str = "whale-watcher/0.1 (read-only research)"
     timeout_seconds: float = 20.0
     max_concurrency: int = 16
@@ -289,6 +305,10 @@ class ApiConfig:
             # https://docs.kalshi.com/getting_started/rate_limits.md). Unauthenticated
             # reads answered 429 on bursts in testing, so stay well below that.
             "api.elections.kalshi.com": 3.0,
+            # Polymarket US: 25 requests a second for the whole retail API, per source IP
+            # (https://docs.polymarket.us/api-reference/rate-limits.md). Row A needs two
+            # or three a signal.
+            "gateway.polymarket.us": 5.0,
         }
     )
 
@@ -309,6 +329,7 @@ class Config:
     fees: FeesConfig = field(default_factory=FeesConfig)
     filters: FiltersConfig = field(default_factory=FiltersConfig)
     bankroll: BankrollConfig = field(default_factory=BankrollConfig)
+    polymarket_us: PolymarketUsConfig = field(default_factory=PolymarketUsConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
 
     def public_dict(self) -> dict[str, Any]:
@@ -335,6 +356,7 @@ _SECTIONS = {
     "fees": FeesConfig,
     "filters": FiltersConfig,
     "bankroll": BankrollConfig,
+    "polymarket_us": PolymarketUsConfig,
     "api": ApiConfig,
 }
 
@@ -411,6 +433,13 @@ def validate(cfg: Config) -> None:
     fe = cfg.fees
     if fe.rate_source not in ("market", "table", "higher"):
         raise ConfigError("fees.rate_source must be market, table or higher")
+    us = cfg.polymarket_us
+    if not isinstance(us.exclude_categories, list) or not all(isinstance(c, str) for c in us.exclude_categories):
+        raise ConfigError("polymarket_us.exclude_categories must be a list of category names, such as [sports]")
+    if not 0 <= us.fallback_fee_coefficient <= 0.5:
+        raise ConfigError("polymarket_us.fallback_fee_coefficient must be between 0 and 0.5")
+    if us.market_cache_seconds < 0:
+        raise ConfigError("polymarket_us.market_cache_seconds cannot be negative")
     br = cfg.bankroll
     if not 0 < br.deploy_fraction <= 1:
         raise ConfigError("bankroll.deploy_fraction must be above 0 and at most 1")

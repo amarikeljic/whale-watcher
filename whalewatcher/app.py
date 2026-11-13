@@ -14,6 +14,7 @@ from .db import Database
 from .http import HttpClient
 from .markets import MarketStore
 from .polymarket import Clob, DataApi, Gamma, PricePoint
+from .polymarket_us import UsGateway
 from .timeutil import now_ts
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ class App:
     markets: MarketStore
     prices: PriceLookup
     clock: Callable[[], int]
+    us: UsGateway | None = None      # Polymarket US public market data (row A)
     # Fractional wall clock, for latency. Whole seconds cannot tell a 0.4 s
     # detection from a 1.4 s one. Under a test clock it is that clock.
     wall: Callable[[], float] = time.time
@@ -85,7 +87,7 @@ async def open_app(cfg: Config, *, http: HttpClient | None = None, db: Database 
     try:
         yield App(cfg=cfg, db=db, http=http, data=data, gamma=gamma, clob=clob,
                   markets=MarketStore(db, gamma, data, clock=clock),
-                  prices=PriceLookup(db, data, clock), clock=clock,
+                  prices=PriceLookup(db, data, clock), clock=clock, us=UsGateway(http, cfg.api.us_gateway),
                   wall=time.time if clock is now_ts else (lambda: float(clock())))
     finally:
         if own_http:

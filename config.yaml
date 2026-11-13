@@ -156,6 +156,17 @@ bankroll:
   # venue takes, 5 shares, to watch a path; on past signals this still lost money).
   auto_no_edge_stake: none
 
+# Row A (v2.1): every signal is also priced on Polymarket US, the US-regulated venue,
+# from its PUBLIC order book (no account, no key, read-only). Shown as the runner
+# "us", never mixed with the international numbers. See docs/polymarket-us.md.
+polymarket_us:
+  enabled: true
+  exclude_categories: []          # e.g. [sports] to leave a category out on Polymarket US
+  include_different_index: false  # crypto up/down settles on another price index there: not the same bet
+  fallback_fee_coefficient: 0.095 # only if a market publishes none. Every market checked publishes 0.095
+  bypass_cache: true              # ask for a fresh book. A plain request is served up to 30 s old
+  market_cache_seconds: 600
+
 # Costs (v2.1). Every paper fill pays the taker fee, on the buy and on a mirror-exit
 # sell:  fee = shares x rate x price x (1 - price).  No rebate is ever counted.
 fees:

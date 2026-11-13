@@ -195,6 +195,12 @@ class Signal:
     payout: float | None = None      # dollars per share at that moment
     wallet: str | None = None
     question: str = ""
+    venue_skip: str | None = None    # the market is not on this venue at all (Polymarket US rows): not_on_us, ...
+
+
+# Skips that say the bet does not exist on the venue (polymarket_us.py). A wallet on that
+# venue could not have taken the signal at any stake, so it is a skip, never a miss.
+VENUE_SKIPS = ("not_on_us", "not_same_bet", "us_excluded")
 
 
 @dataclass
@@ -501,6 +507,9 @@ def run(signals: list[Signal], params: Params, *, marks: Marks | None = None, st
         if far is not None:
             entry.code, entry.reason = far
             continue
+        if sig.venue_skip is not None:
+            entry.code, entry.reason = sig.venue_skip, sig.base_reason or sig.venue_skip
+            continue
         if sig.base_status == "MISSED" and not (sig.asks and (sig.base_reason or "").startswith(BOOK_REASONS)):
             entry.status, entry.reason = MISSED, sig.base_reason or "the order did not fill"
             continue
@@ -552,6 +561,13 @@ def run(signals: list[Signal], params: Params, *, marks: Marks | None = None, st
 
 
 def _rate(rec: dict, cfg: Config) -> tuple[float, float]:
+    if rec.get("runner") == "us":
+        # Polymarket US: one coefficient on every market, exponent 1. A row that did not
+        # fill stored no rate, so the published one applies (polymarket_us.py). The
+        # wallet's fee is rounded per level, not to the cent as the venue rounds the
+        # order: at these stakes that is under half a cent.
+        rate = rec.get("fee_rate")
+        return (float(rate) if rate is not None else cfg.polymarket_us.fallback_fee_coefficient), 1.0
     exp = rec.get("market_fee_exponent") or 1.0
     if rec.get("fee_rate") is not None:
         return float(rec["fee_rate"]), exp
@@ -592,7 +608,8 @@ def signal_of(rec: dict, cfg: Config) -> Signal | None:
         base_stake=rec.get("stake_usd") or 10.0, limit_price=limit, asks=asks,
         min_shares=rec.get("min_order_size") or DEFAULT_MIN_SHARES, fee_rate=rate, fee_exponent=exp,
         scheduled_end=rec.get("scheduled_end"), settle_ts=settle_ts if payout is not None else None, payout=payout,
-        wallet=rec.get("wallet"), question=rec.get("question") or "")
+        wallet=rec.get("wallet"), question=rec.get("question") or "",
+        venue_skip=rec.get("skip_code") if rec.get("skip_code") in VENUE_SKIPS else None)
 
 
 def source_key(rec: dict) -> str | None:
@@ -609,7 +626,7 @@ def source_key(rec: dict) -> str | None:
 def source_label(key: str) -> str:
     kind, _, name = key.partition(":")
     if kind == "bot":
-        return f"Bot, runner {name}"
+        return "Polymarket US: same signals, US book" if name == "us" else f"Bot, runner {name}"
     if kind == "sim":
         return f"Simulated: {name}"
     return "Old rule (v1), human delay"

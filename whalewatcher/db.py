@@ -28,8 +28,11 @@ log = logging.getLogger(__name__)
 # and a recalculation kept beside the original values). 7: v2.1 Part 3, the
 # time-to-close cutoff (skip code, scheduled end and days to it, real resolution time).
 # 8: v2.1 Part 2, the small wallet (settings, bankroll_runs, position_marks, and the
-# ask levels each signal saw).
-SCHEMA_VERSION = 8
+# ask levels each signal saw). 9: v2.1 Part 3b, row A: which Polymarket US market and
+# side a `us` row was priced on, and the gap between the two venues' best asks.
+SCHEMA_VERSION = 9
+BUSY_TIMEOUT_MS = 60_000
+SLOW_STATEMENT_SECONDS = 2.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallets (
@@ -553,6 +556,12 @@ ADDED_COLUMNS = (
     (8, "bot_trades", "asks_json", "TEXT"),        # [[price, shares], ...] best first, as seen when we decided
     (8, "bot_trades", "limit_price", "REAL"),      # the fill-or-kill limit that applied
     (8, "bot_trades", "min_order_size", "REAL"),   # the market's minimum order, in shares
+    # v2.1 Part 3b. Set on rows of the runner `us` only.
+    (9, "bot_trades", "us_slug", "TEXT"),          # the Polymarket US market it was priced on
+    (9, "bot_trades", "us_side", "TEXT"),          # long | short (there is one instrument; the other side is a short)
+    (9, "bot_trades", "us_rule", "TEXT"),          # the matching rule: game_winner | crypto_updown | none
+    (9, "bot_trades", "intl_best_ask", "REAL"),    # the international best ask the baseline saw
+    (9, "bot_trades", "price_gap", "REAL"),        # US best ask minus the international best ask
 )
 
 
@@ -567,7 +576,11 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         if path != ":memory:":
             self.conn.execute("PRAGMA journal_mode = WAL")
-            self.conn.execute("PRAGMA busy_timeout = 5000")
+            # Several processes write this file (detector, runner, the nightly review as a
+            # child). A writer that finds it busy waits this long before giving up. Five
+            # seconds was not enough: on a cold 6 GB database the review held it longer
+            # and the runner's write failed (seen live 2026-11-13).
+            self.conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         # Several processes (detector, runners, a CLI command) can start at once. A file
         # lock makes exactly one of them back up and migrate; the others wait and then
         # find the database already current.
@@ -618,7 +631,7 @@ class Database:
         db.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None, check_same_thread=False)
         db.conn.row_factory = sqlite3.Row
         db.conn.execute("PRAGMA query_only = ON")
-        db.conn.execute("PRAGMA busy_timeout = 5000")
+        db.conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         return db
 
     @property
@@ -685,7 +698,15 @@ class Database:
             self.conn.execute("COMMIT")
 
     def execute(self, sql: str, params: Iterable[Any] | dict[str, Any] = ()) -> sqlite3.Cursor:
-        return self.conn.execute(sql, params)
+        started = time.monotonic()
+        try:
+            return self.conn.execute(sql, params)
+        finally:
+            waited = time.monotonic() - started
+            if waited > SLOW_STATEMENT_SECONDS:
+                # Almost always another process holding the write lock. Worth knowing:
+                # while the runner waits here it is not acting on signals.
+                log.warning("a database statement took %.1fs (%s...)", waited, " ".join(sql.split())[:60])
 
     def query(self, sql: str, params: Iterable[Any] | dict[str, Any] = ()) -> list[sqlite3.Row]:
         return self.conn.execute(sql, params).fetchall()

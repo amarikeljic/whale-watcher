@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 from .app import App
 from .bot import Bot
@@ -129,8 +130,9 @@ class Monitor:
     RUNNER = "single"
 
     def __init__(self, app: App, *, paper: PaperEngine | None = None, bot: Bot | None = None,
-                 embedded: bool = True, max_alert_age_seconds: int | None = None) -> None:
+                 embedded: bool = True, max_alert_age_seconds: int | None = None, us: Any = None) -> None:
         self.app = app
+        self.us = us                    # polymarket_us.UsRowA, or None: the same signals priced on Polymarket US
         self.paper = paper
         self.bot = bot
         self.embedded = embedded
@@ -325,6 +327,9 @@ class Monitor:
         tradable = not reason and market is not None
         if tradable and self.bot is not None:
             self.bot.enter(alert, market, book, detected_at=detected_at, decided_at=decided_at)
+            if self.us is not None:
+                # After the bot, and in the background: a comparison never delays a decision.
+                self.us.submit(alert, market, detected_at=detected_at)
 
         kind, held = await self._kind(alert)
         app.db.execute("UPDATE alerts SET kind = ?, whale_position = ? WHERE id = ?", (kind, held, alert["id"]))

@@ -38,6 +38,7 @@ from .detector import HEARTBEAT_KEY as DETECTOR_HEARTBEAT_KEY
 from .detector import Detector
 from .monitor import DATA_HOST, Monitor
 from .paper import PaperEngine
+from .polymarket_us import UsRowA
 from .stats import daily_summary, export_bot_csv, export_csv, render
 from .timeutil import from_ts, iso
 from .watchlist import nightly, seed_from_monitored, sync_monitored
@@ -82,7 +83,9 @@ class Service:
         self._review_task: asyncio.Task | None = None
         self.paper = PaperEngine(app)            # settles the pre-v3 paper trades; opens no new ones
         self.bot = Bot(app, Monitor.RUNNER)
-        self.monitor = Monitor(app, paper=self.paper, bot=self.bot, embedded=with_detector)
+        # Row A: the same signals priced on Polymarket US, in the background.
+        self.us = UsRowA(app) if app.cfg.polymarket_us.enabled and app.us is not None else None
+        self.monitor = Monitor(app, paper=self.paper, bot=self.bot, embedded=with_detector, us=self.us)
         self.stop = asyncio.Event()
         self._outage_reported: str | None = None
         self._detector_down = False
@@ -129,10 +132,15 @@ class Service:
                 log.exception("cycle failed; continuing")
             if time.monotonic() - self._beat_at >= HEARTBEAT_EVERY or cycles is not None:
                 self._beat_at = time.monotonic()
-                app.db.set_state(HEARTBEAT_KEY, app.clock())
-                if self.with_detector:
-                    app.db.set_state(DETECTOR_HEARTBEAT_KEY, app.clock())
-                await self._report_outage()
+                try:
+                    app.db.set_state(HEARTBEAT_KEY, app.clock())
+                    if self.with_detector:
+                        app.db.set_state(DETECTOR_HEARTBEAT_KEY, app.clock())
+                    await self._report_outage()
+                except Exception:
+                    # A busy database or a failing notice must never end the runner: a
+                    # missed heartbeat shows on the Health page, a dead process trades nothing.
+                    log.exception("heartbeat failed; continuing")
             done += 1
             if cycles is not None and done >= cycles:
                 break
@@ -141,6 +149,8 @@ class Service:
                 await asyncio.wait_for(self.stop.wait(), timeout=wait)
             except TimeoutError:
                 pass
+        if self.us is not None:
+            await self.us.drain()             # let any Polymarket US pricing in flight finish and be recorded
         log.info("stopped after %d cycles", done)
 
     async def _rescore(self) -> None:
@@ -193,7 +203,8 @@ class Service:
             return
         self._wallet_checked = time.monotonic()
         try:
-            for change in bankroll.sync_runs(self.app, [self.bot.runner]):
+            runners = [self.bot.runner] + (["us"] if self.us is not None else [])
+            for change in bankroll.sync_runs(self.app, runners):
                 log.info("wallet: %s", change)
         except Exception:
             log.exception("could not bring the wallet run up to date; trying again shortly")
@@ -205,6 +216,11 @@ class Service:
         if now - int(app.db.get_state("last_settle_at", 0)) >= cfg.paper.settle_interval_seconds:
             settled = await self.paper.settle()
             closed = await self.bot.settle()
+            if self.us is not None:
+                try:
+                    closed += await self.us.settle()
+                except Exception as exc:  # noqa: BLE001 - the comparison row never stops the runner
+                    log.warning("could not settle the Polymarket US rows: %s", exc)
             recalculate(app)                 # cost columns for anything filled or closed since
             app.db.set_state("last_settle_at", now)
             if settled or closed:
@@ -272,15 +288,18 @@ async def run_detector(app: App, stop: asyncio.Event, *, cycles: int | None = No
             errors += stats.errors
         except Exception:
             log.exception("detector step failed; continuing")
-        if time.monotonic() - beat_at >= HEARTBEAT_EVERY or cycles is not None:
-            beat_at = time.monotonic()
-            app.db.set_state(DETECTOR_HEARTBEAT_KEY, app.clock())
-        if time.monotonic() - line_at >= 60:
-            line_at = time.monotonic()
-            log.info("detector: %d wallets tracked | last minute: %d fills published (%d only the backstop saw), "
-                     "%d errors, %d feed gaps so far", len(detector.tracked()), published, backstop, errors,
-                     detector.gaps)
-            published = backstop = errors = 0
+        try:
+            if time.monotonic() - beat_at >= HEARTBEAT_EVERY or cycles is not None:
+                beat_at = time.monotonic()
+                app.db.set_state(DETECTOR_HEARTBEAT_KEY, app.clock())
+            if time.monotonic() - line_at >= 60:
+                line_at = time.monotonic()
+                log.info("detector: %d wallets tracked | last minute: %d fills published (%d only the backstop "
+                         "saw), %d errors, %d feed gaps so far", len(detector.tracked()), published, backstop,
+                         errors, detector.gaps)
+                published = backstop = errors = 0
+        except Exception:
+            log.exception("detector heartbeat failed; continuing")     # a busy database must not end the detector
         done += 1
         if cycles is not None and done >= cycles:
             break

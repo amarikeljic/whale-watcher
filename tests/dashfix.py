@@ -64,6 +64,29 @@ class Fixture:
              closed_at, (1.0 if pnl > 0 else 0.0) if filled and pnl is not None else None))
         return alert_id
 
+    def us(self, alert_id: int, *, status: str = "FILLED", pnl: float | None = None, us_ask: float | None = 0.51,
+           intl_ask: float = 0.50, reason: str | None = None, skip_code: str | None = None, fees: float = 0.24,
+           slug: str | None = "aec-nfl-a-b-2026-11-01", side: str = "long") -> None:
+        """Row A for an existing signal: the same alert priced on Polymarket US."""
+        a = self.db.one("SELECT * FROM alerts WHERE id = ?", (alert_id,))
+        filled = status == "FILLED"
+        closed = a["first_fill_ts"] + DAY // 2 if pnl is not None else None
+        self.db.execute(
+            "INSERT INTO bot_trades (runner, strategy, alert_id, wallet, condition_id, token_id, event_key, status, "
+            "reason, signal_ts, detected_at, decided_at, stake_usd, whale_price, best_ask, fill_price, contracts, fees, "
+            "cost, human_done, closed_at, result, pnl, updated_at, skip_code, fee_rate, fee_source, us_slug, us_side, "
+            "us_rule, intl_best_ask, price_gap, payout_per_share) VALUES ('us','flat_hold',?,?,?,?,?,?,?,?,?,?,10,?,?,"
+            "?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (alert_id, a["wallet"], a["condition_id"], a["token_id"], f"e-{a['condition_id']}", status, reason,
+             a["first_fill_ts"], a["first_fill_ts"] + 3, a["first_fill_ts"] + 5, a["whale_price"], us_ask,
+             us_ask if filled else None, 10 / us_ask if filled else None, fees if filled else None,
+             10 + fees if filled else None, closed, ("WIN" if (pnl or 0) > 0 else "LOSS") if pnl is not None else None,
+             pnl, a["first_fill_ts"], skip_code, 0.095 if filled else None, "us" if filled else None,
+             slug if skip_code != "not_on_us" else None, side if slug and skip_code != "not_on_us" else None,
+             "game_winner" if slug else "none", intl_ask,
+             None if us_ask is None else round(us_ask - intl_ask, 6),
+             (1.0 if pnl > 0 else 0.0) if pnl is not None else None))
+
     def old_rule(self, wallet: str, days_ago: float, pnl: float) -> None:
         self.n += 1
         cond = f"0xo{self.n}"
@@ -116,12 +139,18 @@ def small(path: str, now: int) -> Fixture:
     late. The open trade is 30 days out (entered before the cutoff existed) and one signal was
     skipped as too long."""
     fx = Fixture(Database(path), now)
-    fx.trade(A, 6, pnl=12.5, closing=0.55, markout=0.52, detect=3.0, zero_pnl=14.0, human_pnl=9.0, category="sports",
-             end_days=0.5)
-    fx.trade(A, 5, pnl=-10.0, closing=0.47, markout=0.49, detect=4.0, zero_pnl=-10.0, human_pnl=-10.0,
-             category="sports", end_days=0.5)
-    fx.trade(A, 4, pnl=6.0, markout=0.51, detect=5.0, zero_pnl=7.0, human_pnl=0.0, category="politics", end_days=3,
-             hold_days=3)
+    one = fx.trade(A, 6, pnl=12.5, closing=0.55, markout=0.52, detect=3.0, zero_pnl=14.0, human_pnl=9.0,
+                   category="sports", end_days=0.5)
+    two = fx.trade(A, 5, pnl=-10.0, closing=0.47, markout=0.49, detect=4.0, zero_pnl=-10.0, human_pnl=-10.0,
+                   category="sports", end_days=0.5)
+    three = fx.trade(A, 4, pnl=6.0, markout=0.51, detect=5.0, zero_pnl=7.0, human_pnl=0.0, category="politics",
+                     end_days=3, hold_days=3)
+    # Row A, the same three signals on Polymarket US: the first filled a cent dearer and won
+    # (+9.37 after a 24-cent fee), the second ran past the limit, the third is not listed there.
+    fx.us(one, pnl=9.37, us_ask=0.51, intl_ask=0.50)
+    fx.us(two, status="MISSED", us_ask=0.56, intl_ask=0.50, reason="price ran: filling $10 costs 0.560 a share, limit 0.510")
+    fx.us(three, status="SKIPPED", us_ask=None, skip_code="not_on_us", slug=None,
+          reason="not_on_us: no rule for politics markets")
     fx.trade(B, 4, pnl=4.0, detect=3.0, category="politics", end_days=1, hold_days=3)
     fx.trade(B, 3, pnl=-10.0, detect=4.0, hour=11, category="crypto", end_days=0.2)   # 11:00-12:00 UTC: in the outage
     fx.trade(A, 2, detect=3.0, end_days=30)                                      # open

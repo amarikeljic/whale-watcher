@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from typing import Any
 
 NAV = (("/", "Overview"), ("/edge", "Edge"), ("/wallets", "Wallets"), ("/trades", "Trades"),
-       ("/bankroll", "Sim wallet"), ("/breakdowns", "Breakdowns"), ("/health", "Health"))
+       ("/bankroll", "Sim wallet"), ("/us", "US venue"), ("/breakdowns", "Breakdowns"), ("/health", "Health"))
 
 
 def esc(value: Any) -> str:
@@ -37,7 +37,8 @@ def pct(x: float | None) -> str:
 
 
 def cents(x: float | None) -> str:
-    return "-" if x is None else f"{x:+.3f}"
+    """Signed, to a tenth of a cent. A difference of nothing reads +0.000, never -0.000."""
+    return "-" if x is None else f"{(round(x, 3) or 0.0):+.3f}"
 
 
 def tone(x: float | None) -> str:
@@ -473,6 +474,13 @@ JS = r"""
   document.addEventListener("pointerdown", function (evt) { if (!(evt.target.closest && evt.target.closest(".chart"))) hideTip(); });
   var timer; window.addEventListener("resize", function () { clearTimeout(timer); timer = setTimeout(drawAll, 120); });
   drawAll();
+  // On a phone the page links overflow the bar, which scrolls without a visible
+  // scrollbar: bring the current page's link into the middle of it.
+  var on = document.querySelector("nav a.on");
+  if (on) {
+    var bar = on.parentNode, r = on.getBoundingClientRect(), n = bar.getBoundingClientRect();
+    if (r.left < n.left || r.right > n.right) bar.scrollLeft += (r.left + r.width / 2) - (n.left + n.width / 2);
+  }
 
   document.querySelectorAll("table.sortable").forEach(function (table) {
     table.querySelectorAll("th").forEach(function (th, col) {

@@ -117,6 +117,7 @@ def horizon_fields(d: dict, entered: float | None) -> dict:
 # -- the bot model (v2 Phase 3) -------------------------------------------------------
 
 BOT_HEADLINE = "flat_hold"
+US_RUNNER = "us"            # polymarket_us.RUNNER: the same signals priced on Polymarket US
 BOT_QUERY = """
 SELECT b.*, a.kind, a.outcome, a.whale_usd, a.probation, a.membership_id, a.detect_delay, a.trigger_fill_ts,
        a.snapshot_run_id, m.category, m.question, m.slug, m.event_slug, m.game_start_time,
@@ -209,6 +210,8 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
             "flat_mirror": "bot fill, sold when the whale sells",
             "scaled_hold": "stake grows with the whale's size, capped",
             "placebo_late": "the control: same outcome at a random later time"}.get(strategy, "")
+    if runner == US_RUNNER:
+        note = "the same signals on the Polymarket US book, at US fees: row A"
     lines = [f"== {runner} / {strategy} ({note}) =="]
     if s.settled < threshold:
         lines.append(f"  ⚠ only {s.settled} closed trades: not enough to draw conclusions (need {threshold})")
@@ -220,9 +223,10 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
         why: dict[str, int] = defaultdict(int)
         for t in skipped:
             why[(t["reason"] or "unknown").split(":")[0]] += 1
-        lines.append("  skipped by a risk limit: " + ", ".join(f"{k} {v}" for k, v in sorted(why.items())))
-    lines.append(f"  paper bankroll ${acct.equity:,.2f} (started ${acct.starting:,.2f}) | open at cost "
-                 f"${acct.open_cost:,.2f} | free ${acct.cash:,.2f} | closed today {_money(acct.today)}")
+        lines.append("  skipped: " + ", ".join(f"{k} {v}" for k, v in sorted(why.items())))
+    if runner != US_RUNNER:     # row A prices every signal: it has no bankroll and no risk limits
+        lines.append(f"  paper bankroll ${acct.equity:,.2f} (started ${acct.starting:,.2f}) | open at cost "
+                     f"${acct.open_cost:,.2f} | free ${acct.cash:,.2f} | closed today {_money(acct.today)}")
     if s.settled:
         lines.append(f"  total P&L {_money(s.total_pnl)} on ${s.total_cost:,.2f} staked (n={s.settled} closed) | "
                      f"ROI {_pct(s.roi)} | win rate {s.win_rate:.0%}")
@@ -244,8 +248,12 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
     marks = [t["markout_price"] - t["fill_price"] for t in traded
              if t["status"] == "FILLED" and t["markout_price"] is not None]
     inplay = f", {s.clv_inplay_excluded} in-play fills have no closing line" if s.clv_inplay_excluded else ""
-    lines.append(f"  CLV: closing line {cents(s.avg_clv)} (n={s.clv_n}{inplay}) | price "
-                 f"{app.cfg.bot.markout_seconds // 60} min after our fill {cents(mean(marks))} (n={len(marks)}, every fill)")
+    if runner == US_RUNNER:
+        lines.append("  CLV: not measured on Polymarket US (its price history is display prices, not trades)")
+    else:
+        lines.append(f"  CLV: closing line {cents(s.avg_clv)} (n={s.clv_n}{inplay}) | price "
+                     f"{app.cfg.bot.markout_seconds // 60} min after our fill {cents(mean(marks))} "
+                     f"(n={len(marks)}, every fill)")
     # Signals we reached too late (a restart, an outage) are already counted as misses
     # above; averaging minutes-old backlog into this line would hide how fast the bot is.
     limit = app.cfg.bot.max_signal_age_seconds
@@ -275,9 +283,15 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
     for t in trades:
         by[(t["runner"], t["strategy"])].append(t)
     order = {name: i for i, name in enumerate(BOT_STRATEGIES)}
-    for (runner, strategy), rows in sorted(by.items(), key=lambda kv: (kv[0][0], order.get(kv[0][1], 99))):
-        lines += _bot_strategy_lines(app, runner, strategy, rows, threshold, samples, brief=brief)
-    for runner in sorted({r for r, _ in by}):
+    # The US venue (row A) comes last: it is read against the international runner.
+    runners = sorted({r for r, _ in by}, key=lambda r: (r == US_RUNNER, r))
+    for runner in runners:
+        for strategy in sorted({s for r, s in by if r == runner}, key=lambda s: order.get(s, 99)):
+            lines += _bot_strategy_lines(app, runner, strategy, by[(runner, strategy)], threshold, samples,
+                                         brief=brief)
+        if runner == US_RUNNER:
+            lines += us_lines(by.get((US_RUNNER, BOT_HEADLINE), []), by.get(("single", BOT_HEADLINE), []), samples)
+            continue
         n, m, lo, hi = _paired(by.get((runner, BOT_HEADLINE), []), by.get((runner, "placebo_late"), []), samples)
         if n:
             ci = "-" if lo is None else f"[{_pct(lo)}, {_pct(hi)}]"
@@ -286,16 +300,91 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
                        "no difference shown: the whale's timing has not been shown to matter")
             lines.append(f"  {runner}: flat_hold minus placebo_late, ROI per trade on the {n} signals both filled: "
                          f"{_pct(m)}, 95% CI {ci} -> {verdict}")
-    for runner in sorted({r for r, _ in by}):
         lines += cutoff_lines(app, runner, by.get((runner, BOT_HEADLINE), []))
     lines += wallet_lines(app, trades, brief=brief)
     lines += detection_lines(app)
     if with_breakdowns:
-        headline = [t for t in trades if t["strategy"] == BOT_HEADLINE and t["status"] != "SKIPPED"]
+        headline = [t for t in trades if t["strategy"] == BOT_HEADLINE and t["status"] != "SKIPPED"
+                    and t["runner"] != US_RUNNER]
         if headline:
             lines += _breakdown_lines(headline, f" ({BOT_HEADLINE})",
                                       ("watchlist status", "month", "category", "days to close when entered",
                                        "holding time", "entry price", "wallet"))
+    return lines
+
+
+@dataclass
+class UsComparison:
+    """Row A beside the baseline, on the same signals."""
+    signals: int = 0
+    on_us: int = 0                       # the same bet exists there and the sides lined up
+    reasons: dict[str, int] = field(default_factory=dict)
+    gaps: list[float] = field(default_factory=list)       # US best ask minus international best ask
+    both_filled: int = 0
+    fee_us: float = 0.0                  # on the signals both filled
+    fee_intl: float = 0.0
+    paired: tuple[int, float | None, float | None, float | None] = (0, None, None, None)
+    no_sports: Summary | None = None
+
+
+def us_comparison(us_rows: list[dict], base_rows: list[dict], samples: int) -> UsComparison:
+    c = UsComparison(signals=len(us_rows))
+    base = {t["alert_id"]: t for t in base_rows}
+    for t in us_rows:
+        if t.get("us_slug"):
+            c.on_us += 1
+        code = t.get("skip_code")
+        if code:
+            why = (t.get("reason") or code).split(":", 1)[-1].strip() if code == "not_on_us" else ""
+            if "its sides do not line up" in why:
+                why = "the market exists but its sides do not line up"
+            key = f"{code}: {why}" if why else code
+            c.reasons[key] = c.reasons.get(key, 0) + 1
+        if t.get("price_gap") is not None:
+            c.gaps.append(t["price_gap"])
+        other = base.get(t["alert_id"])
+        if t["status"] == "FILLED" and other is not None and other["status"] == "FILLED":
+            c.both_filled += 1
+            c.fee_us += t.get("fees") or 0.0
+            c.fee_intl += other.get("fees") or 0.0
+    c.paired = _paired(us_rows, base_rows, samples)
+    rest = [t for t in us_rows if t["status"] != "SKIPPED" and (t.get("category") or "") != "sports"]
+    c.no_sports = summarise("us, sports excluded", rest, samples=samples) if rest else None
+    return c
+
+
+def us_lines(us_rows: list[dict], base_rows: list[dict], samples: int) -> list[str]:
+    """v2.1 Part 3b: how the same signals fare on Polymarket US, against the baseline."""
+    if not us_rows:
+        return []
+    c = us_comparison(us_rows, base_rows, samples)
+    share = c.on_us / c.signals if c.signals else 0.0
+    lines = [f"  {US_RUNNER}: the same bet exists on Polymarket US for {c.on_us} of {c.signals} signals ({share:.0%})"]
+    if c.reasons:
+        lines.append("    not priced there: " + ", ".join(
+            f"{k} {v}" for k, v in sorted(c.reasons.items(), key=lambda kv: -kv[1])))
+    if c.gaps:
+        dearer = sum(1 for g in c.gaps if g > 1e-9)
+        lines.append(f"    US best ask minus international best ask, n={len(c.gaps)}: mean "
+                     f"{(round(mean(c.gaps), 3) or 0.0):+.3f}, median {(round(median(c.gaps), 3) or 0.0):+.3f}; "
+                     f"the US price was higher on {dearer} ({dearer / len(c.gaps):.0%})")
+    if c.both_filled:
+        lines.append(f"    fees on the {c.both_filled} signals both venues filled: US ${c.fee_us:,.2f}, "
+                     f"international ${c.fee_intl:,.2f}")
+    n, m, lo, hi = c.paired
+    if n:
+        ci = "-" if lo is None else f"[{_pct(lo)}, {_pct(hi)}]"
+        lines.append(f"    US minus international, ROI per trade on the {n} signals both filled and closed: "
+                     f"{_pct(m)}, 95% CI {ci}")
+    else:
+        lines.append("    no signal has been filled and closed on both venues yet, so no comparison of returns")
+    s = c.no_sports
+    if s is not None and s.settled:
+        lines.append(f"    sports excluded: net {_money(s.total_pnl)} on ${s.total_cost:,.2f}, n={s.settled} closed, "
+                     f"mean ROI {_pct(s.mean_roi)}, 95% CI {_ci_text(s)}")
+    else:
+        lines.append(f"    sports excluded: {0 if s is None else s.filled} fills, none closed"
+                     " (almost everything that exists on both venues is sports)")
     return lines
 
 
@@ -544,7 +633,7 @@ def render(app: App, *, with_breakdowns: bool = True, brief_backtest: bool = Fal
     bot = bot_lines(app, threshold=threshold, samples=samples, brief=brief_backtest, with_breakdowns=with_breakdowns)
     if bot:
         headline = app.db.one("SELECT COUNT(*) n FROM bot_trades WHERE strategy = ? AND status = 'FILLED' "
-                              "AND closed_at IS NOT NULL", (BOT_HEADLINE,))["n"]
+                              "AND closed_at IS NOT NULL AND runner != ?", (BOT_HEADLINE, US_RUNNER))["n"]
         label = "closed bot paper trades (flat_hold)"
     else:
         headline = sum(1 for t in live if t["status"] == "FILLED" and t["settled_at"] is not None)

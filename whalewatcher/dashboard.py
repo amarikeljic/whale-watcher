@@ -20,6 +20,7 @@ import csv
 import io
 import json
 import logging
+import math
 import sqlite3
 import time
 from collections import defaultdict
@@ -38,7 +39,8 @@ from .db import SCHEMA_VERSION, Database
 from .horizon import BUCKETS as CLOSE_BUCKETS
 from .horizon import UNKNOWN as NO_END
 from .horizon import bucket as horizon_bucket
-from .stats import (bucket, cutoff_report, event_key, in_play, load_bot_trades, load_trades, summarise)
+from .stats import (bucket, cutoff_report, event_key, in_play, load_bot_trades, load_trades, summarise,
+                    us_comparison)
 from .stats_util import mean, median
 from .timeutil import iso, now_ts, parse_as_of, start_of_day
 
@@ -47,12 +49,15 @@ log = logging.getLogger(__name__)
 DAY = 86_400
 SAMPLES = 2000            # bootstrap draws per interval: enough for a dashboard, light on a home server
 PAGE_ROWS = 100
+US_KEY = "us/flat_hold"          # row A: the runner `us` (polymarket_us.py)
+BASE_KEY = "single/flat_hold"
 LABELS = {
     "single/flat_hold": "Bot: flat stake, hold",
     "single/flat_mirror": "Bot: flat stake, mirror exits",
     "single/scaled_hold": "Bot: scaled stake, hold",
     "single/placebo_late": "Control: same outcome, later",
     "old/hold_to_resolution": "Old rule: human delay",
+    US_KEY: "Polymarket US: same signals, US book",
 }
 SERIES = {"single/flat_hold": "s1", "single/flat_mirror": "s2", "single/scaled_hold": "s3",
           "single/placebo_late": "s4", "old/hold_to_resolution": "s5"}
@@ -73,7 +78,8 @@ def load_records(app: Any) -> list[dict]:
     """Every paper trade, bot and old rule and simulated, as one list with one set of names."""
     out = []
     for t in load_bot_trades(app):
-        t.update(key=f"{t['runner']}/{t['strategy']}", market_venue="polymarket", simulated=False)
+        t.update(key=f"{t['runner']}/{t['strategy']}", simulated=False,
+                 market_venue="polymarket_us" if t["runner"] == "us" else "polymarket")
         out.append(t)
     for t in load_trades(app):
         sim = str(t["strategy"]).startswith("backtest:")
@@ -273,7 +279,7 @@ def filters_html(c: Ctx) -> str:
             f'{hidden}{custom}'
             f'<label>Strategy{select("strategy", [(k, label_of(k)) for k in c.strategies], f.strategy)}</label>'
             f'<label>Group by{select("group", [("day", "Day"), ("week", "Week")], f.group)}</label>'
-            f'<label>Venue{select("venue", [("all", "All venues"), ("polymarket", "Polymarket")], f.venue)}</label>'
+            f'<label>Venue{select("venue", [("all", "All venues"), ("polymarket", "Polymarket"), ("polymarket_us", "Polymarket US")], f.venue)}</label>'
             f'<label>Wallet{select("wallet", wallets, f.wallet)}</label>'
             f'<label>Days to close{select("close", closes, f.close)}</label>'
             f'<label class="check"><input type="checkbox" name="outages" value="exclude"'
@@ -366,7 +372,10 @@ def histogram(values: list[float], lo: float = -0.2, hi: float = 0.2, step: floa
     n = round((hi - lo) / step)
     counts = [0] * n
     for x in values:
-        counts[min(n - 1, max(0, int((x - lo) / step)))] += 1
+        # Prices move in whole ticks, so most values sit exactly on a bucket edge, and
+        # in floating point 0.58 - 0.57 is 0.00999...: without the rounding a one-cent
+        # gap lands in the bucket below about one time in eight.
+        counts[min(n - 1, max(0, math.floor(round((x - lo) / step, 9))))] += 1
     bars = [{"label": f"{lo + i * step:+.2f}", "v": cnt, "n": cnt} for i, cnt in enumerate(counts)]
     return bars, n // 2
 
@@ -663,6 +672,114 @@ def breakdowns(c: Ctx) -> str:
     return body + "</div>"
 
 
+# -- Polymarket US, row A (v2.1 Part 3b) ----------------------------------------------------------------
+
+
+def us_page(c: Ctx) -> str:
+    """The same signals on Polymarket US, beside the international baseline. Scoped by
+    the date range and the outage switch only: it is always these two rows."""
+    f = c.f
+
+    def ranged(key: str) -> list[dict]:
+        out = []
+        for r in c.records:
+            ts = r["alert_ts"]
+            if r["key"] != key or (f.start is not None and ts < f.start) or (f.end is not None and ts >= f.end):
+                continue
+            if f.no_outages and any(a <= ts < b for a, b in c.windows):
+                continue
+            out.append(r)
+        return out
+
+    us_rows, base_rows = ranged(US_KEY), ranged(BASE_KEY)
+    intro = v.banner(
+        "Row A. Nobody's trades are visible on Polymarket US, so there is nothing to copy there. This page shows what "
+        "acting on the SAME signals would have cost on the Polymarket US order book, at US fees, read from its public "
+        "market data. Nothing is ordered anywhere. Of the filters above, only the date range and the outage "
+        "switch apply here.", "info")
+    if not us_rows:
+        return intro + v.card("Polymarket US", '<p class="empty">No signal has been priced on Polymarket US in this '
+                                               "range yet. It starts with the next signal the runner makes.</p>",
+                              wide=True)
+    cmp = us_comparison(us_rows, base_rows, samples=1500)
+    us_sum = summarise("us", [r for r in us_rows if r["status"] != "SKIPPED"], samples=1500)
+    alerted = {r["alert_id"] for r in us_rows}
+    same = [r for r in base_rows if r["alert_id"] in alerted and r["status"] != "SKIPPED"]
+    base_sum = summarise("base", same, samples=1500)
+    n, m, lo, hi = cmp.paired
+    gap_mean = mean(cmp.gaps) if cmp.gaps else None
+    tiles = (v.tile("Signals priced", str(cmp.signals), "made since row A began")
+             + v.tile("On Polymarket US", f"{cmp.on_us} ({cmp.on_us / cmp.signals:.0%})" if cmp.signals else "-",
+                      "the same bet exists there")
+             + v.tile("Filled there", str(us_sum.filled), f"{us_sum.missed} did not fill · {us_sum.settled} closed")
+             + v.tile("Mean price gap", "-" if gap_mean is None else v.cents(gap_mean),
+                      f"US ask minus international, n={len(cmp.gaps)}")
+             + v.tile("Fees, both filled", f"${cmp.fee_us:,.2f} vs ${cmp.fee_intl:,.2f}",
+                      f"US vs international, n={cmp.both_filled}")
+             + v.tile("ROI, US minus intl", "-" if not n else v.pct(m),
+                      "no signal closed on both yet" if not n else
+                      f"n={n}, 95% interval " + ("-" if lo is None else f"[{v.pct(lo)}, {v.pct(hi)}]"),
+                      v.tone(m) if n else ""))
+    body = intro + size_banner(c, us_sum.settled) + f'<div class="tiles">{tiles}</div><div class="grid">'
+
+    bars, ref = histogram(cmp.gaps, lo=-0.05, hi=0.05, step=0.01)
+    body += v.card("Price gap between the venues", v.chart(
+        "bars", {"bars": bars, "y": "num", "signed": False, "cls": "s1", "ref": ref},
+        table_headers=["US ask minus international ask", "Signals"],
+        table_rows=[[b["label"], str(b["n"])] for b in bars]) if cmp.gaps else '<p class="empty">No gap measured yet.</p>',
+        note="Best ask on Polymarket US minus the best ask the bot saw on the international book, for the same "
+             "outcome, read moments apart. Right of the line the US price was higher. The two ends collect "
+             "everything beyond 5 cents.", wide=True)
+
+    def row(name: str, s: Any, fee: float) -> list:
+        return [name, (str(s.alerts), s.alerts), (str(s.filled), s.filled), (str(s.missed), s.missed),
+                (str(s.settled), s.settled), (v.money(s.total_pnl) if s.settled else "-", s.total_pnl,
+                                               v.tone(s.total_pnl) if s.settled else ""),
+                (v.pct(s.roi), -9 if s.roi is None else s.roi),
+                (f"{v.pct(s.mean_roi)} {ci_text(s)}" if s.settled else "-", -9 if s.mean_roi is None else s.mean_roi),
+                (f"${fee:,.2f}", fee)]
+
+    body += v.card("The same signals on both venues", v.table(
+        ["Venue", "Signals", "Filled", "Did not fill", "Closed", "Net P&L", "ROI", "Mean ROI, 95% interval",
+         "Fees, both filled"],
+        [row("International (the baseline)", base_sum, cmp.fee_intl), row("Polymarket US (row A)", us_sum, cmp.fee_us)],
+        sortable=False),
+        note="Signals the cutoff or a missing US market skipped are not counted as attempts. Fees are compared on "
+             "the signals both venues filled. The US fee coefficient is 0.095 on every market.", wide=True)
+
+    body += v.card("Why a signal was not priced on Polymarket US", v.table(
+        ["Reason", "Signals"], [[(k, None, "wrap"), (str(n_), n_)] for k, n_ in
+                                sorted(cmp.reasons.items(), key=lambda kv: -kv[1])],
+        empty="Every signal was priced there.", numeric_from=1),
+        note="A market is matched by an exact rule on its name, or not at all. not_same_bet: crypto up or down "
+             "covers the same window on both venues but settles on a different price index.", wide=True)
+
+    traded_us = [r for r in us_rows if r["status"] != "SKIPPED"]
+    s = cmp.no_sports
+    sports_line = ("Sports excluded: no fill has closed (almost everything on both venues is sports)."
+                   if s is None or not s.settled else
+                   f"Sports excluded: net {v.money(s.total_pnl)} on ${s.total_cost:,.2f}, n={s.settled} closed, "
+                   f"mean ROI {v.pct(s.mean_roi)} {ci_text(s)}.")
+    body += v.card("Polymarket US by category", breakdown_table(
+        c, traded_us, lambda r: r.get("category") or "unknown", "Category")[0],
+        note=sports_line + " Set polymarket_us.exclude_categories to leave a category out there.", wide=True)
+
+    rows = []
+    for r in sorted(us_rows, key=lambda r: -r["alert_ts"])[:40]:
+        rows.append([iso(int(r["alert_ts"]))[:16].replace("T", " "), ((r.get("question") or "")[:50], None, "wrap"),
+                     r["status"].capitalize(), ((r.get("reason") or r.get("us_side") or "")[:70], None, "wrap"),
+                     "-" if r.get("intl_best_ask") is None else f"{r['intl_best_ask']:.3f}",
+                     "-" if r.get("best_ask") is None else f"{r['best_ask']:.3f}",
+                     ("-" if r.get("price_gap") is None else v.cents(r["price_gap"]), r.get("price_gap") or 0),
+                     "-" if r["status"] != "FILLED" else f"${r.get('fees') or 0:,.2f}",
+                     ("-" if r.get("pnl") is None or r.get("settled_at") is None else v.money(r["pnl"]),
+                      r.get("pnl") or 0, v.tone(r["pnl"]) if r.get("settled_at") is not None else "")])
+    body += v.card("Latest signals on Polymarket US", v.table(
+        ["When (UTC)", "Market", "Result", "Side or reason", "Intl ask", "US ask", "Gap", "US fee", "P&L"], rows,
+        numeric_from=4), note="The 40 most recent, newest first.", wide=True)
+    return body + "</div>"
+
+
 # -- the simulated small wallet (v2.1 Part 2) ---------------------------------------------------------
 
 SKIP_MEANING = {
@@ -673,6 +790,9 @@ SKIP_MEANING = {
     "no_edge": "Automatic stake: the settled signals have not shown an edge, so the right stake is nothing.",
     "too_long": "The market was scheduled to end beyond the time-to-close cutoff.",
     "no_end_date": "The market had no scheduled end date.",
+    "not_on_us": "Polymarket US: the same bet is not listed there (or no rule can line it up exactly).",
+    "not_same_bet": "Polymarket US: the same window is listed but settles on a different price index.",
+    "us_excluded": "Polymarket US: the category is excluded there (polymarket_us.exclude_categories).",
 }
 CURVE_POINTS = 700      # more than this many equity points are thinned before they are sent to the page
 RUG_BINS = 140
@@ -1041,7 +1161,8 @@ def render(cfg: Config, db_path: str, path: str, query: Any, *, now: int | None 
             c.path = path
         else:
             pages = {"/": ("Overview", overview), "/edge": ("Edge", edge), "/wallets": ("Wallets", wallets),
-                     "/breakdowns": ("Breakdowns", breakdowns), "/health": ("Health", health)}
+                     "/breakdowns": ("Breakdowns", breakdowns), "/health": ("Health", health),
+                     "/us": ("Polymarket US", us_page)}
             if path == "/bankroll":
                 title, body = bankroll_page(c, query)
                 updated = f"Read {iso(c.now)[11:16]} UTC."
@@ -1156,7 +1277,7 @@ def make_app(cfg: Config, db_path: str) -> web.Application:
     app.router.add_get("/assets/app.css", css)
     app.router.add_get("/assets/app.js", js)
     app.router.add_get("/healthz", healthz)
-    for route in ("/", "/edge", "/wallets", "/trades", "/trades.csv", "/breakdowns", "/health", "/bankroll",
+    for route in ("/", "/edge", "/wallets", "/trades", "/trades.csv", "/breakdowns", "/health", "/bankroll", "/us",
                   "/wallet/{address}"):
         app.router.add_get(route, handle)       # GET only: none of these can change anything
     return app

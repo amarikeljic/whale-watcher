@@ -111,6 +111,8 @@ def recalculate(app: App) -> dict[str, int]:
                     charged = round(stored / base, 4) if base > 0 else 0.0
                     charged_by = "market"
                 rate, _ = rate_for(market, t[ts_col], app.cfg.fees)
+                if charged_by == "us":
+                    rate = charged      # Polymarket US has its own fee: the international policy does not apply
                 slip = t["slippage_cost"]
                 leaving = table == "bot_trades" and t["exit_price"] is not None
                 if leaving:

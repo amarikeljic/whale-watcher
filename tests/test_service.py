@@ -132,3 +132,35 @@ async def test_an_empty_monitored_set_is_announced_once(live_app, fake_http, clo
     await svc._rescore()          # the next night: still nobody
     notices = [t for t in svc.notices if "no wallet meets the watchlist entry rules" in t]
     assert len(notices) == 1 and "nothing is being monitored" in notices[0]
+
+
+async def test_a_busy_database_at_heartbeat_time_does_not_end_the_runner(live_app, fake_http, clock, monkeypatch):
+    """Seen live on 2026-11-13: the nightly review (a child process) held the database
+    longer than the busy timeout and the heartbeat write, outside any handler, killed the runner."""
+    import sqlite3
+    World(fake_http)
+    live_app.db.execute("INSERT INTO monitored_wallets (wallet, run_id, rank, active, added_at, last_seen_ts) "
+                        "VALUES ('0xw', 1, 1, 1, ?, ?)", (NOW - 3600, NOW - 120))
+    svc = Service(live_app)
+    real, calls = live_app.db.set_state, []
+
+    def locked(key, value):
+        calls.append(key)
+        if key == "heartbeat":
+            raise sqlite3.OperationalError("database is locked")
+        return real(key, value)
+
+    monkeypatch.setattr(live_app.db, "set_state", locked)
+    await svc.run(cycles=2)                                 # returns: it was not killed
+    assert calls.count("heartbeat") == 2, "and it tried again on the next cycle"
+
+
+def test_writers_wait_a_minute_for_a_busy_database_and_slow_statements_are_logged(tmp_path, caplog, monkeypatch):
+    from whalewatcher import db as dbmod
+    d = dbmod.Database(str(tmp_path / "x.sqlite3"))
+    assert d.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 60_000
+    monkeypatch.setattr(dbmod, "SLOW_STATEMENT_SECONDS", -1.0)
+    with caplog.at_level("WARNING"):
+        d.execute("SELECT 1")
+    assert "a database statement took" in caplog.text and "SELECT 1" in caplog.text
+    d.close()

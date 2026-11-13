@@ -84,6 +84,9 @@ def cfg() -> Config:
     # Wallet arithmetic in the older tests is for a fixed 8% stake; the automatic
     # stake (the shipped default) has its own tests in test_bankroll.py.
     c.bankroll.stake_mode = "fixed"
+    # Row A (the same signals priced on Polymarket US) has its own tests in
+    # test_polymarket_us.py; everywhere else the runner makes no US requests.
+    c.polymarket_us.enabled = False
     return c
 
 

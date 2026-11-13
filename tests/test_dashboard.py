@@ -250,9 +250,40 @@ def test_the_settings_writer_cannot_touch_any_other_table(site):
     with pytest.raises(ValueError):
         dash.SettingsWriter.save_wallet_amount(site.path, -5, NOW)
     db = Database.readonly(site.path)
-    assert bankroll.wallet_amount(db) == 400.0 and db.one("SELECT COUNT(*) n FROM bot_trades")["n"] == 10
+    assert bankroll.wallet_amount(db) == 400.0 and db.one("SELECT COUNT(*) n FROM bot_trades")["n"] == 13
     assert db.one("SELECT source FROM settings")["source"] == "dashboard"
     db.close()
+
+
+# -- Polymarket US, row A ---------------------------------------------------------------------------------
+
+
+def test_the_us_page_puts_the_same_signals_on_both_venues_side_by_side(site):
+    html = site("/us")
+    assert "trades are visible on Polymarket US, so there is nothing to copy there" in html
+    assert "Nothing is ordered anywhere" in html
+    assert "2 (67%)" in html, "three signals priced, two of them exist on Polymarket US"
+    assert "+0.035" in html and "n=2" in html, "gaps of +0.01 and +0.06: mean +0.035"
+    assert "$0.24 vs $0.00" in html, "fees on the one signal both venues filled"
+    assert "n=1, 95% interval" in html and "-33.5%" in html, "9.37 / 10.24 against 12.50 / 10: 91.5% minus 125%"
+    assert "International (the baseline)" in html and "Polymarket US (row A)" in html
+    assert "not_on_us: no rule for politics markets" in html and "Why a signal was not priced on Polymarket US" in html
+    assert "Price gap between the venues" in html and "Polymarket US by category" in html
+    assert "Sports excluded: no fill has closed" in html
+    assert "price ran: filling $10 costs 0.560 a share, limit 0.510" in html and "Latest signals on Polymarket US" in html
+
+
+def test_the_us_row_never_leaks_into_the_international_numbers(site):
+    html = site("/")
+    assert "+$2.50" in html and "n=5 closed" in html, "the overview is still the five international trades"
+    assert "Polymarket US: same signals, US book" in html, "it is offered as its own strategy"
+    own = site("/", strategy="us/flat_hold")
+    assert "n=1 closed" in own and "+$9.37" in own
+    assert "n=0 closed" in site("/", strategy="us/flat_hold", venue="polymarket")
+    assert "n=1 closed" in site("/", strategy="us/flat_hold", venue="polymarket_us")
+    wallet = site("/bankroll", src="bot:us")
+    assert "Bot, runner us" in wallet or "Polymarket US" in wallet
+    assert "No signal has been priced on Polymarket US" in site("/us", range="custom", **{"from": "2020-01-01", "to": "2020-01-02"})
 
 
 def test_health_page_shows_delays_heartbeats_and_the_outage(site):
@@ -278,7 +309,7 @@ def test_the_dashboard_cannot_write(site):
         db.execute("DELETE FROM bot_trades")
     with pytest.raises(sqlite3.OperationalError):
         db.execute("INSERT INTO service_state (key, value) VALUES ('x', '1')")
-    assert db.one("SELECT COUNT(*) n FROM bot_trades")["n"] == 10
+    assert db.one("SELECT COUNT(*) n FROM bot_trades")["n"] == 13
     db.close()
 
 
@@ -313,3 +344,23 @@ async def test_the_server_answers_get_only_and_sends_a_strict_policy(site):
 def test_it_refuses_to_listen_beyond_loopback_unless_told_it_is_in_a_container():
     with pytest.raises(SystemExit, match="tailnet only"):
         dash.serve(Config(), host="0.0.0.0", port=8787, in_container=False)
+
+
+def test_a_one_tick_difference_always_lands_in_its_own_bucket():
+    """0.58 - 0.57 is 0.00999... in floating point: before the fix one one-cent gap in
+    eight was counted in the bucket below."""
+    diffs = [round(a / 100 + 0.01, 2) - a / 100 for a in range(1, 98)]
+    bars, ref = dash.histogram(diffs, lo=-0.05, hi=0.05, step=0.01)
+    assert ref == 5 and bars[6]["label"] == "+0.01"
+    assert [b["v"] for b in bars] == [0, 0, 0, 0, 0, 0, 97, 0, 0, 0]
+    flat = [round(a / 100, 2) - round(a / 100, 2) for a in range(1, 98)] + [0.30 - 0.30]
+    assert dash.histogram(flat, lo=-0.05, hi=0.05, step=0.01)[0][5]["v"] == 98, "no difference: the +0.00 bucket"
+    down = [round(a / 100 - 0.01, 2) - a / 100 for a in range(2, 99)]
+    assert dash.histogram(down, lo=-0.05, hi=0.05, step=0.01)[0][4]["v"] == 97, "one tick cheaper: -0.01"
+    assert dash.histogram([-0.30, 0.30], lo=-0.05, hi=0.05, step=0.01)[0][0]["v"] == 1, "the ends collect the rest"
+
+
+def test_a_difference_of_nothing_is_never_printed_as_minus_zero():
+    from whalewatcher import dashview as dv
+    assert dv.cents(0.57 - 0.58 + 0.01) == "+0.000" and dv.cents(-0.0004) == "+0.000"
+    assert dv.cents(-0.0006) == "-0.001" and dv.cents(0.013) == "+0.013" and dv.cents(None) == "-"

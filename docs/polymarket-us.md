@@ -1,8 +1,10 @@
 # Polymarket US: what the public data exposes
 
 Checked 2026-11-12 against the official docs and the live public gateway, with
-read-only GET requests and no account or key. Nothing here is built yet. This is
-the research report v2.1 Part 3b asks for before source B is designed.
+read-only GET requests and no account or key. This is the research report v2.1
+Part 3b asks for. Row A (the same signals priced on the US book) was built on it
+on 2026-11-13: `whalewatcher/polymarket_us.py` and the README. Source B was not
+built.
 
 Sources: <https://docs.polymarket.us/llms.txt> (page index),
 <https://docs.polymarket.us/api-reference/introduction.md>,
@@ -89,12 +91,19 @@ in fees. Combos use a different, higher curve.
 
 ## Matching an international market to its US market
 
-| Market type | Rule | Checked |
+Every rule is exact: a market is matched by its slug and the sides are lined up
+by name, or it is not matched at all (`not_on_us`). Kickoff times must agree
+within 6 hours, so trying a neighbouring date cannot pick another game.
+
+| Market type | Rule | Status (2026-11-13) |
 | --- | --- | --- |
-| Two-way game winner | `aec-<league>-<a>-<b>-<date>`. The US date is the Eastern date of the game, international uses the UTC date, so try the date and the day before | 82 of 142 recent markets. Misses are team-code differences (esports, tennis, some NBA) |
-| Crypto up/down | `btc-updown-5m-<unix start>` becomes `cpc-btc-updown-5m-YYYY-MM-DD-HHMMz` | 162 of 162 |
-| State election winner | event `usse-<st>-2026-11-03` or `usgub-<st>-2026-11-03` | 3 of 3 states sampled |
-| Spreads, totals, props, three-way soccer | US slugs exist (`asc-`, `tsc-`, `atc-`) but lines must be matched by number | not yet |
+| Two-way game winner | `aec-<league>-<a>-<b>-<date>`. The US date is the Eastern date, international the UTC date, so the date and the days either side are tried | built |
+| Tennis match | `aec-<atp or wta>-<player>-<player>-<date>`, each player as three letters of the first name and three of the last (`sebbae`). International slugs truncate surnames instead. A third name is tried both ways | built: 9 of 9 recent alerts |
+| Three-way football | `atc-<event>-<team or draw>`, one instrument per outcome. International "No" is the short side | built: 3 of 4 |
+| Esports map or game winner | `astatc-<event>-map<N>` (CS2) or `-game<N>` (LoL), one Yes/No instrument, "Will X win Map N vs Y?". The side is read from that question | built: 20 of 57 map alerts in 30 days. Most misses are Dota 2 and smaller events, listed under other team codes (Team Spirit is `ts8` internationally, `ts` there) or not at all |
+| Crypto up/down | `btc-updown-5m-<unix start>` becomes `cpc-btc-updown-5m-YYYY-MM-DD-HHMMz` | found, but skipped as `not_same_bet` (a different price index) |
+| State election winner | event `usse-<st>-<date>` or `usgub-<st>-<date>`, markets ending `-rep` and `-dem` | not built: the 2026-11-03 races have resolved |
+| Spreads, totals, props | US slugs exist (`asc-`, `tsc-`) but each line has to be matched by its number | not built |
 
 Two traps:
 
@@ -104,6 +113,11 @@ Two traps:
 * **`endDate` on a US sports market is the game plus about 14 days.** Use
   `gameStartTime`, never `endDate`, for a days-to-close filter.
 
-On the sandbox copy of the database, 1,926 alerts in the last 14 days: 25% match
-by the first two rules, about 65% if the election rule holds for every state.
-The real figure has to come from the server's database.
+Match rate on the sandbox copy (`python -m whalewatcher us match`,
+2026-11-13): the same bet exists on Polymarket US for 32 of the 60 alerts the
+live service made in the last 14 days (53%), all of them sports. Of the other
+28, 20 are sports lines and props (totals 11, spreads 4, five others) and 8 are
+geopolitics, finance, politics and tech. An earlier estimate of 1,926 alerts
+counted simulated backtest alerts too. The server's own figure will differ: its
+last two weeks include the 2026-11-03 elections, which had winner markets on
+the US venue that no rule covers.

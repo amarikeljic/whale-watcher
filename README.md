@@ -53,6 +53,7 @@ python -m whalewatcher watchlist --history          # every add and removal ever
 python -m whalewatcher watchlist --review           # run the nightly review now
 python -m whalewatcher consensus                    # today's consensus pool: counts at $100k/$250k/$500k/top 50, entities
 python -m whalewatcher consensus --backtest         # six months of the consensus strategy, no hindsight, with baselines
+python -m whalewatcher us match [--days 14]         # how many recent alerts have the same bet on Polymarket US
 python -m whalewatcher dashboard                    # the web dashboard on 127.0.0.1:8787
 python -m whalewatcher wallet show                  # the simulated small wallet: amount, runs, replay
 python -m whalewatcher wallet set 250               # change the amount (starts a new wallet run)
@@ -331,11 +332,59 @@ What it shows:
   up on lucky streaks and lost 88% to 96% in the simulated runs. That is why
   the bar is the pre-set decision rule and not something tuned to look good.
 
+### Polymarket US, row A (v2.1)
+
+Polymarket US is a separate, US-regulated exchange with its own order books and
+fees. Nobody's trades are visible there, so there is nothing to copy on it
+(`docs/polymarket-us.md`). What can be measured is what acting on the same
+signals would have cost there. `polymarket_us.py` does that for every signal
+the runner makes, in the background so the bot never waits for it:
+
+1. **Match** the market by an exact rule on its name, or not at all
+   (`not_on_us`): two-way game winners, tennis matches (the US slug is built
+   from the players' names), three-way football markets, and esports map or
+   game winners (the side is read from "Will X win Map 2 vs Y?"). Kickoff times
+   must agree and each outcome must line up with exactly one side by name.
+2. **Read** the US order book from the public gateway. No account, no key.
+   Every request is a GET to `gateway.polymarket.us`. The trading host is never
+   contacted.
+3. **Fill** the same $10, fill-or-kill, under the same limit (the whale's price
+   + `max_slippage`). There is one instrument per market: the other side is a
+   short of it, filled against the bids at `1 - bid`.
+4. **Charge** the US fee: `0.095 x contracts x p x (1 - p)`, to the cent. That
+   is two to three times the international fee.
+5. **Settle** at what the US venue itself paid (its settlement endpoint).
+
+The rows live in the same ledger under the runner `us`, so `stats`, the
+dashboard (strategy "Polymarket US", venue filter, the **US venue** page) and
+the small wallet all show it, and none of them mix it with the international
+numbers. `python -m whalewatcher us match` prints the match rate on recent
+alerts.
+
+* Crypto up/down exists on both venues for the same window but settles on a
+  different price index there, so it is skipped as `not_same_bet` unless
+  `polymarket_us.include_different_index` is set.
+* `polymarket_us.exclude_categories: [sports]` leaves a category out on the US
+  venue only. Reports always carry a sports-excluded line.
+* Spreads, totals, props and non-sports markets have no rule yet and count as
+  `not_on_us`.
+* A row A fill is decided a moment after the bot's, because it needs one or
+  two more requests. Both times are stored.
+
+Match rate on the sandbox copy, live alerts of the last 14 days (2026-11-13):
+the same bet exists on Polymarket US for 32 of 60 (53%), all of them sports.
+The other 28 are sports lines and props (20) and geopolitics, finance, politics
+and tech (8).
+
 **The dashboard** (`dashboard.py`, `dashview.py`, v2 Phase 4). A third
 container that shows everything `stats` prints, as pages: Overview, Edge,
 Wallets (with a page per wallet and the watchlist timeline), Trades (with CSV
-export), Breakdowns and Health. One filter row scopes every number on a page:
-date range, day or week, strategy, venue, wallet, and "exclude outage windows".
+export), Sim wallet (the small wallet and its amount form), US venue (row A
+beside the international baseline), Breakdowns and Health. One filter row
+scopes every number on a page: date range, day or week, strategy, venue,
+wallet, days to close, and "exclude outage windows". The US venue page uses
+only the date range and the outage switch, and Sim wallet uses none: a
+wallet is one path through all of its signals.
 
 * **It reads, with one exception.** The database is opened read-only and
   query-only and every page is a GET. The one thing the site can change is the
