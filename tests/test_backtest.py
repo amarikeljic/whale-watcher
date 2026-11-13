@@ -11,7 +11,6 @@ import pytest
 from conftest import DAY, NOW, act, market
 from whalewatcher.backtest import AlertEvent, alert_events, plan_periods, run_backtest, simulate, top_wallets
 from whalewatcher.config import ScoringConfig
-from whalewatcher.discord import MemorySink
 from whalewatcher.fees import polymarket_taker_fee
 from whalewatcher.monitor import Monitor
 from whalewatcher.optimize import SPEC_REQUIREMENTS, Fold, FoldIndex, FoldWallet, choose, search
@@ -230,11 +229,9 @@ async def test_the_live_monitor_never_joins_a_backtest_alert(live_app, fake_http
         "VALUES (?, '0xm', '0xm-t0', 'Yes', 'NEW', ?, ?, ?, 1500, 630, 0.42, 1, ?, 'BACKTEST', ?)",
         (W, NOW - 30, NOW - 30, NOW - 30, NOW - 30, NOW))
     world.trade(W, NOW - 20, "0xm", size=1500, price=0.42)
-    sink = MemorySink()
-    await Monitor(live_app, sink).poll_once()
-    assert len(sink.posts) == 1
+    await Monitor(live_app).poll_once()
     rows = live_app.db.query("SELECT status, fills FROM alerts ORDER BY id")
-    assert [(r["status"], r["fills"]) for r in rows] == [("BACKTEST", 1), ("POSTED", 1)]
+    assert [(r["status"], r["fills"]) for r in rows] == [("BACKTEST", 1), ("RECORDED", 1)]
 
 
 # -- the interval ---------------------------------------------------------------------------------

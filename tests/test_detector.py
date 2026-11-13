@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from conftest import NOW
 from whalewatcher.detector import Detector
-from whalewatcher.discord import MemorySink
 from whalewatcher.http import HttpError
 from whalewatcher.monitor import Monitor
 from whalewatcher.service import DETECTOR_HEARTBEAT_KEY, Service, run_detector
@@ -133,8 +132,8 @@ async def test_two_runners_read_the_same_fills_each_from_its_own_cursor(live_app
     class Second(Monitor):
         RUNNER = "second"
 
-    a = Monitor(live_app, MemorySink(), embedded=False)
-    b = Second(live_app, MemorySink(), embedded=False)
+    a = Monitor(live_app, embedded=False)
+    b = Second(live_app, embedded=False)
     world.trade(WHALE, NOW - 3, COND, size=1500, price=0.42, usdc=630, feed=True)
     assert (await a.poll_once()).new_fills == 0, "nothing published yet, and a runner does not detect"
     await detector.poll_once(backstop=False)
@@ -147,17 +146,16 @@ async def test_two_runners_read_the_same_fills_each_from_its_own_cursor(live_app
 async def test_the_detector_process_writes_a_heartbeat_and_the_runner_reports_it_missing(live_app, fake_http, clock):
     import asyncio
     world, _ = setup(live_app, fake_http)
-    sink = MemorySink()
-    svc = Service(live_app, sink, with_detector=False)
+    svc = Service(live_app, with_detector=False)
     await svc._report_outage()
     await svc._report_outage()
-    assert [t for _, t in sink.posts if "detector is not running" in t] != [] and len(sink.posts) == 1
+    assert [t for t in svc.notices if "detector is not running" in t] != [] and len(svc.notices) == 1
 
     world.trade(WHALE, NOW - 3, COND, size=1500, price=0.42, usdc=630, feed=True)
     await run_detector(live_app, asyncio.Event(), cycles=1)
     assert live_app.db.get_state(DETECTOR_HEARTBEAT_KEY) == clock.now and len(events(live_app)) == 1
     await svc._report_outage()
-    assert "detector is running again" in sink.posts[-1][1]
+    assert "detector is running again" in svc.notices[-1]
     stats = await svc.monitor.poll_once()
     assert stats.alerts == 1, "the runner acted on what the detector process published"
     assert fake_http.count("/v2/activity") == 1, "only the detector polled; the runner made no detection calls"

@@ -441,7 +441,7 @@ def current_rows(app: App) -> list[dict[str, Any]]:
         run_id = row["last_review_run_id"] or row["added_run_id"]
         snap = app.db.one("SELECT * FROM wallet_score_snapshots WHERE run_id = ? AND wallet = ?", (run_id, wallet))
         events, clv = live_record(app, wallet)
-        alerts = app.db.one("SELECT COUNT(*) n FROM alerts WHERE wallet = ? AND status IN ('POSTED', 'UNSENT')",
+        alerts = app.db.one("SELECT COUNT(*) n FROM alerts WHERE wallet = ? AND status IN ('RECORDED', 'POSTED', 'UNSENT')",
                             (wallet,))["n"]
         failing = json.loads(row["last_review"] or "[]")
         if row["fail_streak"]:

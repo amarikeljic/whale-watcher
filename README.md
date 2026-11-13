@@ -1,19 +1,21 @@
 # Whale Watcher
 
-Finds Polymarket wallets that look consistently profitable, alerts in Discord
+Finds Polymarket wallets that look consistently profitable, records an alert
 when one of them opens or adds to a position, and **paper trades every alert the
 way a bot would: against the live order book, seconds after the whale**, after
 fees, to answer one question: would copying them make money?
 
 Research tool. It **never places orders**, never asks for or stores wallet keys,
-seed phrases or trading credentials, and publishes no ports. It covers whale
+seed phrases or trading credentials, and publishes no ports. It **sends nothing
+to anyone**: every request it makes is a GET to a public market-data API, it has
+no secrets and needs no `.env`. Alerts and notices are rows in the database and
+lines in the log, read on the dashboard. It covers whale
 trades in every market category. Kalshi is used only to test copying the same
 alerts there (`backtest --kalshi`), with public market data and no key.
 
 ## Quick start (home server)
 
 ```bash
-cp .env.example .env              # add DISCORD_WEBHOOK_URL (and optionally DISCORD_STATS_WEBHOOK_URL)
 docker compose up -d --build
 docker compose logs -f
 ```
@@ -55,9 +57,9 @@ python -m whalewatcher dashboard                    # the web dashboard on 127.0
 python -m whalewatcher wallet show                  # the simulated small wallet: amount, runs, replay
 python -m whalewatcher wallet set 250               # change the amount (starts a new wallet run)
 python -m whalewatcher detector                     # watch trades, publish tracked wallets' fills (own container)
-python -m whalewatcher monitor [--no-post] [--cycles N] [--no-detector]   # the runner: alerts + the paper bot
+python -m whalewatcher monitor [--cycles N] [--no-detector]   # the runner: alerts + the paper bot
 python -m whalewatcher settle
-python -m whalewatcher stats [--post]
+python -m whalewatcher stats [--brief]              # the full report, or the short daily summary
 python -m whalewatcher export --csv exports/paper_trades.csv
 python -m whalewatcher health                        # Docker healthcheck
 ```
@@ -138,7 +140,8 @@ Runners read `fill_events` from their own cursor, so the APIs are asked once
 and every runner sees identical timing. Detector and runner are **separate
 containers**: one crashing or restarting never stops the other, the detector
 keeps publishing while the runner is down, and the runner resumes where it
-stopped. The runner says so in Discord if the detector's heartbeat goes stale.
+stopped. The runner logs it, and the Health page shows it, if the detector's
+heartbeat goes stale.
 The nightly review runs as a child process so the bot never freezes for it.
 
 *The fill.* When a buy group crosses the alert threshold, the bot reads the
@@ -429,11 +432,12 @@ nothing depends on it yet.
    skipped after one page. Neg-risk conversions cannot be attributed from the
    API rows, so markets that contain them are excluded, and so is any wallet
    with too many such markets (`max_unreliable_market_share`).
-7. **Grouping without latency.** Alerts post when a group crosses the threshold
-   instead of waiting out the window, and later fills edit the message.
+7. **Grouping without latency.** An alert is made when a group crosses the
+   threshold instead of waiting out the window, and later fills update its text.
 8. **Skipped alerts are not paper traded.** "Every alert produces one paper
-   trade" applies to alerts actually sent. With no webhook configured, alerts
-   are stored as UNSENT and are still paper traded (useful for dry runs).
+   trade" applies to alerts actually made (status `RECORDED`). Alerts are not
+   sent anywhere. Rows marked `POSTED` or `UNSENT` date from when they were also
+   posted to a chat webhook, which was removed on 2026-11-13.
 9. **Wallet P&L can be off by taker fees.** Activity rows do not say maker or
    taker. The error is at most about 1.75% of notional. Paper trades compute
    fees exactly.
@@ -801,7 +805,5 @@ Today's live pool, for comparison (`python -m whalewatcher consensus`):
   history fetched before this fix may be missing a few such fills.
 * Positions opened more than `entry_lookback_days` before the lookback window
   and held to resolution without any later activity are invisible to scoring.
-* Discord's webhook endpoints could not be re-read from the build sandbox. They
-  follow the published API, and the tests mock them.
 
 *Research and education only. Not financial advice.*

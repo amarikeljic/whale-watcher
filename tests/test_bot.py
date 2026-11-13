@@ -11,7 +11,6 @@ import pytest
 from conftest import DAY, NOW
 from whalewatcher.bot import Bot, walk_bids
 from whalewatcher.db import SCHEMA_VERSION, Database
-from whalewatcher.discord import MemorySink
 from whalewatcher.monitor import Monitor
 from whalewatcher.paper import PaperEngine, walk_asks
 from whalewatcher.polymarket import Book
@@ -39,7 +38,7 @@ def setup(app, fake_http, *, asks=((0.44, 1000), (0.45, 1000)), bids=((0.42, 500
         app.db.execute("INSERT INTO monitored_wallets (wallet, run_id, rank, active, added_at, last_seen_ts) "
                        "VALUES (?, 1, ?, 1, ?, ?)", (w, i, NOW - 3600, NOW - 120))
     bot = Bot(app)
-    monitor = Monitor(app, MemorySink(), paper=PaperEngine(app), bot=bot)
+    monitor = Monitor(app, paper=PaperEngine(app), bot=bot)
     return world, monitor, bot
 
 
@@ -136,7 +135,7 @@ async def test_a_signal_seen_too_late_is_a_miss_for_the_bot(live_app, fake_http,
     world, monitor, bot = setup(live_app, fake_http)
     world.trade(WHALE, NOW - 120, COND, size=1500, price=0.42, usdc=630)       # only the backstop sees it
     await monitor.poll_once()
-    assert live_app.db.one("SELECT status FROM alerts")["status"] == "POSTED"
+    assert live_app.db.one("SELECT status FROM alerts")["status"] == "RECORDED"
     t = one(live_app, "flat_hold")
     assert t["status"] == "MISSED" and t["reason"] == "too late: 120s after the whale's fill (limit 30s)"
     assert t["human_due"] is None, "no comparison for a signal nobody could have acted on in time"

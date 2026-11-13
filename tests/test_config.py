@@ -32,13 +32,12 @@ def test_wrong_type_is_an_error(tmp_path):
         load(write(tmp_path, "scoring:\n  top_k: lots\n"), env={})
 
 
-def test_secrets_come_from_the_environment_only(tmp_path):
+def test_there_are_no_secrets_and_a_leftover_webhook_variable_is_ignored(tmp_path):
     cfg = load(write(tmp_path, "alerts:\n  min_price: 0.1\n"),
                env={"DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1/abc"})
     assert cfg.alerts.min_price == 0.1
-    assert cfg.discord_webhook_url.endswith("/abc")
-    assert "discord_webhook_url" not in cfg.public_dict()
-    assert "abc" not in repr(cfg)
+    assert not hasattr(cfg, "discord_webhook_url") and not hasattr(cfg, "discord_stats_webhook_url")
+    assert "abc" not in repr(cfg) and "abc" not in str(cfg.public_dict()), "an old .env cannot leak into anything"
 
 
 def test_the_shipped_config_file_loads():

@@ -221,14 +221,14 @@ CREATE TABLE IF NOT EXISTS alerts (
     whale_price      REAL NOT NULL,       -- VWAP of the group's fills
     fills            INTEGER NOT NULL,
     detected_at      INTEGER NOT NULL,    -- when this service saw the fill that crossed the threshold
-    posted_at        INTEGER,             -- when the webhook accepted it (NULL if skipped / not posted)
-    status           TEXT NOT NULL,       -- POSTED | SKIPPED | UNSENT (no webhook) | FAILED
+    posted_at        INTEGER,             -- history only: set while alerts were also sent to a chat webhook
+    status           TEXT NOT NULL,       -- RECORDED | SKIPPED | FAILED (history: POSTED, UNSENT)
     skip_reason      TEXT,
     alert_best_ask   REAL,
     alert_best_bid   REAL,
     alert_book_ts    INTEGER,
     snapshot_run_id  INTEGER,             -- score run current when the alert fired
-    discord_message_id TEXT,
+    discord_message_id TEXT,              -- history only, never written since 2026-11-13
     message          TEXT,
     updated_at       INTEGER NOT NULL,
     membership_id    INTEGER,             -- watchlist_membership row the wallet was on when the alert fired

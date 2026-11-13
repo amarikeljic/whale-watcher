@@ -694,10 +694,11 @@ def export_bot_csv(app: App, path: str) -> int:
 
 
 def daily_summary(app: App) -> str:
-    """The short version for the stats webhook (Discord cuts a message at 2,000
-    characters). Per runner: net P&L with its n and interval, where the money went,
-    what the time-to-close cutoff skipped, and the small wallet. The full report is
-    ``stats`` and the dashboard."""
+    """The short version: what `stats --brief` prints and what the runner writes to
+    its log once a day. Per runner: net P&L with its n and interval, where the money
+    went, what the time-to-close cutoff skipped, and the small wallet. Kept under
+    2,000 characters so it stays one screen. The full report is ``stats`` and the
+    dashboard."""
     from . import bankroll
     bots = load_bot_trades(app)
     if not bots:        # only old-rule or simulated trades: the old short report

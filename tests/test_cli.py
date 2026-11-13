@@ -1,5 +1,7 @@
 """The command line parses what the README documents and fails cleanly on bad input."""
 
+import pytest
+
 from whalewatcher.cli import build_parser, main
 
 
@@ -9,8 +11,10 @@ def test_documented_commands_parse():
     assert (a.command, a.as_of, a.show) == ("score", "2026-11-01", 25)
     a = p.parse_args(["validate", "--as-of", "2026-11-01", "--holdout-months", "2", "--rank-by", "clv_markout"])
     assert (a.command, a.holdout_months, a.rank_by) == ("validate", 2, "clv_markout")
-    assert p.parse_args(["monitor", "--no-post", "--cycles", "3"]).cycles == 3
-    assert p.parse_args(["stats", "--post"]).post
+    assert p.parse_args(["monitor", "--cycles", "3"]).cycles == 3
+    with pytest.raises(SystemExit):
+        p.parse_args(["monitor", "--no-post"])          # the flag left with the chat webhook
+    assert p.parse_args(["stats", "--brief"]).brief
     assert p.parse_args(["export", "--csv", "x.csv"]).csv == "x.csv"
     assert p.parse_args(["health"]).command == "health"
 

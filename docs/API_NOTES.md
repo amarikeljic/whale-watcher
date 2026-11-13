@@ -108,13 +108,6 @@ Sports markets that are drawn, ruled no contest, cancelled or postponed past a
 deadline resolve **"50-50"**: each share pays $0.50 (`payouts [500000, 500000]`).
 That is not a refund.
 
-## Discord webhooks
-
-discord.com was not reachable from the build sandbox; these follow Discord's
-published webhook API (Execute Webhook with `?wait=true` to get the message id;
-Edit Webhook Message via `PATCH {url}/messages/{id}`; 429s carry `retry_after`
-in the body). Verify on first deployment.
-
 ## Kalshi (backtest cross-venue copies only)
 
 Used by `backtest --kalshi` to copy Polymarket alerts on the same game on Kalshi.

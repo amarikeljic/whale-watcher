@@ -8,7 +8,7 @@ Nothing listens on any port. Two processes share the database (v2 Phase 3):
 
     every settle_interval_seconds settle resolved paper trades
     nightly at rescore.hour_utc   rescore with data up to today, review the watchlist (watchlist.py)
-    daily at daily_summary_hour   post the stats summary to the stats webhook
+    daily at daily_summary_hour   write the short summary to the log (also: `stats --brief`)
 
 They are separate containers so that one crashing, restarting or pausing never
 stops the other: the detector keeps publishing while a runner is down, and the
@@ -27,6 +27,7 @@ import logging
 import signal
 import sys
 import time
+from collections import deque
 
 from . import bankroll
 from .app import App, open_app
@@ -35,7 +36,6 @@ from .config import Config
 from .costs import recalculate
 from .detector import HEARTBEAT_KEY as DETECTOR_HEARTBEAT_KEY
 from .detector import Detector
-from .discord import DiscordWebhook, NullSink, Sink
 from .monitor import DATA_HOST, Monitor
 from .paper import PaperEngine
 from .stats import daily_summary, export_bot_csv, export_csv, render
@@ -63,11 +63,14 @@ class Service:
     """The `single` runner and the housekeeping. ``with_detector`` also runs the
     detector in this process; False means a separate detector process publishes."""
 
-    def __init__(self, app: App, sink: Sink, stats_sink: Sink | None = None, *, with_detector: bool = True,
-                 review_in_subprocess: bool = False, config_path: str | None = None) -> None:
+    def __init__(self, app: App, *, with_detector: bool = True, review_in_subprocess: bool = False,
+                 config_path: str | None = None) -> None:
         self.app = app
-        self.sink = sink
-        self.stats_sink = stats_sink
+        # Things the owner should know (an outage, a stopped detector, an empty
+        # watchlist). They go to the log, which `docker logs` shows, and the Health
+        # page shows the same state. Nothing is sent anywhere. The most recent are
+        # kept here for the tests.
+        self.notices: deque[str] = deque(maxlen=50)
         self.with_detector = with_detector
         # The nightly review scores hundreds of wallets: minutes of work, some of it
         # pure computation that would freeze this loop, and a bot that is frozen
@@ -79,7 +82,7 @@ class Service:
         self._review_task: asyncio.Task | None = None
         self.paper = PaperEngine(app)            # settles the pre-v3 paper trades; opens no new ones
         self.bot = Bot(app, Monitor.RUNNER)
-        self.monitor = Monitor(app, sink, paper=self.paper, bot=self.bot, embedded=with_detector)
+        self.monitor = Monitor(app, paper=self.paper, bot=self.bot, embedded=with_detector)
         self.stop = asyncio.Event()
         self._outage_reported: str | None = None
         self._detector_down = False
@@ -157,8 +160,8 @@ class Service:
         app.db.set_state("empty_notice_run", run_id)
         run = app.db.one("SELECT n_candidates FROM score_runs WHERE id = ?", (run_id,))
         n = run["n_candidates"] if run else 0
-        await (self.stats_sink or self.sink).post(
-            f"⚠ Whale Watcher: no wallet meets the watchlist entry rules (snapshot #{run_id}, {n} candidates), "
+        self.notice(
+            f"no wallet meets the watchlist entry rules (snapshot #{run_id}, {n} candidates), "
             "so nothing is being monitored and no alerts will fire. Loosen watchlist.entry in config.yaml or "
             "wait for a wallet to qualify; see `python -m whalewatcher watchlist --last` for why.")
 
@@ -216,24 +219,23 @@ class Service:
                     self._review_task = asyncio.create_task(self._review_in_child())
             else:
                 await self._rescore()
-        if (self.stats_sink is not None and app.db.get_state("last_summary_day") != today
-                and dt.hour >= cfg.stats.daily_summary_hour_utc):
+        if app.db.get_state("last_summary_day") != today and dt.hour >= cfg.stats.daily_summary_hour_utc:
             app.db.set_state("last_summary_day", today)
-            await self.stats_sink.post(f"📊 Whale Watcher daily summary ({today} UTC)\n```\n"
-                                       f"{daily_summary(app)}\n```")
+            log.info("daily summary (%s UTC):\n%s", today, daily_summary(app))
+
+    def notice(self, text: str, *, good: bool = False) -> None:
+        self.notices.append(text)
+        (log.info if good else log.error)("%s", text)
 
     async def _report_outage(self) -> None:
         problem = self.app.http.outage(DATA_HOST)
-        target = self.stats_sink or self.sink
         if problem and self._outage_reported is None:
             self._outage_reported = problem
-            log.error("outage: %s", problem)
-            await target.post(f"⚠ Whale Watcher: Polymarket data is unreachable. {problem}. "
-                              "Alerts and paper fills are paused until it answers again.")
+            self.notice(f"Polymarket data is unreachable. {problem}. Alerts and paper fills are paused until it "
+                        "answers again.")
         elif problem is None and self._outage_reported is not None:
             self._outage_reported = None
-            log.info("outage over")
-            await target.post("✅ Whale Watcher: Polymarket data is answering again.")
+            self.notice("Polymarket data is answering again.", good=True)
         # The detector is a separate process: if it stops, nothing is detected and
         # silence would look exactly like a quiet market.
         if self.with_detector:
@@ -245,12 +247,11 @@ class Service:
         warming_up = beat is None and time.monotonic() - self._started < self.detector_grace
         if stale and not self._detector_down and not warming_up:
             self._detector_down = True
-            log.error("detector heartbeat is stale (%s): no fills are being detected", iso(beat))
-            await target.post("⚠ Whale Watcher: the detector is not running (last heartbeat "
-                              f"{iso(beat)}). No whale fills are being detected until it is back.")
+            self.notice(f"the detector is not running (last heartbeat {iso(beat)}). No whale fills are being "
+                        "detected until it is back.")
         elif not stale and self._detector_down:
             self._detector_down = False
-            await target.post("✅ Whale Watcher: the detector is running again.")
+            self.notice("the detector is running again.", good=True)
 
 
 async def run_detector(app: App, stop: asyncio.Event, *, cycles: int | None = None) -> None:
@@ -290,17 +291,6 @@ async def run_detector(app: App, stop: asyncio.Event, *, cycles: int | None = No
     log.info("detector stopped after %d steps", done)
 
 
-def _sinks(app: App, *, post: bool) -> tuple[Sink, Sink | None]:
-    cfg = app.cfg
-    if not post or not cfg.discord_webhook_url:
-        sink: Sink = NullSink()
-    else:
-        sink = DiscordWebhook(app.http, cfg.discord_webhook_url)
-    stats_sink = (DiscordWebhook(app.http, cfg.discord_stats_webhook_url)
-                  if post and cfg.discord_stats_webhook_url else None)
-    return sink, stats_sink
-
-
 async def run_command(args, cfg: Config) -> int:
     async with open_app(cfg) as app:
         if args.command in ("monitor", "detector"):
@@ -314,11 +304,8 @@ async def run_command(args, cfg: Config) -> int:
             if args.command == "detector":
                 await run_detector(app, stop, cycles=args.cycles)
                 return 0
-            sink, stats_sink = _sinks(app, post=not args.no_post)
-            if isinstance(sink, NullSink):
-                log.warning("no Discord webhook in use: alerts are stored as UNSENT and still paper traded")
-            service = Service(app, sink, stats_sink, with_detector=not args.no_detector,
-                              review_in_subprocess=True, config_path=args.config)
+            service = Service(app, with_detector=not args.no_detector, review_in_subprocess=True,
+                              config_path=args.config)
             service.stop = stop
             await service.run(cycles=1 if args.once else args.cycles)
             return 0
@@ -328,14 +315,7 @@ async def run_command(args, cfg: Config) -> int:
             print(f"settled {n} old-rule paper trades and {m} bot trades")
             return 0
         if args.command == "stats":
-            text = render(app)
-            print(text)
-            if args.post:
-                _, stats_sink = _sinks(app, post=True)
-                if stats_sink is None:
-                    print("no DISCORD_STATS_WEBHOOK_URL set; not posted")
-                else:
-                    await stats_sink.post(f"📊 Whale Watcher stats\n```\n{daily_summary(app)}\n```")
+            print(daily_summary(app) if args.brief else render(app))
             return 0
         if args.command == "export":
             n = export_csv(app, args.csv)

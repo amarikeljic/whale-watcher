@@ -11,7 +11,6 @@ from conftest import DAY, NOW
 from whalewatcher import watchlist as wl
 from whalewatcher.config import Config, ConfigError, validate
 from whalewatcher.db import SCHEMA_VERSION, Database
-from whalewatcher.discord import MemorySink
 from whalewatcher.http import HttpError
 from whalewatcher.service import Service
 from world import FakeMarket, World
@@ -340,7 +339,7 @@ async def test_an_alert_records_its_membership_probation_and_snapshot(live_app, 
     bets(world, GOOD, wins=4, losses=0, start=NOW - 20 * DAY)
     review = await wl.nightly(live_app)
     member = rows(live_app, GOOD)[0]
-    svc = Service(live_app, MemorySink())
+    svc = Service(live_app)
 
     async def alert_now(cond: str):
         world.add_market(FakeMarket(cond, end_date=clock.now + 30 * DAY))

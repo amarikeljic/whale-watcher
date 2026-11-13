@@ -390,11 +390,10 @@ async def test_a_skipped_signal_gets_its_result_so_the_wallet_can_have_taken_it(
 
 
 async def test_the_runner_notices_a_new_amount_and_the_reports_show_the_wallet(live_app, fake_http, clock):
-    from whalewatcher.discord import MemorySink
     from whalewatcher.service import Service
     from whalewatcher.stats import daily_summary, render
     await whale_buy(live_app, fake_http)
-    svc = Service(live_app, MemorySink())
+    svc = Service(live_app)
     svc._sync_wallet()
     assert br.open_run(live_app.db, "single")["amount"] == 100.0
     br.save_amount(live_app.db, 250, "dashboard", clock.now)

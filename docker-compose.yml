@@ -7,13 +7,12 @@
 # Separate so that one crashing or restarting never stops the others: the detector
 # keeps publishing while the runner is down, and the runner resumes from its cursor.
 # The detector and the runner have no `ports:`. They only make outbound HTTPS
-# requests (Polymarket's read-only APIs, the Discord webhook) and nothing listens.
+# GET requests to Polymarket's public read-only APIs. They send nothing and nothing listens.
 # The dashboard is the only thing that listens, and only on this machine's 127.0.0.1.
 x-common: &common
   build: .
   image: whale-watcher
   restart: unless-stopped
-  env_file: .env
   volumes:
     - ./data:/app/data
     - ./config.yaml:/app/config.yaml:ro

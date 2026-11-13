@@ -1,4 +1,4 @@
-"""Configuration: one YAML file for settings, the environment (.env) for secrets.
+"""Configuration: one YAML file for settings. There are no secrets: nothing to put in a .env.
 
 Unknown keys are an error rather than silently ignored, because a typo in a
 threshold ("min_settled_market: 5") would otherwise leave the default in place
@@ -296,16 +296,11 @@ class Config:
     filters: FiltersConfig = field(default_factory=FiltersConfig)
     bankroll: BankrollConfig = field(default_factory=BankrollConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
-    # Secrets, from the environment only.
-    discord_webhook_url: str | None = field(default=None, repr=False)
-    discord_stats_webhook_url: str | None = field(default=None, repr=False)
 
     def public_dict(self) -> dict[str, Any]:
-        """Everything except secrets, for storing alongside a score run."""
-        data = dataclasses.asdict(self)
-        data.pop("discord_webhook_url", None)
-        data.pop("discord_stats_webhook_url", None)
-        return data
+        """The whole configuration, for storing alongside a score run. There are no
+        secrets in it: this service has none (no keys, no tokens, nothing it sends to)."""
+        return dataclasses.asdict(self)
 
 
 class ConfigError(ValueError):
@@ -487,7 +482,5 @@ def load(path: str | os.PathLike | None = None, *, env: dict[str, str] | None = 
     if env.get("WHALEWATCHER_DB"):
         cfg.database_path = env["WHALEWATCHER_DB"]
 
-    cfg.discord_webhook_url = (env.get("DISCORD_WEBHOOK_URL") or "").strip() or None
-    cfg.discord_stats_webhook_url = (env.get("DISCORD_STATS_WEBHOOK_URL") or "").strip() or None
     validate(cfg)
     return cfg

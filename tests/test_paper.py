@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from conftest import NOW
-from whalewatcher.discord import MemorySink
 from whalewatcher.fees import polymarket_taker_fee
 from whalewatcher.monitor import Monitor
 from whalewatcher.paper import PaperEngine, settle_values, walk_asks
@@ -40,7 +39,7 @@ def world_with_alert(app, fake_http, *, fee_rate=0.05, asks=((0.44, 1000),)):
     app.db.execute("INSERT INTO monitored_wallets (wallet, run_id, rank, active, added_at, last_seen_ts) "
                    "VALUES (?, 1, 1, 1, ?, ?)", (WHALE, NOW - 3600, NOW - 120))
     world.trade(WHALE, NOW - 20, COND, size=1500, price=0.42, usdc=630)
-    return world, Monitor(app, MemorySink(), paper=PaperEngine(app))
+    return world, Monitor(app, paper=PaperEngine(app))
 
 
 async def test_fill_happens_on_the_next_poll_at_the_book_price_then(live_app, fake_http, clock):
@@ -92,7 +91,7 @@ async def test_every_posted_alert_gets_exactly_one_filled_or_missed_record(live_
     for _ in range(3):
         clock.advance(60)
         await monitor.poll_once()
-    posted = live_app.db.query("SELECT id FROM alerts WHERE status = 'POSTED'")
+    posted = live_app.db.query("SELECT id FROM alerts WHERE status = 'RECORDED'")
     trades = live_app.db.query("SELECT alert_id, status FROM paper_trades")
     assert len(posted) == 2 and len(trades) == 2
     assert sorted(t["alert_id"] for t in trades) == sorted(a["id"] for a in posted)

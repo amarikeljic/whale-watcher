@@ -238,11 +238,11 @@ class HttpClient:
         finally:
             self._inflight.pop(full, None)
 
-    async def send_json(self, method: str, url: str, body: dict[str, Any]) -> Any:
-        """POST/PATCH JSON (Discord webhooks). Same retry rules as GET."""
-        return await self._request(method, url, body=body)
-
-    async def _request(self, method: str, url: str, *, body: dict[str, Any] | None = None) -> Any:
+    async def _request(self, method: str, url: str) -> Any:
+        """GET only. This client has no way to send a body: the service reads public
+        data and sends nothing to anyone."""
+        if method != "GET":
+            raise ValueError("this service only reads: GET is the only request it makes")
         if self._session is None:
             await self.start()
         parts = urlsplit(url)
@@ -259,10 +259,7 @@ class HttpClient:
             try:
                 async with self.semaphore:
                     self.requests_made += 1
-                    kwargs: dict[str, Any] = {"headers": headers}
-                    if body is not None:
-                        kwargs["json"] = body
-                    async with self._session.request(method, url, **kwargs) as resp:
+                    async with self._session.request("GET", url, headers=headers) as resp:
                         status = resp.status
                         text = await resp.text()
                         resp_headers = resp.headers
@@ -329,7 +326,7 @@ def _retry_after(headers: Any, text: str) -> float | None:
             return float(value)
         except ValueError:
             return None
-    # Discord puts it in the JSON body as seconds.
+    # Some APIs put it in the JSON body as seconds.
     if text and "retry_after" in text:
         try:
             return float(json.loads(text).get("retry_after"))

@@ -11,8 +11,6 @@ import sys
 from collections import Counter
 from collections.abc import Sequence
 
-from dotenv import load_dotenv
-
 from . import config as config_mod
 from .app import open_app
 from .scoring import WalletMetrics, run_scoring
@@ -504,20 +502,18 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "monitor":
             sp.add_argument("--once", action="store_true", help="one poll cycle, then exit")
             sp.add_argument("--cycles", type=int, help="stop after this many poll cycles")
-            sp.add_argument("--no-post", action="store_true", help="never post to Discord (dry run)")
             sp.add_argument("--no-detector", action="store_true",
                             help="do not detect in this process: a separate `detector` process publishes the fills")
         if name == "health":
             sp.add_argument("--detector", action="store_true", help="check the detector's heartbeat instead")
         if name == "stats":
-            sp.add_argument("--post", action="store_true", help="also post the summary to the stats webhook")
+            sp.add_argument("--brief", action="store_true", help="the short daily summary instead of the full report")
         if name == "export":
             sp.add_argument("--csv", default="exports/paper_trades.csv")
     return p
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    load_dotenv()
     _setup_logging()
     args = build_parser().parse_args(argv)
     try:

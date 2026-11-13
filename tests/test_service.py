@@ -5,7 +5,6 @@ themselves are tested in test_watchlist.py."""
 from __future__ import annotations
 
 from conftest import DAY, NOW
-from whalewatcher.discord import MemorySink
 from whalewatcher.service import HEARTBEAT_KEY, Service, rescore
 from world import FakeMarket, World
 
@@ -58,9 +57,9 @@ async def test_rescore_updates_the_watchlist_and_alerts_link_to_the_snapshot_in_
     world.set_book("0xlive-t0", [(0.50, 5000)])
     live_app.db.execute("UPDATE monitored_wallets SET last_seen_ts = ?", (clock.now - 120,))
     world.trade("0xbbbb", clock.now - 10, "0xlive", size=2000, price=0.49, usdc=980)
-    svc = Service(live_app, MemorySink())
+    svc = Service(live_app)
     await svc.monitor.poll_once()
-    alert = live_app.db.one("SELECT * FROM alerts WHERE status = 'POSTED'")
+    alert = live_app.db.one("SELECT * FROM alerts WHERE status = 'RECORDED'")
     assert alert["snapshot_run_id"] == second
     assert f"(snapshot #{second})" in alert["message"]
 
@@ -70,7 +69,7 @@ async def test_startup_rescore_counts_as_todays_rescore(live_app, fake_http, clo
     world = World(fake_http)
     world.leaderboard = [{"rank": 1, "user_id": "0xaaaa", "pnl": 1000, "volume": 1, "user_name": "a"}]
     history(world, "0xaaaa", win=True, start=NOW - 20 * DAY)
-    svc = Service(live_app, MemorySink())
+    svc = Service(live_app)
     await svc.run(cycles=2)
     runs = live_app.db.one("SELECT COUNT(*) n FROM score_runs WHERE kind = 'nightly'")["n"]
     assert runs == 1, "no second rescore straight after the first poll"
@@ -92,8 +91,7 @@ class FlakyHttp:
 
 async def test_outages_are_reported_once_and_recovery_once(live_app, fake_http):
     World(fake_http)
-    sink = MemorySink()
-    svc = Service(live_app, sink)
+    svc = Service(live_app)
     flaky = FlakyHttp(fake_http)
     live_app.http = flaky
     flaky.problem = "data-api.polymarket.com: 9 failed attempts over 12 min"
@@ -101,7 +99,7 @@ async def test_outages_are_reported_once_and_recovery_once(live_app, fake_http):
     await svc._report_outage()
     flaky.problem = None
     await svc._report_outage()
-    texts = [t for _, t in sink.posts]
+    texts = list(svc.notices)
     assert len(texts) == 2 and "unreachable" in texts[0] and "answering again" in texts[1]
 
 
@@ -118,7 +116,7 @@ async def test_a_failing_wallet_does_not_stop_the_cycle(live_app, fake_http, clo
         return original(params)
 
     fake_http.route("/v2/activity", activity)
-    svc = Service(live_app, MemorySink())
+    svc = Service(live_app)
     stats = await svc.monitor.poll_once()
     assert stats.errors == 1 and stats.wallets == 2
 
@@ -129,9 +127,8 @@ async def test_an_empty_monitored_set_is_announced_once(live_app, fake_http, clo
     world = World(fake_http)
     world.leaderboard = [{"rank": 1, "user_id": "0xaaaa", "pnl": 1000, "volume": 1, "user_name": "a"}]
     history(world, "0xaaaa", win=True, start=NOW - 20 * DAY)
-    sink = MemorySink()
-    svc = Service(live_app, sink)
+    svc = Service(live_app)
     await svc.run(cycles=1)
     await svc._rescore()          # the next night: still nobody
-    notices = [t for _, t in sink.posts if "no wallet meets the watchlist entry rules" in t]
+    notices = [t for t in svc.notices if "no wallet meets the watchlist entry rules" in t]
     assert len(notices) == 1 and "nothing is being monitored" in notices[0]

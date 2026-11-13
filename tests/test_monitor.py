@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import NOW
-from whalewatcher.discord import MemorySink, NullSink
+from conftest import NOW, Messages
 from whalewatcher.monitor import Monitor
 from whalewatcher.paper import PaperEngine
 from world import FakeMarket, World
@@ -15,16 +14,15 @@ COND = "0xm"
 YES, NO = f"{COND}-t0", f"{COND}-t1"
 
 
-def setup(app, fake_http, *, sink=None, book_asks=((0.44, 1000), (0.45, 1000))):
+def setup(app, fake_http, *, book_asks=((0.44, 1000), (0.45, 1000))):
     world = World(fake_http)
     world.add_market(FakeMarket(COND, end_date=NOW + 30 * 86400, question="Will A beat B?"))
     world.set_book(YES, list(book_asks), [(0.42, 500)])
     world.set_book(NO, [(0.58, 1000)], [(0.55, 500)])
     app.db.execute("INSERT INTO monitored_wallets (wallet, run_id, rank, active, added_at, last_seen_ts) "
                    "VALUES (?, 1, 1, 1, ?, ?)", (WHALE, NOW - 3600, NOW - 120))
-    sink = sink if sink is not None else MemorySink()
-    monitor = Monitor(app, sink, paper=PaperEngine(app))
-    return world, monitor, sink
+    monitor = Monitor(app, paper=PaperEngine(app))
+    return world, monitor, Messages(app)
 
 
 def alerts(app, status=None):
@@ -34,15 +32,16 @@ def alerts(app, status=None):
     return app.db.query(sql + " ORDER BY id")
 
 
-async def test_a_large_buy_posts_one_alert_with_all_timestamps(live_app, fake_http, clock):
+async def test_a_large_buy_makes_one_alert_with_all_timestamps(live_app, fake_http, clock):
     world, monitor, sink = setup(live_app, fake_http)
     world.trade(WHALE, NOW - 20, COND, size=1500, price=0.42, usdc=630)
     stats = await monitor.poll_once()
     assert stats.alerts == 1 and len(sink.posts) == 1
     (a,) = alerts(live_app)
-    assert a["status"] == "POSTED" and a["kind"] == "NEW"
+    assert a["status"] == "RECORDED" and a["kind"] == "NEW"
     assert a["first_fill_ts"] == NOW - 20, "whale trade time"
-    assert a["detected_at"] == NOW and a["posted_at"] == NOW, "detection and post time"
+    assert a["detected_at"] == NOW and a["posted_at"] is None and a["discord_message_id"] is None, \
+        "detected now, and sent nowhere"
     assert a["alert_best_ask"] == 0.44
     text = sink.posts[0][1]
     assert "bought YES" in text and "Whale price: 0.420" in text and "Current best ask: 0.440" in text
@@ -87,8 +86,7 @@ async def test_later_fills_in_the_window_edit_the_message_instead_of_posting(liv
     clock.advance(60)
     world.trade(WHALE, NOW + 40, COND, size=2000, price=0.43, usdc=860)
     await monitor.poll_once()
-    assert len(sink.posts) == 1 and len(sink.edits) == 1
-    assert "$1,490 (2 fills)" in sink.edits[0][1]
+    assert len(sink.posts) == 1 and "$1,490 (2 fills)" in sink.posts[0][1], "the alert's text is brought up to date"
     assert len(alerts(live_app)) == 1
 
 
@@ -98,7 +96,7 @@ async def test_overlapping_polls_never_duplicate(live_app, fake_http, clock):
     for _ in range(4):
         await monitor.poll_once()
         clock.advance(60)
-    assert len(sink.posts) == 1 and sink.edits == [] and len(alerts(live_app)) == 1
+    assert len(sink.posts) == 1 and len(alerts(live_app)) == 1
     assert live_app.db.one("SELECT COUNT(*) n FROM paper_trades")["n"] == 1
 
 
@@ -150,26 +148,42 @@ async def test_fills_that_surface_late_are_skipped_as_stale(live_app, fake_http,
     assert a["status"] == "SKIPPED" and a["skip_reason"].startswith("stale") and sink.posts == []
 
 
-async def test_without_a_webhook_alerts_are_unsent_and_still_paper_traded(live_app, fake_http, clock):
-    world, monitor, _ = setup(live_app, fake_http, sink=NullSink())
+async def test_an_alert_is_recorded_and_paper_traded_and_nothing_is_sent_anywhere(live_app, fake_http, clock):
+    world, monitor, _ = setup(live_app, fake_http)
     world.trade(WHALE, NOW - 20, COND, size=1500, price=0.42, usdc=630)
     await monitor.poll_once()
     (a,) = alerts(live_app)
-    assert a["status"] == "UNSENT" and a["posted_at"] is None
+    assert a["status"] == "RECORDED" and "bought YES" in a["message"]
     assert live_app.db.one("SELECT status FROM paper_trades")["status"] == "PENDING"
+    assert {method for method, _, _ in fake_http.calls} == {"GET"}, "every request the service made was a read"
+    hosts = {url for _, url, _ in fake_http.calls}
+    assert not any("discord" in h or "webhook" in h for h in hosts)
 
 
-class FailingSink(MemorySink):
-    async def post(self, content):
-        return None
+async def test_the_http_client_can_only_read():
+    from whalewatcher.http import HttpClient
+    client = HttpClient(user_agent="test", timeout=1.0, max_concurrency=1, rate_limits={})
+    assert not hasattr(client, "send_json") and not hasattr(client, "post")
+    for method in ("POST", "PATCH", "PUT", "DELETE"):
+        with pytest.raises(ValueError, match="only reads"):
+            await client._request(method, "https://example.invalid/x")
+    await client.close()
 
 
-async def test_a_failed_post_is_recorded_and_not_traded(live_app, fake_http, clock):
-    world, monitor, _ = setup(live_app, fake_http, sink=FailingSink())
-    world.trade(WHALE, NOW - 20, COND, size=1500, price=0.42, usdc=630)
-    await monitor.poll_once()
-    assert alerts(live_app)[0]["status"] == "FAILED"
-    assert live_app.db.one("SELECT COUNT(*) n FROM paper_trades")["n"] == 0
+def test_nothing_in_the_program_mentions_a_chat_webhook():
+    import pathlib
+    import whalewatcher
+    root = pathlib.Path(whalewatcher.__file__).parent
+    assert not (root / "discord.py").exists()
+    allowed = {"db.py", "monitor.py"}        # two comments that explain the history columns
+    for path in root.glob("*.py"):
+        text = path.read_text().lower()
+        if path.name not in allowed:
+            assert "discord" not in text and "webhook" not in text, path.name
+    for name in ("config.yaml", "docker-compose.yml", "requirements.txt", "Dockerfile"):
+        text = (root.parent / name).read_text().lower()
+        assert "discord" not in text and "webhook" not in text and "dotenv" not in text, name
+    assert not (root.parent / ".env.example").exists()
 
 
 async def test_score_line_says_when_a_wallet_could_not_be_scored(live_app, fake_http, clock):

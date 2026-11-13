@@ -24,13 +24,18 @@ from dataclasses import dataclass, field
 from .app import App
 from .bot import Bot
 from .detector import Detector
-from .discord import NullSink, Sink
 from .paper import PaperEngine
 from .polymarket import Activity, Book, MarketInfo
 from .timeutil import iso
 from .watchlist import membership_at
 
 log = logging.getLogger(__name__)
+
+# An alert that was made. RECORDED is the only status written today. POSTED and UNSENT
+# are history from when alerts were also sent to a chat webhook (removed 2026-11-13);
+# those rows, and their posted_at and discord_message_id columns, are kept as they are.
+RECORDED = "RECORDED"
+ALERTED = (RECORDED, "POSTED", "UNSENT")
 
 DATA_HOST = "data-api.polymarket.com"
 
@@ -123,10 +128,9 @@ class Monitor:
 
     RUNNER = "single"
 
-    def __init__(self, app: App, sink: Sink, *, paper: PaperEngine | None = None, bot: Bot | None = None,
+    def __init__(self, app: App, *, paper: PaperEngine | None = None, bot: Bot | None = None,
                  embedded: bool = True, max_alert_age_seconds: int | None = None) -> None:
         self.app = app
-        self.sink = sink
         self.paper = paper
         self.bot = bot
         self.embedded = embedded
@@ -270,22 +274,23 @@ class Monitor:
                     "UPDATE alerts SET status = 'FAILED', skip_reason = ?, detected_at = ?, trigger_fill_ts = ?, "
                     "updated_at = ? WHERE id = ?", (f"error: {exc}"[:300], now, fill.ts, now, alert_id))
                 return "failed"
-        if alert["status"] == "POSTED" and alert["discord_message_id"]:
+        if alert["status"] in ALERTED:
+            # More fills joined an alert already made: its text is brought up to date.
             market = app.markets.get(alert["condition_id"])
             message = format_alert(app, alert, market, run_id=alert["snapshot_run_id"], lag=lag,
                                    bot_line=bot_line(app, alert_id, self.RUNNER) if self.bot else None)
-            if await self.sink.edit(alert["discord_message_id"], message):
-                app.db.execute("UPDATE alerts SET message = ? WHERE id = ?", (message, alert_id))
+            app.db.execute("UPDATE alerts SET message = ? WHERE id = ?", (message, alert_id))
             return "edit"
         return "grouped"
 
     async def _trigger(self, alert, fill: Activity, counter: int, lag: int | None, *,
                        detected_at: float | None = None) -> str:
-        """The group just crossed the threshold: decide, paper trade, record, post.
+        """The group just crossed the threshold: decide, paper trade, record.
 
         Order matters for latency. The bot acts first, on the order book read at this
-        instant; the slower things a bot would not wait for (the whale's position
-        lookup, the Discord post) come after."""
+        instant; the slower thing a bot would not wait for (the whale's position
+        lookup) comes after. Nothing is sent anywhere: an alert is a row in the
+        database and a line in the log, read on the dashboard."""
         app = self.app
         now = app.clock()
         detected_at = float(now) if detected_at is None else detected_at
@@ -333,22 +338,13 @@ class Monitor:
                            (reason, message, alert["id"]))
             log.info("alert %s skipped: %s", alert["id"], reason)
             return "skipped"
-        message_id = await self.sink.post(message)
-        posted_at = app.clock()
-        if message_id:
-            status = "POSTED"
-        elif isinstance(self.sink, NullSink):
-            status, posted_at = "UNSENT", None
-        else:
-            status, posted_at = "FAILED", None
-        app.db.execute("UPDATE alerts SET status = ?, posted_at = ?, discord_message_id = ?, message = ? WHERE id = ?",
-                       (status, posted_at, message_id, message, alert["id"]))
-        log.info("alert %s %s:\n%s", alert["id"], status, message)
+        app.db.execute("UPDATE alerts SET status = ?, message = ? WHERE id = ?", (RECORDED, message, alert["id"]))
+        log.info("alert %s:\n%s", alert["id"], message)
         # Before v3 every alert got one human-delay paper trade. With the bot running
         # that rule lives on as the bot's human_* comparison columns instead.
-        if self.bot is None and status in ("POSTED", "UNSENT") and self.paper is not None and market is not None:
+        if self.bot is None and self.paper is not None and market is not None:
             self.paper.open(alert["id"], poll_counter=counter, market=market)
-        return "alert" if status != "FAILED" else "failed"
+        return "alert"
 
     def _skip_reason(self, alert, fill: Activity, market: MarketInfo | None, book: Book | None, now: int) -> str | None:
         cfg = self.cfg

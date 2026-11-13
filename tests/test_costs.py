@@ -9,7 +9,6 @@ from conftest import DAY, NOW, market
 from whalewatcher import costs, fees
 from whalewatcher.bot import Bot
 from whalewatcher.config import Config, ConfigError, FeesConfig, validate
-from whalewatcher.discord import MemorySink
 from whalewatcher.monitor import Monitor
 from whalewatcher.paper import PaperEngine
 from whalewatcher.stats import render
@@ -87,7 +86,7 @@ def setup(app, fake_http, *, asks, bids=((0.48, 5000),), fee_rate=0.05):
     app.db.execute("INSERT INTO monitored_wallets (wallet, run_id, rank, active, added_at, last_seen_ts) "
                    "VALUES (?, 1, 1, 1, ?, ?)", (WHALE, NOW - 3600, NOW - 120))
     bot = Bot(app)
-    return world, Monitor(app, MemorySink(), paper=PaperEngine(app), bot=bot), bot
+    return world, Monitor(app, paper=PaperEngine(app), bot=bot), bot
 
 
 def one(app, strategy="flat_hold"):

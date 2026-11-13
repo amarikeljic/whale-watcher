@@ -19,7 +19,8 @@ DAY = 86_400
 
 
 class FakeHttp:
-    """Routes ``get_json``/``send_json`` by URL path to handlers; records every call."""
+    """Routes ``get_json`` by URL path to handlers; records every call. There is no way
+    to send anything: the real client has none either."""
 
     def __init__(self) -> None:
         self.routes: dict[tuple[str, str], Callable[[dict[str, Any]], Any]] = {}
@@ -40,9 +41,6 @@ class FakeHttp:
     async def get_json(self, url: str, params: dict[str, Any] | None = None, *, ttl: float = 0) -> Any:
         return self._dispatch("GET", url, dict(params or {}))
 
-    async def send_json(self, method: str, url: str, body: dict[str, Any]) -> Any:
-        return self._dispatch(method, url, body)
-
     def _dispatch(self, method: str, url: str, params: dict[str, Any]) -> Any:
         path = urlsplit(url).path
         self.calls.append((method, path, params))
@@ -53,6 +51,18 @@ class FakeHttp:
 
     def count(self, path: str) -> int:
         return sum(1 for _, p, _ in self.calls if p == path)
+
+
+class Messages:
+    """What the alerts made so far say, read from the database. They go nowhere else."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    @property
+    def posts(self) -> list[tuple[str, str]]:
+        return [(str(r["id"]), r["message"]) for r in self.app.db.query(
+            "SELECT id, message FROM alerts WHERE status = 'RECORDED' ORDER BY id")]
 
 
 @pytest.fixture

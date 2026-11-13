@@ -10,7 +10,6 @@ from test_bot import COND, WHALE, YES, one, trades
 from whalewatcher.bot import Bot
 from whalewatcher.config import ConfigError, FiltersConfig
 from whalewatcher.config import load as load_config
-from whalewatcher.discord import MemorySink
 from whalewatcher.horizon import BUCKETS, NO_END_DATE, TOO_LONG, bucket, close_skip, days_to_close, scheduled_end
 from whalewatcher.monitor import Monitor
 from whalewatcher.paper import PaperEngine
@@ -96,7 +95,7 @@ def setup(app, fake_http, end_date):
     app.db.execute("INSERT INTO monitored_wallets (wallet, run_id, rank, active, added_at, last_seen_ts) "
                    "VALUES (?, 1, 1, 1, ?, ?)", (WHALE, NOW - 3600, NOW - 120))
     bot = Bot(app)
-    return world, Monitor(app, MemorySink(), paper=PaperEngine(app), bot=bot), bot
+    return world, Monitor(app, paper=PaperEngine(app), bot=bot), bot
 
 
 async def signal(world, monitor):
