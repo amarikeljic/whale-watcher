@@ -208,6 +208,20 @@ class FiltersConfig:
     skip_if_no_end_date: bool = True         # a market with no scheduled end could tie money up for ever
 
 
+@dataclass
+class BankrollConfig:
+    """v2.1 Part 2: the simulated small wallet (bankroll.py). The amount itself is not
+    here: it is the one setting the dashboard may change, kept in the settings table."""
+    deploy_fraction: float = 0.8          # share of equity the wallet is willing to have in positions
+    max_open_positions: int = 10          # stake = equity x deploy_fraction / this
+    # Our own floor. Polymarket's real minimum is per market and in shares
+    # (min_order_size on GET /book, 5 on every book sampled 2026-11-12;
+    # https://docs.polymarket.com/trading/place-orders.md); the wallet applies both.
+    min_order_usd: float = 1.0
+    max_per_event_fraction: float = 0.2   # of equity, at cost, in one event
+    mark_interval_seconds: int = 300      # how often open positions' best bids are recorded
+
+
 def _fee_table() -> list[dict[str, Any]]:
     # https://docs.polymarket.com/trading/fees.md, table read 2026-11-10. `from` is the
     # day a table took effect; add a new entry when Polymarket changes its fees and
@@ -280,6 +294,7 @@ class Config:
     consensus: ConsensusConfig = field(default_factory=ConsensusConfig)
     fees: FeesConfig = field(default_factory=FeesConfig)
     filters: FiltersConfig = field(default_factory=FiltersConfig)
+    bankroll: BankrollConfig = field(default_factory=BankrollConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
     # Secrets, from the environment only.
     discord_webhook_url: str | None = field(default=None, repr=False)
@@ -310,6 +325,7 @@ _SECTIONS = {
     "consensus": ConsensusConfig,
     "fees": FeesConfig,
     "filters": FiltersConfig,
+    "bankroll": BankrollConfig,
     "api": ApiConfig,
 }
 
@@ -386,6 +402,22 @@ def validate(cfg: Config) -> None:
     fe = cfg.fees
     if fe.rate_source not in ("market", "table", "higher"):
         raise ConfigError("fees.rate_source must be market, table or higher")
+    br = cfg.bankroll
+    if not 0 < br.deploy_fraction <= 1:
+        raise ConfigError("bankroll.deploy_fraction must be above 0 and at most 1")
+    if br.max_open_positions < 1:
+        raise ConfigError("bankroll.max_open_positions must be at least 1")
+    if br.min_order_usd <= 0:
+        raise ConfigError("bankroll.min_order_usd must be above 0")
+    if not 0 < br.max_per_event_fraction <= 1:
+        raise ConfigError("bankroll.max_per_event_fraction must be above 0 and at most 1")
+    if br.deploy_fraction / br.max_open_positions > br.max_per_event_fraction + 1e-12:
+        raise ConfigError(
+            f"bankroll: each stake would be {br.deploy_fraction / br.max_open_positions:.0%} of equity "
+            f"(deploy_fraction / max_open_positions) but max_per_event_fraction allows {br.max_per_event_fraction:.0%}: "
+            "no trade could ever be taken")
+    if br.mark_interval_seconds < 30:
+        raise ConfigError("bankroll.mark_interval_seconds must be at least 30")
     fl = cfg.filters
     if fl.max_days_to_close is not None and not 0 < fl.max_days_to_close <= 3650:
         raise ConfigError("filters.max_days_to_close must be a number of days above 0 (or null for no limit)")

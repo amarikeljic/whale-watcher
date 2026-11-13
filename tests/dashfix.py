@@ -54,14 +54,14 @@ class Fixture:
             "INSERT INTO bot_trades (runner, strategy, alert_id, wallet, condition_id, token_id, event_key, status, "
             "reason, signal_ts, detected_at, decided_at, stake_usd, whale_price, best_ask, fill_price, contracts, fees, "
             "cost, zero_price, zero_pnl, human_done, human_pnl, closed_at, result, pnl, closing_price, markout_price, "
-            "markout_done, updated_at, skip_code, scheduled_end, days_to_close, resolved_at) "
-            "VALUES ('single',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,1,?,?,?,?,?)",
+            "markout_done, updated_at, skip_code, scheduled_end, days_to_close, resolved_at, payout_per_share) "
+            "VALUES ('single',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,1,?,?,?,?,?,?)",
             (strategy, alert_id, wallet, cond, f"{cond}-t0", event or f"e-{cond}", status, reason, ts, ts + (detect or 3),
              ts + (detect or 3) + 1, 10.0, whale, fill, fill if filled or status == "MISSED" else None,
              cost / fill if filled else None, 0.0 if filled else None, cost if filled else None, whale, zero_pnl,
              human_pnl, closed_at, ("WIN" if (pnl or 0) > 0 else "LOSS") if filled and pnl is not None else None,
              pnl if filled else (0.0 if closed_at else None), closing, markout, ts, skip_code, end, end_days,
-             closed_at))
+             closed_at, (1.0 if pnl > 0 else 0.0) if filled and pnl is not None else None))
         return alert_id
 
     def old_rule(self, wallet: str, days_ago: float, pnl: float) -> None:

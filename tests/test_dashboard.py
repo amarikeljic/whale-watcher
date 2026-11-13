@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from conftest import NOW
 from dashfix import A, B, small
+from whalewatcher import bankroll
 from whalewatcher import dashboard as dash
 from whalewatcher.config import Config
 from whalewatcher.db import Database
@@ -119,6 +121,126 @@ def test_the_days_to_close_filter_scopes_every_number(site):
     assert "n=0 closed" in site("/", close="gt14"), "the open trade and the skipped signal"
     assert "n=5 closed" in site("/", close="nonsense"), "an unknown value is ignored"
     assert 'name="close"' in week and 'value="1-7" selected' in week
+
+
+# -- the simulated small wallet -------------------------------------------------------------------
+
+
+def test_the_wallet_page_replays_the_fixture_to_the_hand_checked_equity(site):
+    """$100, 1.5% on-ramp, 8% of equity a trade, every fill at 0.50, fee inside the stake
+    (table rates: sports 0.05, politics 0.04, crypto 0.07; a share costs 0.5125 / 0.51 / 0.5175).
+    An open position is worth its shares at the price paid, so the fee is gone at once.
+
+      start                                                        cash  98.5000
+      6 days ago  sports, wins     stake 7.8800  15.3756 shares -> cash 105.9956
+      5 days ago  sports, loses    stake 8.4796                 -> cash  97.5160
+      4 days ago  politics         stake 7.8013  15.2966 shares    equity 97.3630 (fee 0.1530 gone)
+      4 days ago  politics         stake 7.7890  15.2726 shares    equity 97.2103
+      3 days ago  crypto, loses    stake 7.7768                 -> equity 89.4334 (the low)
+      2 days ago  30 days to close: skipped (too_long). Another did not fill.
+      1 day ago   both politics win, +30.5692                   -> cash 104.7181
+      1 day ago   a signal the $10 strategy skipped: taken at the best ask, stake 8.3774, 16.3462 shares
+      1 day ago   40 days to close: skipped (too_long)
+      now         cash 96.3406 + 16.3462 shares at 0.50 = equity 104.5137
+    """
+    html = site("/bankroll")
+    assert "$100.00 wallet" in html and "Replay of every signal" in html
+    assert "$104.51" in html and "cash $96.34 free" in html and "+4.5%" in html
+    assert "$16.56" in html and "15.6% below the high before it" in html, "from 105.9956 down to 89.4334"
+    assert "6 / 2" in html and "of 9 signals · 1 did not fill" in html
+    assert "3 won · 1 open" in html
+    assert "Not enough data: 5 settled wallet trades (need at least 30)" in html
+    assert "1 of 6 fills are priced from a smaller order or from the best ask" in html
+    assert "too_long" in html and "The market was scheduled to end beyond the time-to-close cutoff." in html
+    assert 'data-kind="wallet"' in html and "Tied up in positions" in html and "Skipped signals" in html
+    assert "With and without the time-to-close cutoff" in html and "Old rule (v1), human delay" in html
+    assert "The runner has not started a wallet run yet" in html
+    assert 'action="/settings/wallet-amount"' in html and 'value="100.00"' in html
+
+
+def test_the_wallet_page_follows_the_saved_amount_and_shows_runs(site):
+    db = Database(site.path)
+    app = SimpleNamespace(db=db, cfg=site.cfg, clock=lambda: NOW - 3 * 86_400)
+    bankroll.sync_runs(app, ["single"])                         # a run that began three days ago
+    bankroll.save_amount(db, 1000, "cli", NOW - 60)
+    db.close()
+    html = site("/bankroll")
+    assert "$1,000.00 wallet" in html and "$1,045.14" in html, "ten times the wallet, the same path"
+    assert "6 of 6 fills are priced from a smaller order" in html, "$80 stakes priced at what $10 paid"
+    assert "Live wallet" in html and "Run #1: $100.00 from" in html
+    assert "The amount was changed: the runner will end this run shortly." in html
+    assert "Wallet runs" in html and "running" in html
+    old = site("/bankroll", src="old")
+    assert "Old rule (v1), human delay" in old and "Live wallet" not in old.split("Replay of every signal")[0].split("</nav>")[-1]
+    assert "Saved. The runner ends" in site("/bankroll", saved="250.00")
+    assert "Not saved: the wallet amount must be more than $0." in site("/bankroll", error="the wallet amount must be more than $0")
+    assert "&lt;script&gt;" in site("/bankroll", error="<script>alert(1)</script>"), "an error message is escaped"
+
+
+async def test_the_amount_form_is_the_only_thing_the_site_can_write(site):
+    client = TestClient(TestServer(dash.make_app(site.cfg, site.path)))
+    await client.start_server()
+    same = {"Origin": f"http://{client.host}:{client.port}"}
+
+    async def post(amount, headers=same):
+        return await client.post("/settings/wallet-amount", data={"amount": amount}, headers=headers,
+                                 allow_redirects=False)
+
+    def saved():
+        db = Database.readonly(site.path)
+        try:
+            return bankroll.wallet_amount(db), db.one("SELECT COUNT(*) n FROM settings")["n"]
+        finally:
+            db.close()
+
+    try:
+        ok = await post("250")
+        assert ok.status == 303 and ok.headers["Location"] == "/bankroll?saved=250.00"
+        assert saved() == (250.0, 1)
+        page = await client.get("/bankroll?saved=250.00")
+        assert "$250.00 wallet" in await page.text()
+
+        for bad, why in (("0", "more+than"), ("-1", "more+than"), ("abc", "must+be+a+number"), ("", "must+be+a+number"),
+                         ("100000.01", "cannot+be+more+than"), ("1.234", "two+decimals")):
+            r = await post(bad)
+            assert r.status == 303 and r.headers["Location"].startswith("/bankroll?error=") and why in r.headers["Location"]
+        assert saved() == (250.0, 1), "a refused amount changes nothing"
+
+        assert (await post("999", {"Origin": "https://evil.example"})).status == 403, "another site's form"
+        assert (await post("999", {})).status == 403, "no word on where the form came from"
+        assert (await post("300", {"Sec-Fetch-Site": "same-origin"})).status == 303
+        assert (await post("999", {"Sec-Fetch-Site": "cross-site"})).status == 403
+        assert saved() == (300.0, 1)
+
+        for route in ("/", "/bankroll", "/trades", "/settings/other"):
+            assert (await client.post(route, headers=same)).status in (404, 405), f"{route} accepts no write"
+        assert (await client.get("/settings/wallet-amount")).status == 405
+        big = await client.post("/settings/wallet-amount", data={"amount": "1" * 10_000}, headers=same,
+                                allow_redirects=False)
+        assert big.status == 413, "an oversized form is refused before it is read"
+    finally:
+        await client.close()
+
+
+def test_the_settings_writer_cannot_touch_any_other_table(site):
+    dash.SettingsWriter.save_wallet_amount(site.path, 400, NOW)
+    conn = dash.SettingsWriter.connect(site.path)
+    try:
+        for sql in ("DELETE FROM bot_trades", "UPDATE bot_trades SET pnl = 999", "DELETE FROM settings",
+                    "INSERT INTO service_state (key, value) VALUES ('x', '1')", "DROP TABLE alerts",
+                    "UPDATE bankroll_runs SET amount = 1", "SELECT * FROM alerts", "CREATE TABLE x (y)",
+                    "PRAGMA writable_schema = 1", "ATTACH DATABASE ':memory:' AS other"):
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized|prohibited"):
+                conn.execute(sql).fetchall()
+        conn.rollback()
+    finally:
+        conn.close()
+    with pytest.raises(ValueError):
+        dash.SettingsWriter.save_wallet_amount(site.path, -5, NOW)
+    db = Database.readonly(site.path)
+    assert bankroll.wallet_amount(db) == 400.0 and db.one("SELECT COUNT(*) n FROM bot_trades")["n"] == 10
+    assert db.one("SELECT source FROM settings")["source"] == "dashboard"
+    db.close()
 
 
 def test_health_page_shows_delays_heartbeats_and_the_outage(site):

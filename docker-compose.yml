@@ -2,7 +2,7 @@
 #
 #   whale-watcher-detector   watches trades and publishes tracked wallets' fills
 #   whale-watcher            the runner: alerts, the paper bot, nightly review, stats
-#   whale-watcher-dashboard  the read-only web dashboard
+#   whale-watcher-dashboard  the web dashboard (reads everything, can change one setting)
 #
 # Separate so that one crashing or restarting never stops the others: the detector
 # keeps publishing while the runner is down, and the runner resumes from its cursor.
@@ -40,8 +40,9 @@ services:
       start_period: 5m
       retries: 3
 
-  # Read-only: it opens the database read-only, answers GET requests only and makes
-  # no outbound requests. The port is published on 127.0.0.1 ONLY, so nothing on the
+  # It reads: the database is opened read-only and every page is a GET. The one thing
+  # it can change is the simulated wallet amount (one row of the settings table). It
+  # makes no outbound requests. The port is published on 127.0.0.1 ONLY, so nothing on the
   # LAN or the internet can reach it. To see it from your phone, expose it on your
   # tailnet yourself:   tailscale serve --bg 8787
   dashboard:

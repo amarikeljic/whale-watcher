@@ -28,6 +28,7 @@ import signal
 import sys
 import time
 
+from . import bankroll
 from .app import App, open_app
 from .bot import Bot
 from .config import Config
@@ -44,6 +45,7 @@ from .watchlist import nightly, seed_from_monitored, sync_monitored
 log = logging.getLogger(__name__)
 
 HEARTBEAT_KEY = "heartbeat"
+WALLET_CHECK_EVERY = 30.0      # seconds between looks at the wallet amount (one small query)
 HEARTBEAT_EVERY = 5.0          # seconds between heartbeat writes: the loops tick faster than that
 DETECTOR_STALE_SECONDS = 90
 
@@ -83,6 +85,7 @@ class Service:
         self._detector_down = False
         self._started = time.monotonic()
         self._beat_at = 0.0
+        self._wallet_checked = -WALLET_CHECK_EVERY      # look on the first cycle
         self._quiet_since = 0.0
 
     async def run(self, *, cycles: int | None = None) -> None:
@@ -180,9 +183,22 @@ class Service:
         log.info("nightly review finished")
         await self._after_review(self.app.db.get_state("monitored_run_id"))
 
+    def _sync_wallet(self) -> None:
+        """The wallet amount is the one thing the dashboard can change. Notice it within
+        half a minute: end the old wallet run, start the new one."""
+        if time.monotonic() - self._wallet_checked < WALLET_CHECK_EVERY:
+            return
+        self._wallet_checked = time.monotonic()
+        try:
+            for change in bankroll.sync_runs(self.app, [self.bot.runner]):
+                log.info("wallet: %s", change)
+        except Exception:
+            log.exception("could not bring the wallet run up to date; trying again shortly")
+
     async def _periodic(self) -> None:
         app, cfg = self.app, self.app.cfg
         now = app.clock()
+        self._sync_wallet()
         if now - int(app.db.get_state("last_settle_at", 0)) >= cfg.paper.settle_interval_seconds:
             settled = await self.paper.settle()
             closed = await self.bot.settle()

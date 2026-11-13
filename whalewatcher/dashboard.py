@@ -1,7 +1,9 @@
 """v2 Phase 4: the dashboard. A small web app that READS the database and shows it.
 
-  * It never writes: the database is opened read-only and query-only, every route
-    is a GET, and there is no form that changes anything.
+  * It reads. The database is opened read-only and query-only and every page is a
+    GET. There is ONE exception (v2.1): the wallet amount form, which writes one
+    row of the ``settings`` table through ``SettingsWriter``, a connection that
+    SQLite itself restricts to that table. No trade, alert or run can be changed.
   * It is meant for the tailnet only. Run directly it binds 127.0.0.1. In Docker it
     listens inside its own container network and compose publishes that port on the
     host's 127.0.0.1 only; the owner exposes it with `tailscale serve`.
@@ -16,16 +18,19 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
+import sqlite3
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from aiohttp import web
 
+from . import bankroll
 from . import dashview as v
 from .config import Config
 from .costs import breakdown
@@ -658,6 +663,198 @@ def breakdowns(c: Ctx) -> str:
     return body + "</div>"
 
 
+# -- the simulated small wallet (v2.1 Part 2) ---------------------------------------------------------
+
+SKIP_MEANING = {
+    "no_slot": "All positions were open, so the signal could only be watched.",
+    "no_cash": "Less cash was free than the smallest order.",
+    "below_minimum": "The stake was under the smallest order, in dollars or in shares.",
+    "event_cap": "The event already held its share of the wallet.",
+    "too_long": "The market was scheduled to end beyond the time-to-close cutoff.",
+    "no_end_date": "The market had no scheduled end date.",
+}
+CURVE_POINTS = 700      # more than this many equity points are thinned before they are sent to the page
+RUG_BINS = 140
+
+
+def _thin(points: list, limit: int) -> list:
+    if len(points) <= limit:
+        return points
+    step = len(points) / limit
+    kept = [points[int(i * step)] for i in range(limit)]
+    return kept + ([points[-1]] if kept[-1] is not points[-1] else [])
+
+
+def wallet_chart(res: Any) -> str:
+    curve = _thin(res.curve, CURVE_POINTS)
+    if len(curve) < 2:
+        return '<p class="empty">No wallet activity yet.</p>'
+    t0, t1 = curve[0].ts, curve[-1].ts
+    width = max(1.0, (t1 - t0) / RUG_BINS)
+    bins: dict[int, int] = defaultdict(int)
+    for e in res.entries:
+        if e.status == bankroll.SKIPPED:
+            bins[int((e.signal.ts - t0) // width)] += 1
+    data = {"points": [[int(p.ts), round(p.equity, 2), round(p.cash, 2)] for p in curve], "start": res.params.amount,
+            "skips": [[int(t0 + (k + 0.5) * width), n] for k, n in sorted(bins.items())]}
+    rows = [[iso(int(p.ts))[:16].replace("T", " "), v.money(p.equity, signed=False), v.money(p.cash, signed=False),
+             v.money(p.tied, signed=False)] for p in curve[-200:]]
+    legend = [("Equity", "s1"), ("Tied up in positions", "s2 area"), ("Free cash", "s3 area"),
+              ("Skipped signals", "rug")]
+    return v.chart("wallet", data, table_headers=["When (UTC)", "Equity", "Free cash", "Tied up"], table_rows=rows,
+                   legend=legend)
+
+
+def wallet_tiles(res: Any) -> str:
+    s = res.summary()
+    skipped = sum(s["skipped"].values())
+    return ('<div class="tiles">'
+            + v.tile("Equity", v.money(s["equity"], signed=False), f"cash {v.money(s['cash'], signed=False)} free")
+            + v.tile("Total return", v.pct(s["total_return"]), f"on ${s['amount']:,.2f} put in",
+                     v.tone(s["total_return"]))
+            + v.tile("Max drawdown", v.money(s["max_drawdown_usd"], signed=False),
+                     f"{s['max_drawdown_pct']:.1%} below the high before it")
+            + v.tile("Taken / skipped", f"{s['taken']} / {skipped}", f"of {s['signals']} signals · {s['missed']} did not fill")
+            + v.tile("Total fees", v.money(s["fees"], signed=False),
+                     f"plus {v.money(s['onramp_cost'], signed=False)} on-ramp")
+            + v.tile("Settled", str(s["settled"]), f"{s['wins']} won · {s['open']} open") + "</div>")
+
+
+def wallet_warnings(res: Any, threshold: int) -> str:
+    out = ""
+    settled = len(res.settled)
+    if settled < threshold:
+        out += v.banner(f"Not enough data: {settled} settled wallet trades (need at least {threshold}). A wallet's path "
+                        "depends on the order of a few wins and losses, so this curve says little yet.")
+    if res.optimistic:
+        out += v.banner(f"{res.optimistic} of {len(res.taken)} fills are priced from a smaller order or from the best "
+                        "ask, because no order book was stored for them. A real order of this size may have paid "
+                        "more, or not filled.")
+    return out
+
+
+def wallet_form(amount: float, saved: str, error: str) -> str:
+    note = ""
+    if error:
+        note = v.banner(f"Not saved: {error}.", "bad")
+    elif saved:
+        note = v.banner("Saved. The runner ends the current wallet run and starts a new one within a minute. "
+                        "The replay below already uses the new amount.", "good")
+    form = ('<form class="setting" method="post" action="/settings/wallet-amount">'
+            '<label>Wallet amount, in dollars'
+            f'<input type="text" name="amount" inputmode="decimal" autocomplete="off" value="{amount:.2f}" '
+            'aria-describedby="amount-help"></label><button type="submit">Save</button></form>'
+            f'<p class="card-note" id="amount-help">Above $0, at most ${bankroll.MAX_AMOUNT:,.0f}. Changing it starts '
+            "a new simulated wallet run. Earlier runs are kept below and never rewritten. This is the only thing "
+            "this site can change.</p>")
+    return note + v.card("Wallet amount", form, wide=True)
+
+
+def bankroll_page(c: Ctx, query: Any) -> tuple[str, str]:
+    """(title, body). Not scoped by the filter row: a wallet is one path through all its signals."""
+    app = c.app
+    amount = bankroll.wallet_amount(app.db)
+    all_views = bankroll.views(c.records, app.cfg, app.db, c.now, amount=amount)
+    keys = [w.key for w in all_views]
+    src = query.get("src") if query.get("src") in keys else (keys[0] if keys else "")
+    view = next((w for w in all_views if w.key == src), None)
+    title = f"${amount:,.2f} wallet"
+    body = wallet_form(amount, query.get("saved") or "", (query.get("error") or "")[:200])
+    params = bankroll.Params.of(app.cfg, amount)
+    body += (f'<p class="card-note">{v.esc(params.describe())}. The stake is equity times the deployed share, divided '
+             "by the number of positions, with the fee inside it and never more than the cash. Open positions are "
+             "valued at their last recorded best bid, or at the price paid when none was recorded.</p>")
+    if view is None:
+        return title, body + v.banner("No signals yet.", "info")
+    body += '<nav class="tabs" aria-label="Signal source">' + "".join(
+        f'<a href="/bankroll?{urlencode({"src": w.key})}" class="{"on" if w.key == src else ""}">{v.esc(w.label)}</a>'
+        for w in all_views) + "</nav>"
+    if view.simulated:
+        body += v.banner("These signals come from a simulated backtest, not from live paper trading.", "info")
+    body += '<div class="grid">'
+    if view.key.startswith("bot:"):
+        if view.live is None:
+            body += v.card("Live wallet", '<p class="empty">The runner has not started a wallet run yet. It does so '
+                                          "within a minute of starting.</p>", wide=True)
+        else:
+            row = view.run_row
+            stale = abs(row["amount"] - amount) > 1e-9
+            note = (f"{bankroll.run_label(row)}. Only signals since the run began count."
+                    + (" The amount was changed: the runner will end this run shortly." if stale else ""))
+            body += v.card("Live wallet", wallet_warnings(view.live, c.threshold) + wallet_tiles(view.live)
+                           + wallet_chart(view.live), note=note, wide=True)
+    replay, bare = view.replay, view.replay_no_cutoff
+    if not bare.entries:
+        return title, body + v.card("Replay of every signal", '<p class="empty">No signals yet.</p>', wide=True) + "</div>"
+    fl = app.cfg.filters
+    cutoff = "no cutoff set" if fl.max_days_to_close is None else f"{fl.max_days_to_close:g}-day cutoff"
+    body += v.card("Replay of every signal", wallet_warnings(replay, c.threshold) + wallet_tiles(replay)
+                   + wallet_chart(replay),
+                   note=f"All {len(replay.entries)} signals of this source, in the order they were decided, through "
+                        f"today's wallet settings, with the {cutoff}.", wide=True)
+
+    def series(res: Any) -> list:
+        return [[int(p.ts), round(p.equity, 2)] for p in _thin(res.curve, CURVE_POINTS)]
+
+    def cell(res: Any, key: str) -> str:
+        s = res.summary()
+        return {"equity": v.money(s["equity"], signed=False), "ret": v.pct(s["total_return"]),
+                "dd": f"{v.money(s['max_drawdown_usd'], signed=False)} ({s['max_drawdown_pct']:.1%})",
+                "taken": str(s["taken"]), "skipped": str(sum(s["skipped"].values())),
+                "fees": v.money(s["fees"], signed=False), "settled": str(s["settled"])}[key]
+
+    compare = v.chart("line", {"series": [{"name": "With the cutoff", "cls": "s1", "points": series(replay)},
+                                          {"name": "Without the cutoff", "cls": "s2", "points": series(bare)}],
+                               "y": "usd"},
+                      table_headers=["", "With the cutoff", "Without the cutoff"],
+                      table_rows=[[name, cell(replay, k), cell(bare, k)] for name, k in (
+                          ("Equity", "equity"), ("Total return", "ret"), ("Max drawdown", "dd"), ("Taken", "taken"),
+                          ("Skipped", "skipped"), ("Settled", "settled"), ("Fees", "fees"))],
+                      legend=[("With the cutoff", "s1"), ("Without the cutoff", "s2")])
+    body += v.card("With and without the time-to-close cutoff", compare + v.table(
+        ["", "With the cutoff", "Without the cutoff"],
+        [[name, cell(replay, k), cell(bare, k)] for name, k in (
+            ("Equity", "equity"), ("Total return", "ret"), ("Max drawdown", "dd"), ("Taken", "taken"),
+            ("Skipped", "skipped"), ("Settled", "settled"), ("Fees", "fees"))], sortable=False),
+        note="One path each. The two wallets take different trades from the first skip on, so a gap between the "
+             "lines is mostly the luck of which trades each happened to hold.", wide=True)
+
+    skips = replay.skipped
+    body += v.card("Why signals were skipped", v.table(
+        ["Reason", "What it means", "Signals"],
+        [[code, (SKIP_MEANING.get(code, ""), None, "wrap"), (str(n), n)] for code, n in skips.most_common()],
+        empty="Nothing was skipped.", numeric_from=2), note="In the replay with the cutoff.", wide=True)
+
+    recent = replay.entries[-40:][::-1]
+    rows = []
+    for e in recent:
+        what = {"TAKEN": "Taken", "SKIPPED": "Skipped", "MISSED": "Did not fill"}[e.status]
+        pnl = e.pnl
+        rows.append([iso(int(e.signal.ts))[:16].replace("T", " "), ((e.signal.question or e.signal.event_key)[:60], None, "wrap"),
+                     what, (e.reason if e.status != "TAKEN" else f"at {e.price:.3f}", None, "wrap"),
+                     v.money(e.stake, signed=False) if e.status == "TAKEN" else "-",
+                     v.money(e.equity, signed=False),
+                     ("-" if pnl is None else v.money(pnl), pnl or 0, v.tone(pnl) if pnl is not None else "")])
+    body += v.card("Latest decisions", v.table(
+        ["When (UTC)", "Market", "Decision", "Why / price", "Stake", "Equity before", "P&L"], rows, numeric_from=4),
+        note="The 40 most recent signals in the replay with the cutoff, newest first.", wide=True)
+
+    runs = bankroll.past_runs(app.db)
+    run_rows = []
+    for r in runs:
+        s = json.loads(r["summary_json"] or "{}")
+        run_rows.append([f"#{r['id']}", r["runner"], v.money(r["amount"], signed=False), iso(r["started_at"])[:10],
+                         iso(r["ended_at"])[:10] if r["ended_at"] else "running",
+                         (r["end_reason"] or "", None, "wrap"),
+                         v.money(s["equity"], signed=False) if s else "-",
+                         v.pct(s["total_return"]) if s else "-", str(s.get("taken", "-")) if s else "-"])
+    body += v.card("Wallet runs", v.table(
+        ["Run", "Runner", "Amount", "Started", "Ended", "Why it ended", "Final equity", "Return", "Taken"], run_rows,
+        empty="No run has started yet.", numeric_from=6),
+        note="A run ends when the amount or a bankroll setting changes. Its figures are frozen then.", wide=True)
+    return title, body + "</div>"
+
+
 def state(app: Any, key: str) -> Any:
     try:
         return app.db.get_state(key)
@@ -825,6 +1022,10 @@ def render(cfg: Config, db_path: str, path: str, query: Any, *, now: int | None 
         else:
             pages = {"/": ("Overview", overview), "/edge": ("Edge", edge), "/wallets": ("Wallets", wallets),
                      "/breakdowns": ("Breakdowns", breakdowns), "/health": ("Health", health)}
+            if path == "/bankroll":
+                title, body = bankroll_page(c, query)
+                updated = f"Read {iso(c.now)[11:16]} UTC."
+                return "text/html", v.page(title, path, "", body, updated=updated)
             if path == "/trades":
                 try:
                     page_no = int(query.get("page") or 1)
@@ -849,7 +1050,69 @@ SECURITY_HEADERS = {
 }
 
 
+class SettingsWriter:
+    """THE ONLY WRITE THE DASHBOARD CAN MAKE: the ``settings`` table, and in it only
+    the wallet amount. Every other connection in this module is read-only. This one
+    is opened for a single statement and SQLite itself is told to refuse anything
+    that is not an insert or update of ``settings``."""
+
+    ALLOWED = {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_READ}
+
+    @classmethod
+    def _authorize(cls, action: int, arg1: Any, _arg2: Any, _db: Any, _source: Any) -> int:
+        if action in (sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SELECT):
+            return sqlite3.SQLITE_OK
+        if action in cls.ALLOWED and arg1 == "settings":
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    @classmethod
+    def connect(cls, db_path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(f"file:{db_path}?mode=rw", uri=True, timeout=10)
+        conn.set_authorizer(cls._authorize)
+        return conn
+
+    @classmethod
+    def save_wallet_amount(cls, db_path: str, amount: float, now: int) -> None:
+        value = f"{bankroll.parse_amount(amount):.2f}"
+        conn = cls.connect(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    "INSERT INTO settings (key, value, updated_at, source) VALUES (?,?,?,'dashboard') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at, "
+                    "source = excluded.source", (bankroll.AMOUNT_KEY, value, now))
+        finally:
+            conn.close()
+
+
+def same_site(request: web.Request) -> bool:
+    """A form on another website must not be able to change the amount. Browsers say
+    where a POST came from; one that does not say is refused."""
+    if request.headers.get("Sec-Fetch-Site") == "same-origin":
+        return True
+    origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+    host = urlsplit(origin).netloc.lower()
+    return bool(host) and host in {(request.headers.get("Host") or "").lower(),
+                                   (request.headers.get("X-Forwarded-Host") or "").lower()} - {""}
+
+
 def make_app(cfg: Config, db_path: str) -> web.Application:
+    async def save_amount(request: web.Request) -> web.Response:
+        if not same_site(request):
+            raise web.HTTPForbidden(text="This form can only be sent from the dashboard itself.")
+        form = await request.post()
+        try:
+            amount = bankroll.parse_amount(form.get("amount", ""))
+            SettingsWriter.save_wallet_amount(db_path, amount, now_ts())
+            target = "/bankroll?" + urlencode({"saved": f"{amount:.2f}"})
+        except ValueError as exc:
+            target = "/bankroll?" + urlencode({"error": str(exc)})
+        except sqlite3.Error as exc:
+            log.error("could not save the wallet amount: %s", exc)
+            target = "/bankroll?" + urlencode({"error": "the database could not be written just now"})
+        raise web.HTTPSeeOther(target, headers=SECURITY_HEADERS)
+
     async def handle(request: web.Request) -> web.Response:
         kind, body = render(cfg, db_path, request.path, request.query)
         headers = dict(SECURITY_HEADERS)
@@ -868,12 +1131,14 @@ def make_app(cfg: Config, db_path: str) -> web.Application:
     async def healthz(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
-    app = web.Application()
+    app = web.Application(client_max_size=4096)     # the one form is a few bytes
+    app.router.add_post("/settings/wallet-amount", save_amount)   # the only route that is not a GET
     app.router.add_get("/assets/app.css", css)
     app.router.add_get("/assets/app.js", js)
     app.router.add_get("/healthz", healthz)
-    for route in ("/", "/edge", "/wallets", "/trades", "/trades.csv", "/breakdowns", "/health", "/wallet/{address}"):
-        app.router.add_get(route, handle)       # GET only: nothing here can change anything
+    for route in ("/", "/edge", "/wallets", "/trades", "/trades.csv", "/breakdowns", "/health", "/bankroll",
+                  "/wallet/{address}"):
+        app.router.add_get(route, handle)       # GET only: none of these can change anything
     return app
 
 
@@ -886,5 +1151,6 @@ def serve(cfg: Config, *, host: str, port: int, in_container: bool) -> None:
             f"refusing to listen on {host}: the dashboard is for the tailnet only. Run it on 127.0.0.1 and expose "
             "it with `tailscale serve`. (--in-container allows it inside Docker, where compose must publish the "
             "port on 127.0.0.1 only.)")
-    log.info("dashboard on http://%s:%d (read-only; database %s)", host, port, cfg.database_path)
+    log.info("dashboard on http://%s:%d (reads %s; can change only the simulated wallet amount)", host, port,
+             cfg.database_path)
     web.run_app(make_app(cfg, cfg.database_path), host=host, port=port, print=None, access_log=None)

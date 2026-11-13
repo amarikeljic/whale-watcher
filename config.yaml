@@ -127,6 +127,20 @@ filters:
   max_days_to_close: 14       # skip a market scheduled to end later than this (null = no limit)
   skip_if_no_end_date: true   # a market with no scheduled end could tie money up for ever
 
+# The simulated small wallet (v2.1). The amount itself (default $100) is set on the
+# dashboard or with `python -m whalewatcher wallet set 250`, not here. Changing the
+# amount or any value below ends the current wallet run and starts a new one; old
+# runs are kept.
+bankroll:
+  deploy_fraction: 0.8          # share of equity the wallet is willing to have in positions
+  max_open_positions: 10        # stake = equity x deploy_fraction / this, never more than the cash
+  # Our own floor. Polymarket's real minimum is per market and in SHARES (5 on every
+  # book sampled 2026-11-12), so a $1 order of a 50-cent outcome is refused by the
+  # venue anyway. The wallet applies both.
+  min_order_usd: 1.00
+  max_per_event_fraction: 0.2   # of equity, at cost, in one event
+  mark_interval_seconds: 300    # how often open positions' best bids are recorded
+
 # Costs (v2.1). Every paper fill pays the taker fee, on the buy and on a mirror-exit
 # sell:  fee = shares x rate x price x (1 - price).  No rebate is ever counted.
 fees:

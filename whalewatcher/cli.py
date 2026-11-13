@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -351,6 +352,44 @@ async def _consensus(args, cfg) -> int:
     return 0
 
 
+async def _wallet(args, cfg) -> int:
+    """`wallet show` and `wallet set <amount>`: the simulated small wallet."""
+    from . import bankroll
+    from .stats import load_bot_trades, load_trades
+    async with open_app(cfg) as app:
+        records = load_bot_trades(app) + load_trades(app)
+        if args.action == "set":
+            try:
+                amount = bankroll.parse_amount(args.amount)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            before = bankroll.wallet_amount(app.db)
+            bankroll.save_amount(app.db, amount, "cli", int(app.clock()))
+            signals = bankroll.signals_by_source(records, cfg)
+            print(f"wallet amount: ${before:,.2f} -> ${amount:,.2f}")
+            for change in bankroll.sync_runs(app, bankroll.live_runners(signals), signals) or ["no run changed"]:
+                print(f"  {change}")
+            print()
+        else:
+            row = app.db.one("SELECT * FROM settings WHERE key = ?", (bankroll.AMOUNT_KEY,))
+            where = f"set from the {row['source']} on {iso(row['updated_at'])}" if row else "the default: never set"
+            print(f"wallet amount: ${bankroll.wallet_amount(app.db):,.2f} ({where})")
+        print("\n".join(bankroll.render(records, cfg, app.db, app.clock()) or ["no signals yet"]))
+        runs = bankroll.past_runs(app.db)
+        if runs:
+            print("\nWallet runs (newest first). An ended run is frozen and never rewritten:")
+            for r in runs:
+                line = f"  {r['runner']}: {bankroll.run_label(r)}"
+                if r["ended_at"]:
+                    s = json.loads(r["summary_json"] or "{}")
+                    line += (f" | ended: {r['end_reason']} | equity ${s.get('equity', 0):,.2f} "
+                             f"({s.get('total_return', 0):+.1%}), taken {s.get('taken', 0)}, "
+                             f"fees ${s.get('fees', 0):,.2f}")
+                print(line)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m whalewatcher",
                                 description="Find skilled Polymarket wallets and paper trade their entries. "
@@ -448,6 +487,10 @@ def build_parser() -> argparse.ArgumentParser:
     db.add_argument("--in-container", action="store_true",
                     help="allow a non-loopback --host inside Docker, where compose publishes the port on 127.0.0.1 only")
 
+    wa = sub.add_parser("wallet", help="the simulated small wallet: `wallet show`, `wallet set 250`")
+    wa.add_argument("action", choices=("show", "set"))
+    wa.add_argument("amount", nargs="?", help="dollars, for `set` (above 0, at most 100,000)")
+
     d = sub.add_parser("detector", help="watch trades and publish tracked wallets' fills (its own container)")
     d.add_argument("--cycles", type=int, help="stop after this many feed polls")
 
@@ -504,6 +547,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_watchlist(args, cfg))
     if args.command == "consensus":
         return asyncio.run(_consensus(args, cfg))
+    if args.command == "wallet":
+        if args.action == "set" and args.amount is None:
+            print("error: `wallet set` needs an amount, such as `wallet set 250`", file=sys.stderr)
+            return 2
+        return asyncio.run(_wallet(args, cfg))
     if args.command == "dashboard":
         from .dashboard import serve
         serve(cfg, host=args.host, port=args.port, in_container=args.in_container)

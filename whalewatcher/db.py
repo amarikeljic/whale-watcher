@@ -27,7 +27,9 @@ log = logging.getLogger(__name__)
 # Part 1, the cost columns on bot_trades and paper_trades (fee rate used, slippage,
 # and a recalculation kept beside the original values). 7: v2.1 Part 3, the
 # time-to-close cutoff (skip code, scheduled end and days to it, real resolution time).
-SCHEMA_VERSION = 7
+# 8: v2.1 Part 2, the small wallet (settings, bankroll_runs, position_marks, and the
+# ask levels each signal saw).
+SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallets (
@@ -415,6 +417,44 @@ CREATE TABLE IF NOT EXISTS service_state (
     value  TEXT NOT NULL
 );
 
+-- v2.1 Part 2. THE ONLY TABLE THE DASHBOARD MAY WRITE (see dashboard.SettingsWriter).
+-- One row today: wallet_amount.
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    source      TEXT NOT NULL          -- dashboard | cli
+);
+
+-- A simulated wallet run: one amount and one set of bankroll settings, from when it
+-- began to when either changed. The figures are derived from the ledger (bankroll.py);
+-- an ended run's are frozen in summary_json. Rows are never deleted or reused.
+CREATE TABLE IF NOT EXISTS bankroll_runs (
+    id            INTEGER PRIMARY KEY,
+    runner        TEXT NOT NULL,       -- single | consensus
+    amount        REAL NOT NULL,
+    params_json   TEXT NOT NULL,       -- the Params the run was started with
+    fingerprint   TEXT NOT NULL,
+    started_at    INTEGER NOT NULL,
+    ended_at      INTEGER,
+    end_reason    TEXT,
+    summary_json  TEXT                 -- equity, return, drawdown, taken, skipped, fees at the end
+);
+CREATE INDEX IF NOT EXISTS bankroll_runs_runner ON bankroll_runs (runner, ended_at);
+CREATE TRIGGER IF NOT EXISTS bankroll_runs_no_delete BEFORE DELETE ON bankroll_runs
+BEGIN SELECT RAISE(ABORT, 'wallet runs are history: never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS bankroll_runs_frozen BEFORE UPDATE ON bankroll_runs WHEN OLD.ended_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'an ended wallet run is never rewritten'); END;
+
+-- The best bid of each open paper position, recorded every few minutes, so equity
+-- can be marked to what the position would have sold for. Insert only.
+CREATE TABLE IF NOT EXISTS position_marks (
+    token_id  TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    best_bid  REAL NOT NULL,
+    PRIMARY KEY (token_id, ts)
+);
+
 -- Kalshi public market data, cached for the backtest's cross-venue copies.
 CREATE TABLE IF NOT EXISTS kalshi_markets (
     ticker               TEXT PRIMARY KEY,
@@ -509,6 +549,10 @@ ADDED_COLUMNS = (
     (7, "bot_trades", "scheduled_end", "INTEGER"), # the market's endDate as published when we decided
     (7, "bot_trades", "days_to_close", "REAL"),    # (scheduled_end - decided_at) in days, never negative
     (7, "bot_trades", "resolved_at", "INTEGER"),   # when the market actually resolved, written at settlement
+    # v2.1 Part 2: enough of the book to price an order of any size later.
+    (8, "bot_trades", "asks_json", "TEXT"),        # [[price, shares], ...] best first, as seen when we decided
+    (8, "bot_trades", "limit_price", "REAL"),      # the fill-or-kill limit that applied
+    (8, "bot_trades", "min_order_size", "REAL"),   # the market's minimum order, in shares
 )
 
 

@@ -18,15 +18,18 @@ from collections.abc import Sequence
 from typing import Any
 
 NAV = (("/", "Overview"), ("/edge", "Edge"), ("/wallets", "Wallets"), ("/trades", "Trades"),
-       ("/breakdowns", "Breakdowns"), ("/health", "Health"))
+       ("/bankroll", "Sim wallet"), ("/breakdowns", "Breakdowns"), ("/health", "Health"))
 
 
 def esc(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
-def money(x: float | None) -> str:
-    return "-" if x is None else f"{'+' if x >= 0 else '-'}${abs(x):,.2f}"
+def money(x: float | None, *, signed: bool = True) -> str:
+    """``signed``: a gain or loss (+$2.50). Unsigned is an amount of money ($98.50)."""
+    if x is None:
+        return "-"
+    return f"{'+' if x >= 0 else '-'}${abs(x):,.2f}" if signed else f"{'-' if x < 0 else ''}${abs(x):,.2f}"
 
 
 def pct(x: float | None) -> str:
@@ -133,7 +136,8 @@ def page(title: str, active: str, filters_html: str, body: str, *, qs: str = "",
 <main>
 {filters_html}
 {body}
-<footer>Paper trading research. No orders are placed and this page only reads the database. {esc(updated)}</footer>
+<footer>Paper trading research. No orders are placed. The only thing this site can change is the simulated
+wallet amount. {esc(updated)}</footer>
 </main>
 <div id="tip" class="tip" hidden></div>
 <script src="/assets/app.js"></script>
@@ -215,6 +219,20 @@ font-size:12px;color:#fff;background:var(--muted)}
 .chart .bar{stroke:none}.chart .bar.pos{fill:var(--pos)}.chart .bar.neg{fill:var(--neg)}
 .chart .bar.s1{fill:var(--s1)}.chart .bar.s3{fill:var(--s3)}
 .chart .bar,.chart .line,.chart .dot,.chart .ref,.chart .band{pointer-events:none}
+.chart .area{stroke:none;opacity:.16;pointer-events:none}.chart .gap{fill:none;stroke:var(--surface);stroke-width:2;
+pointer-events:none}.chart .rug{stroke:var(--ink2);stroke-width:1.5;pointer-events:none}
+.chart .ref.dash{stroke-dasharray:4 4}
+.swatch.area{height:10px;opacity:.5}.swatch.rug{width:2px;height:10px;background:var(--ink2)}
+.setting{display:flex;flex-wrap:wrap;gap:10px 12px;align-items:end;margin:0 0 6px}
+.setting label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--ink2)}
+.setting input[type=text]{font:inherit;font-size:16px;color:var(--ink);background:var(--surface);
+border:1px solid var(--border);border-radius:8px;padding:8px 10px;width:150px;font-variant-numeric:tabular-nums}
+.setting button{font:inherit;font-size:14px;font-weight:600;color:#fff;background:var(--s1);border:0;
+border-radius:8px;padding:9px 16px;min-height:38px;cursor:pointer}
+.setting button:focus-visible,.setting input:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
+.tabs a{font-size:13px;color:var(--ink2);text-decoration:none;border:1px solid var(--border);border-radius:999px;
+padding:6px 12px;background:var(--surface)}.tabs a.on{color:var(--ink);border-color:var(--ink2);font-weight:600}
 .chart .hit{fill:transparent;stroke:none;outline:none}.chart .hit:hover+.bar,.chart .bar.hover{opacity:.75}
 .chart .cross{stroke:var(--axis);stroke-width:1}
 .chart .ref{stroke:var(--ink2);stroke-width:1}
@@ -389,10 +407,67 @@ JS = r"""
     }
   }
 
+  // The simulated wallet: equity as a stepped line (it only moves when something
+  // happens), the cash that is free and the money tied up in positions as two washes
+  // under it, a dashed line at the amount put in, and a rug of skipped signals.
+  function renderWallet(box, d) {
+    var pts = d.points;
+    if (!pts.length) return;
+    var t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+    if (t0 === t1) { t0 -= 43200; t1 += 43200; }
+    var top = Math.max.apply(null, pts.map(function (p) { return p[1]; }).concat([d.start]));
+    var f = frame(box, { y: "usd", zero: true }, 0, top);
+    var x = function (t) { return f.m.l + (f.W - f.m.l - f.m.r) * (t - t0) / (t1 - t0); };
+    var n = f.W < 480 ? 3 : 5;
+    for (var i = 0; i <= n; i++) {
+      var t = t0 + (t1 - t0) * i / n;
+      var tx = el("text", { x: x(t), y: f.H - 6, "text-anchor": i === 0 ? "start" : i === n ? "end" : "middle" }, f.svg); tx.textContent = day(t);
+    }
+    function steps(k) {            // "x y" pairs of the stepped series k, left to right
+      var out = [];
+      pts.forEach(function (p, i) {
+        if (i) out.push(x(p[0]).toFixed(1) + " " + f.y(pts[i - 1][k]).toFixed(1));
+        out.push(x(p[0]).toFixed(1) + " " + f.y(p[k]).toFixed(1));
+      });
+      return out;
+    }
+    var eq = steps(1), cash = steps(2), xl = x(pts[0][0]).toFixed(1), xr = x(pts[pts.length - 1][0]).toFixed(1), y0 = f.y(0).toFixed(1);
+    el("path", { class: "area s3", d: "M" + xl + " " + y0 + "L" + cash.join("L") + "L" + xr + " " + y0 + "Z" }, f.svg);
+    el("path", { class: "area s2", d: "M" + eq.join("L") + "L" + cash.slice().reverse().join("L") + "Z" }, f.svg);
+    el("path", { class: "gap", d: "M" + cash.join("L") }, f.svg);
+    var ref = el("line", { class: "ref dash", x1: f.m.l, x2: f.W - f.m.r, y1: f.y(d.start), y2: f.y(d.start) }, f.svg);
+    el("title", {}, ref).textContent = "Amount put in";
+    (d.skips || []).forEach(function (s) {
+      if (s[0] >= t0 && s[0] <= t1) el("line", { class: "rug", x1: x(s[0]), x2: x(s[0]), y1: f.y(0) - 1, y2: f.y(0) - 9 }, f.svg);
+    });
+    el("path", { class: "line s1", d: "M" + eq.join("L") }, f.svg);
+    var last = pts[pts.length - 1];
+    el("circle", { class: "dot s1", cx: x(last[0]), cy: f.y(last[1]), r: 4 }, f.svg);
+    var cross = el("line", { class: "cross", y1: f.m.t, y2: f.H - f.m.b, visibility: "hidden" }, f.svg);
+    var hit = el("rect", { class: "hit", x: f.m.l, y: f.m.t, width: f.W - f.m.l - f.m.r, height: f.H - f.m.t - f.m.b }, f.svg);
+    function move(evt) {
+      var r = f.svg.getBoundingClientRect(), px = (evt.clientX - r.left) * f.W / r.width;
+      var t = t0 + (px - f.m.l) / (f.W - f.m.l - f.m.r) * (t1 - t0), at = 0;
+      pts.forEach(function (p, i) { if (p[0] <= t) at = i; });
+      var p = pts[at], until = at + 1 < pts.length ? pts[at + 1][0] : Infinity, skipped = 0;
+      (d.skips || []).forEach(function (s) { if (s[0] >= p[0] && s[0] < until) skipped += s[1]; });
+      var cx = Math.max(f.m.l, Math.min(f.W - f.m.r, px));
+      cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("visibility", "visible");
+      var lines = [{ label: day(p[0]) }, { cls: "s1", value: fmt(p[1], "usd"), label: "Equity" },
+                   { cls: "s2", value: fmt(p[1] - p[2], "usd"), label: "Tied up in positions" },
+                   { cls: "s3", value: fmt(p[2], "usd"), label: "Free cash" }];
+      if (skipped) lines.push({ value: String(skipped), label: "signals skipped before the next change" });
+      showTip(evt, lines);
+    }
+    hit.addEventListener("pointermove", move); hit.addEventListener("pointerdown", move);
+    hit.addEventListener("pointerleave", function (evt) { if (evt.pointerType !== "mouse") return; cross.setAttribute("visibility", "hidden"); hideTip(); });
+  }
+
   function drawAll() {
     document.querySelectorAll(".chart").forEach(function (box) {
       var d = JSON.parse(box.getAttribute("data-chart"));
-      if (box.getAttribute("data-kind") === "line") renderLine(box, d); else renderBars(box, d);
+      var kind = box.getAttribute("data-kind");
+      if (kind === "line") renderLine(box, d); else if (kind === "wallet") renderWallet(box, d); else renderBars(box, d);
     });
   }
   document.addEventListener("pointerdown", function (evt) { if (!(evt.target.closest && evt.target.closest(".chart"))) hideTip(); });

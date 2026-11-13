@@ -51,7 +51,9 @@ python -m whalewatcher watchlist --history          # every add and removal ever
 python -m whalewatcher watchlist --review           # run the nightly review now
 python -m whalewatcher consensus                    # today's consensus pool: counts at $100k/$250k/$500k/top 50, entities
 python -m whalewatcher consensus --backtest         # six months of the consensus strategy, no hindsight, with baselines
-python -m whalewatcher dashboard                    # the read-only web dashboard on 127.0.0.1:8787
+python -m whalewatcher dashboard                    # the web dashboard on 127.0.0.1:8787
+python -m whalewatcher wallet show                  # the simulated small wallet: amount, runs, replay
+python -m whalewatcher wallet set 250               # change the amount (starts a new wallet run)
 python -m whalewatcher detector                     # watch trades, publish tracked wallets' fills (own container)
 python -m whalewatcher monitor [--no-post] [--cycles N] [--no-detector]   # the runner: alerts + the paper bot
 python -m whalewatcher settle
@@ -243,8 +245,53 @@ backtests skip a signal whose market is scheduled to end later than that, and
   ROI with and without the cutoff differs by less than one point and every
   interval still includes zero. Among trades the cutoff allows, 0.6% to 5.2%
   were still held longer than 14 days because the market resolved late.
-* **Not covered yet:** the old-rule comparison trader is left as it was, and
-  the $100 wallet replay with and without the cutoff arrives with the wallet.
+* **Not covered:** the old-rule comparison trader is left as it was. The wallet
+  replay with and without the cutoff is on the Sim wallet page.
+
+### The small wallet (v2.1)
+
+The bot stakes a fixed $10 on every signal from a bankroll that never runs dry.
+A person with $100 cannot. `bankroll.py` runs the same signals through a small
+wallet: `python -m whalewatcher wallet show`, or the **Sim wallet** page.
+
+* **Amount.** $100 by default. Set it on the dashboard or with
+  `wallet set 250` (above $0, at most $100,000, two decimals). It lives in the
+  `settings` table, the only thing the dashboard may write.
+* **Stake** = equity x `deploy_fraction` (0.8) / `max_open_positions` (10),
+  never more than the cash. The stake is all-in: it buys the shares and pays
+  the taker fee, so cash never goes below zero. The on-ramp cost (1.5%) comes
+  off the starting amount once.
+* **Equity** = cash + open positions at their last recorded best bid. The bot
+  records each open position's best bid every 5 minutes. A position with no
+  mark (everything before schema 8) is worth its shares at the price paid.
+* **Skips:** `no_slot` (all positions open), `no_cash`, `below_minimum`,
+  `event_cap` (one event over 20% of equity), plus the cutoff's `too_long` and
+  `no_end_date`. An order that would not have filled is a miss, not a skip.
+* **Minimum order.** Polymarket's real minimum is per market and in shares
+  (`min_order_size` on the book, 5 on every book sampled), not dollars.
+  `min_order_usd` is our own floor on top of it. Both apply.
+* **Fill prices.** From schema 8 each signal stores the ask levels it saw, so a
+  stake of any size is walked through that book: a $100,000 wallet misses what
+  an $8 order fills. Older signals carry only what a $10 order paid. A larger
+  stake priced that way is flagged optimistic and counted.
+* **Runs.** Each runner has its own wallet. A run ends when the amount or a
+  `bankroll` setting changes, and a new one starts. An ended run's figures are
+  frozen and a database trigger refuses any later change or deletion.
+* **Replay and live are one engine.** It walks signals in the order they were
+  decided and uses only what was known then. The replay covers a source's whole
+  history, with and without the cutoff. The live wallet covers signals since
+  its run began. The bot model, the old rule and each simulated backtest are
+  replayed separately and never mixed.
+* **Not a forecast.** A wallet is one path. With and without the cutoff the two
+  wallets hold different trades from the first skip on, so most of the gap
+  between them is luck. No confidence interval is given for a single path; the
+  per-trade ROI interval is the evidence, and the page says when there are too
+  few settled trades.
+
+On the sandbox copy (2026-11-12, $100): the bot's 55 live signals leave $85.55
+after 10 trades taken, with 20 signals lost to `no_slot`. The three simulated
+strategies end between $0.00 and $75.02. An 8% stake on signals with a negative
+edge compounds down fast, and one replay peaked at $231 before reaching zero.
 
 **The dashboard** (`dashboard.py`, `dashview.py`, v2 Phase 4). A third
 container that shows everything `stats` prints, as pages: Overview, Edge,
@@ -252,8 +299,12 @@ Wallets (with a page per wallet and the watchlist timeline), Trades (with CSV
 export), Breakdowns and Health. One filter row scopes every number on a page:
 date range, day or week, strategy, venue, wallet, and "exclude outage windows".
 
-* **Read-only.** The database is opened read-only and query-only, every route
-  is a GET, and a test proves a write is refused.
+* **It reads, with one exception.** The database is opened read-only and
+  query-only and every page is a GET. The one thing the site can change is the
+  simulated wallet amount: a form that writes one row of the `settings` table
+  through a connection SQLite restricts to that table. Tests prove that it
+  cannot touch a trade, an alert or a wallet run, that a form on another
+  website is refused, and that every other route refuses a write.
 * **Tailnet only.** Compose publishes the port on the host's `127.0.0.1` and
   nowhere else, so nothing on the LAN or the internet can reach it. Run
   directly, the command refuses any address but loopback. To open it from your

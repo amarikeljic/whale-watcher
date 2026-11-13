@@ -35,12 +35,14 @@ Comparison columns on the hold strategies, same stake, never in the headline:
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 from dataclasses import dataclass
 from typing import Any
 
 from .app import App
+from .bankroll import HEADLINE
 from .config import BOT_STRATEGIES, StrategyConfig
 from .fees import rate_for, taker_fee
 from .horizon import close_skip, days_to_close, scheduled_end
@@ -52,6 +54,8 @@ log = logging.getLogger(__name__)
 
 HOLD = ("flat_hold", "scaled_hold")      # strategies that carry the comparison columns
 EXIT_RETRY_SECONDS = 5.0
+BOOK_LEVELS_KEPT = 25           # ask levels stored with each signal
+SKIPPED_SETTLE_SECONDS = 3600   # how often skipped signals' markets are checked for a result
 MARKOUT_SETTLE_SECONDS = 120             # let the price series catch up before reading it
 
 
@@ -118,6 +122,8 @@ class Bot:
         self.runner = runner
         self.cfg = app.cfg.bot
         self._last_markouts = 0.0
+        self._last_marks = float("-inf")             # mark on the first tick
+        self._last_skipped_settle = float("-inf")    # and look at skipped signals on the first settle
 
     def strategy_cfg(self, strategy: str) -> StrategyConfig:
         return getattr(self.cfg, strategy)
@@ -254,8 +260,8 @@ class Bot:
             "status, reason, signal_ts, detected_at, decided_at, due_at, stake_usd, whale_price, best_ask, "
             "fill_price, contracts, fees, cost, levels, zero_price, zero_contracts, zero_cost, human_due, "
             "human_done, whale_shares, updated_at, fee_rate, fee_source, slippage_cost, skip_code, "
-            "scheduled_end, days_to_close) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "scheduled_end, days_to_close, asks_json, limit_price, min_order_size) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.runner, strategy, alert["id"], alert["wallet"], alert["condition_id"], alert["token_id"], event_key,
              status, reason, signal_ts, detected_at, decided_at, due_at, stake, whale_price,
              book.best_ask if book else None,
@@ -265,7 +271,11 @@ class Bot:
              zero[0] if zero else None, zero[1] if zero else None, zero[3] if zero else None,
              human_due, 0 if human_due is not None else 1, alert["whale_shares"], self.app.clock(),
              decision.fee_rate if decision and walk else None, decision.fee_source if decision and walk else None,
-             slippage(walk, book.best_ask if book else None), skip_code, horizon[0], horizon[1]))
+             slippage(walk, book.best_ask if book else None), skip_code, horizon[0], horizon[1],
+             # The asks as they were, so an order of any size can be priced later (bankroll.py).
+             json.dumps([[lv.price, lv.size] for lv in book.asks[:BOOK_LEVELS_KEPT]]) if book and book.asks else None,
+             whale_price + self.cfg.max_slippage if strategy != "placebo_late" and whale_price is not None else None,
+             book.min_order_size if book else None))
 
     def set_whale_position(self, alert_id: int, shares: float | None) -> None:
         """What the whale held in the outcome when we entered: the base for mirror exits."""
@@ -335,7 +345,62 @@ class Bot:
         if now - self._last_markouts >= 60:
             self._last_markouts = now
             out["markouts"] = await self._markouts(now)
+        if now - self._last_marks >= self.app.cfg.bankroll.mark_interval_seconds:
+            self._last_marks = now
+            out["marks"] = await self.mark_positions()
         return out
+
+    async def mark_positions(self) -> int:
+        """Record the best bid of every open position, so the wallet's equity can be
+        marked to what the position would sell for. A book with no bids records
+        nothing: the last mark stands (a market about to resolve often has none)."""
+        app = self.app
+        tokens = [r["token_id"] for r in app.db.query(
+            "SELECT DISTINCT token_id FROM bot_trades WHERE runner = ? AND status = 'FILLED' AND closed_at IS NULL",
+            (self.runner,))]
+        now, done = int(app.clock()), 0
+        for token in tokens:
+            try:
+                book = await app.clob.book(token)
+            except Exception as exc:  # noqa: BLE001 - a mark is not worth stopping for
+                log.debug("no mark for %s: %s", token, exc)
+                continue
+            if book is None or book.best_bid is None:
+                continue
+            app.db.execute("INSERT OR IGNORE INTO position_marks (token_id, ts, best_bid) VALUES (?,?,?)",
+                           (token, now, book.best_bid))
+            done += 1
+        return done
+
+    async def settle_skipped(self) -> int:
+        """A signal the fixed-stake strategy skipped still has an outcome, and the wallet
+        may have taken it (its limits are its own). Record that outcome on the row:
+        ``payout_per_share`` and ``resolved_at`` only. The row stays SKIPPED, with no
+        P&L, and counts in no total. Checked hourly: these can be months away."""
+        app = self.app
+        if app.wall() - self._last_skipped_settle < SKIPPED_SETTLE_SECONDS:
+            return 0
+        self._last_skipped_settle = app.wall()
+        rows = app.db.query("SELECT id, condition_id, token_id FROM bot_trades WHERE runner = ? AND strategy = ? "
+                            "AND status = 'SKIPPED' AND payout_per_share IS NULL", (self.runner, HEADLINE))
+        if not rows:
+            return 0
+        # The pass itself is hourly; within it, metadata as fresh as any settlement uses.
+        markets = await app.markets.ensure({r["condition_id"] for r in rows},
+                                           refresh_after=app.cfg.paper.settle_interval_seconds)
+        done = 0
+        for t in rows:
+            market = markets.get(t["condition_id"])
+            if market is None or not market.resolved or market.payouts is None:
+                continue
+            pps = market.payout_for(market.outcome_index_of(t["token_id"]))
+            if pps is None:
+                continue
+            app.db.execute("UPDATE bot_trades SET payout_per_share = ?, resolved_at = ?, updated_at = ? "
+                           "WHERE id = ? AND status = 'SKIPPED' AND payout_per_share IS NULL",
+                           (pps, market.resolved_at, app.clock(), t["id"]))
+            done += 1
+        return done
 
     async def _placebos(self, now: float) -> int:
         app = self.app
@@ -416,6 +481,10 @@ class Bot:
     async def settle(self) -> int:
         """Close every position (and settle every comparison) whose market has resolved."""
         app = self.app
+        try:
+            await self.settle_skipped()
+        except Exception as exc:  # noqa: BLE001 - the wallet's extra, never in the way of real settlement
+            log.warning("could not check skipped signals for results: %s", exc)
         rows = app.db.query("SELECT * FROM bot_trades WHERE runner = ? AND closed_at IS NULL "
                             "AND status IN ('FILLED', 'MISSED')", (self.runner,))
         if not rows:

@@ -41,7 +41,8 @@ SELECT p.*, a.wallet, a.kind, a.outcome, a.whale_price, a.whale_usd, a.first_fil
        a.trigger_fill_ts,
        a.detected_at, a.posted_at, a.status AS alert_status, a.snapshot_run_id, a.probation, a.membership_id,
        m.category, m.question, m.slug, m.event_slug, m.game_start_time,
-       m.end_date AS market_end, m.resolved_at AS market_resolved_at
+       m.end_date AS market_end, m.resolved_at AS market_resolved_at, m.fee_rate AS market_fee_rate,
+       m.fees_enabled AS market_fees_enabled, m.fee_exponent AS market_fee_exponent
 FROM paper_trades p
 JOIN alerts a ON a.id = p.alert_id
 LEFT JOIN poly_markets m ON m.condition_id = p.condition_id
@@ -119,7 +120,8 @@ BOT_HEADLINE = "flat_hold"
 BOT_QUERY = """
 SELECT b.*, a.kind, a.outcome, a.whale_usd, a.probation, a.membership_id, a.detect_delay, a.trigger_fill_ts,
        a.snapshot_run_id, m.category, m.question, m.slug, m.event_slug, m.game_start_time,
-       m.end_date AS market_end, m.resolved_at AS market_resolved_at
+       m.end_date AS market_end, m.resolved_at AS market_resolved_at, m.fee_rate AS market_fee_rate,
+       m.fees_enabled AS market_fees_enabled, m.fee_exponent AS market_fee_exponent
 FROM bot_trades b
 LEFT JOIN alerts a ON a.id = b.alert_id
 LEFT JOIN poly_markets m ON m.condition_id = b.condition_id
@@ -286,6 +288,7 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
                          f"{_pct(m)}, 95% CI {ci} -> {verdict}")
     for runner in sorted({r for r, _ in by}):
         lines += cutoff_lines(app, runner, by.get((runner, BOT_HEADLINE), []))
+    lines += wallet_lines(app, trades, brief=brief)
     lines += detection_lines(app)
     if with_breakdowns:
         headline = [t for t in trades if t["strategy"] == BOT_HEADLINE and t["status"] != "SKIPPED"]
@@ -294,6 +297,18 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
                                       ("watchlist status", "month", "category", "days to close when entered",
                                        "holding time", "entry price", "wallet"))
     return lines
+
+
+def wallet_lines(app: App, bot_trades: list[dict], *, brief: bool) -> list[str]:
+    """v2.1 Part 2: the small wallet, per runner. The daily summary gets the bot
+    runners only; the full report adds the old rule and each simulated backtest."""
+    from . import bankroll
+    records = bot_trades if brief else bot_trades + load_trades(app)
+    try:
+        lines = bankroll.render(records, app.cfg, app.db, app.clock(), brief=brief, simulated=not brief)
+    except Exception as exc:  # noqa: BLE001 - a report must not fail on its newest section
+        return [f"  (the small-wallet section could not be worked out: {type(exc).__name__}: {exc})"]
+    return ([""] + lines) if lines else []
 
 
 @dataclass
@@ -679,6 +694,52 @@ def export_bot_csv(app: App, path: str) -> int:
 
 
 def daily_summary(app: App) -> str:
-    """The short version for the stats webhook: live in full, each backtest strategy in one line."""
-    text = render(app, with_breakdowns=False, brief_backtest=True)
+    """The short version for the stats webhook (Discord cuts a message at 2,000
+    characters). Per runner: net P&L with its n and interval, where the money went,
+    what the time-to-close cutoff skipped, and the small wallet. The full report is
+    ``stats`` and the dashboard."""
+    from . import bankroll
+    bots = load_bot_trades(app)
+    if not bots:        # only old-rule or simulated trades: the old short report
+        text = render(app, with_breakdowns=False, brief_backtest=True)
+        return text if len(text) <= 1900 else text[:1890] + "\n…"
+    threshold, samples = app.cfg.stats.min_settled_for_conclusions, min(app.cfg.stats.bootstrap_samples, 2000)
+    by: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for t in bots:
+        by[(t["runner"], t["strategy"])].append(t)
+    lines: list[str] = []
+    for runner in sorted({r for r, _ in by}):
+        rows = by.get((runner, BOT_HEADLINE), [])
+        traded = [t for t in rows if t["status"] != "SKIPPED"]
+        s = summarise(runner, traded, samples=samples)
+        lines.append(f"{runner} / {BOT_HEADLINE} (paper)")
+        if s.settled < threshold:
+            lines.append(f"  ⚠ only {s.settled} closed trades (need {threshold}): everything here is noise so far")
+        if s.settled:
+            lines.append(f"  net {_money(s.total_pnl)} on ${s.total_cost:,.2f} staked, n={s.settled} closed | ROI "
+                         f"{_pct(s.roi)} | mean per trade {_pct(s.mean_roi)}, 95% CI {_ci_text(s)} | win rate "
+                         f"{s.win_rate:.0%}")
+            lines.append(cost_line(traded).split("   (")[0])
+        else:
+            lines.append("  no closed trades yet, so no P&L")
+        c = cutoff_report(app, rows)
+        limit = "off" if c.limit is None else f"{c.limit:g}-day"
+        lines.append(f"  signals {len(rows)}: filled {s.filled}, missed {s.missed}, skipped {len(rows) - len(traded)} "
+                     f"| open {s.open} | time-to-close cutoff ({limit}) skipped {c.too_long + c.no_end_date} "
+                     f"({TOO_LONG} {c.too_long}, {NO_END_DATE} {c.no_end_date})")
+        try:
+            for view in bankroll.views(bots, app.cfg, app.db, app.clock(), only=f"bot:{runner}"):
+                amount = view.replay.params.amount
+                if view.live is not None:
+                    lines.append(f"  ${amount:,.2f} wallet, {view.live.label.lower()}: {bankroll.result_line(view.live)}")
+                lines.append(f"  ${amount:,.2f} wallet, replay of every signal: {bankroll.result_line(view.replay)}")
+        except Exception as exc:  # noqa: BLE001 - the summary must still go out
+            lines.append(f"  (the wallet could not be worked out: {type(exc).__name__})")
+        n, m, lo, hi = _paired(rows, by.get((runner, "placebo_late"), []), samples)
+        if n:
+            ci = "-" if lo is None else f"[{_pct(lo)}, {_pct(hi)}]"
+            lines.append(f"  against the control (same outcome, later), n={n}: {_pct(m)} ROI per trade, 95% CI {ci}")
+    lines += detection_lines(app)[:1]
+    lines.append("Full report: `python -m whalewatcher stats`, or the dashboard.")
+    text = "\n".join(lines)
     return text if len(text) <= 1900 else text[:1890] + "\n…"
