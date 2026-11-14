@@ -39,6 +39,34 @@ under SIMULATED, apart from the live ones:
 docker compose exec whale-watcher python -m whalewatcher backtest --dataset data/optimize-folds.json
 ```
 
+## Deploying the Part 4 batch (2026-11-14)
+
+1. **Check free disk first.** Opening the database upgrades it to schema 11, and
+   before that it copies the whole file to `data/backups/`. It needs free space of
+   about the database's size, and refuses to upgrade (changing nothing) if there
+   is not enough: `du -h data/whalewatcher.sqlite3` against `df -h .`
+2. **Deploy:** `GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build`
+3. **What the first start does.** On a 6 GB copy of the live data the upgrade took
+   70 seconds, backup included, and kept every row. Then:
+   * the gap while the service was down is recorded as an outage window, so
+     signals from the restart are left out of results;
+   * the headline starts again at model 1, from zero. Everything from before is
+     under Version → "Before tagging" on the dashboard, or `stats --model before`;
+   * the simulated wallet ends its run ("model version changed from before
+     tagging to model 1") and starts a new one;
+   * the follow-up is filled in for every past alert (seconds), settled trades get
+     a resolution type (100 per settle), and old fills get their 1- and 30-minute
+     prices a few dozen a minute.
+4. The dashboard says "Not ready" until the runner has upgraded the database.
+5. **Optional, once:** `python3 scripts/check_block_times.py --db data/whalewatcher.sqlite3`
+   on the server (standard library only; it reads the database read-only and asks
+   one public Polygon RPC, `polygon.drpc.org`, for receipts and blocks).
+6. **Still yours to do:** delete the old `.env` if it is still on the server, and
+   delete the two Discord webhooks so their addresses stop working.
+
+`stats` (the full report) takes about a minute and a half on a database this size,
+mostly for the breakdowns of the simulated replays. `stats --brief` is instant.
+
 ## Commands
 
 ```bash

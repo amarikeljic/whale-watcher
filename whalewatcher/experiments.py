@@ -34,6 +34,11 @@ log = logging.getLogger(__name__)
 PRIMARY, CONTROL, COMPARISON, EXPLORATORY, SIMULATED = "primary", "control", "comparison", "exploratory", "simulated"
 ROLE_OF = {"flat_hold": PRIMARY, "placebo_late": CONTROL, "flat_mirror": EXPLORATORY, "scaled_hold": EXPLORATORY}
 SAMPLES = 2000
+# Draws x rows per interval at most. A replay with 13,000 trades gets 200 draws instead of
+# 2,000: with that many trades the interval barely moves between runs, and the dashboard
+# page stays quick. Small samples, where the draws matter, keep all 2,000.
+WORK = 2_000_000
+MIN_SAMPLES = 200
 
 
 @dataclass
@@ -74,7 +79,8 @@ def _interval(rows: list[dict], roi) -> tuple[int, float | None, float | None, f
         events.append(r.get("event_slug") or r.get("event_key") or r.get("condition_id") or "")
     if not vals:
         return 0, None, None, None
-    m, lo, hi = two_way_bootstrap_mean_ci(vals, wallets, events, samples=SAMPLES)
+    samples = max(MIN_SAMPLES, min(SAMPLES, WORK // len(vals)))
+    m, lo, hi = two_way_bootstrap_mean_ci(vals, wallets, events, samples=samples)
     return len(vals), m, lo, hi
 
 
@@ -128,7 +134,9 @@ def build(app: Any, rows: list[dict] | None = None) -> list[Experiment]:
             _column_roi("zero_pnl", "zero_cost"))
         add("column:human", "single / flat_hold a minute later (the old rule's delay)", COMPARISON, head,
             _column_roi("human_pnl", "human_cost"))
-    paper = load_trades(app)
+    # The old rule and the replays: from the rows given when they include them (the
+    # dashboard's records do), else read here.
+    paper = [r for r in rows if "runner" not in r] or load_trades(app)
     old = [t for t in paper if not str(t["strategy"]).startswith("backtest:")]
     if old:
         add("old:live", "Old rule, live (closed to new alerts)", COMPARISON, old, _paper_roi, live=False)

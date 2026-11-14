@@ -4,7 +4,10 @@ Written 2026-11-14 for the v2.1 brief, Part 4: "For each one: tell me whether th
 current code already handles it, and if not, propose a fix and wait for my
 go-ahead. Some may need only a measurement, not a fix."
 
-Nothing in this file has been built. Every proposed fix waits for a go-ahead.
+**Update, the same day:** every proposed fix was approved ("yes for all three") and
+has been built. The "Built" column below says where. Item 7's description of
+Polymarket's rounding was wrong and is corrected under 7. The text of each item is
+otherwise as first written, so the reasoning stays readable.
 
 Measurements come from the sandbox copy of the database: 60 live alerts from 18
 watched wallets, 30 bot fills, 22 of them settled, 2,050 detected fills. That is
@@ -12,27 +15,27 @@ a small sample, so read each figure as "is this a problem at all", not as a rate
 
 ## The short version
 
-| # | Worry | Today | What it needs |
-| --- | --- | --- | --- |
-| 1 | Mixed code versions | Not handled | Tag every row with the commit and a model version |
-| 2 | Too many experiments | Partly | A list of every variation, and a forward test before believing one |
-| 3 | Hindsight in wallet selection | Partly, plus a bug | An end-to-end test, two small leaks closed, a frozen rule fixed |
-| 4 | Correlated bets | Handled | Nothing |
-| 5 | In-play quality | Partly | Prices 1 and 30 minutes after each fill, by wallet |
-| 6 | Stale order books | Not measured | Record the fetch time and re-read the book 1 second later |
-| 7 | Price rules | Partly | Round amounts and shares the way the exchanges do |
-| 8 | Marking open positions | Partly | A conservative value from walking the bids |
-| 9 | Settlement timing | Mostly handled | Name the two times separately |
-| 10 | Bait trades | Measured: none seen | Keep measuring per wallet and flag repeat offenders |
-| 11 | Hedges | Measured: real | Mark possible hedges and report them apart |
-| 12 | Following buys, not sells | Mostly handled | One comparison line |
-| 13 | Disputed, delayed, voided markets | Partly | A resolution type per trade, P&L by type |
-| 14 | Fee changes | Partly | Log when a published fee changes |
-| 15 | Outages | Partly | Record them automatically, exclude by default |
-| 16 | Block time vs API time | Unverified, nothing odd seen | A one-off check against the chain (needs your OK) |
-| 17 | Rate limits and terms | Limits yes, terms no | A sources list, and reading the terms (needs your OK) |
-| 18 | Dependencies | Not handled | Pin exact versions with a purpose list |
-| 19 | Secrets | Handled | Delete the old `.env` on the server, revoke the webhooks |
+| # | Worry | Today | What it needs | Built |
+| --- | --- | --- | --- | --- |
+| 1 | Mixed code versions | Not handled | Tag every row with the commit and a model version | `version.py`; headlines count model 1; Version picker |
+| 2 | Too many experiments | Partly | A list of every variation, and a forward test before believing one | `experiments.py`, `experiment_flags` |
+| 3 | Hindsight in wallet selection | Partly, plus a bug | An end-to-end test, two small leaks closed, a frozen rule fixed | `tests/test_hindsight.py`; both leaks fail it on the old code |
+| 4 | Correlated bets | Handled | Nothing | nothing needed |
+| 5 | In-play quality | Partly | Prices 1 and 30 minutes after each fill, by wallet | 1, 5 and 30 min, in-play, pre-game, by wallet |
+| 6 | Stale order books | Not measured | Record the fetch time and re-read the book 1 second later | second read in the background; fetch time per alert |
+| 7 | Price rules | Partly | Round amounts and shares the way the exchanges do | `precision.py`, both venues and the wallet |
+| 8 | Marking open positions | Partly | A conservative value from walking the bids | conservative equity; US positions marked from the US book |
+| 9 | Settlement timing | Mostly handled | Name the two times separately | `paid_at` beside `resolved_at`, gap reported |
+| 10 | Bait trades | Measured: none seen | Keep measuring per wallet and flag repeat offenders | `followup.py`, switch off |
+| 11 | Hedges | Measured: real | Mark possible hedges and report them apart | `followup.py`, switches off |
+| 12 | Following buys, not sells | Mostly handled | One comparison line | `stats` and Edge page |
+| 13 | Disputed, delayed, voided markets | Partly | A resolution type per trade, P&L by type | `resolution_type`; disputes from Gamma's UMA history |
+| 14 | Fee changes | Partly | Log when a published fee changes | `fee_changes`, Health page |
+| 15 | Outages | Partly | Record them automatically, exclude by default | `outages.py`; excluded unless asked |
+| 16 | Block time vs API time | Unverified, nothing odd seen | A one-off check against the chain (needs your OK) | `scripts/check_block_times.py`: equal on 200 of 200 |
+| 17 | Rate limits and terms | Limits yes, terms no | A sources list, and reading the terms (needs your OK) | `docs/data-sources.md`: read, quoted, 3 open questions |
+| 18 | Dependencies | Not handled | Pin exact versions with a purpose list | pinned, base image by digest, `docs/dependencies.md` |
+| 19 | Secrets | Handled | Delete the old `.env` on the server, revoke the webhooks | rechecked: none in the history; the server's `.env` is yours to delete |
 
 Found along the way (not on your list):
 
@@ -197,10 +200,17 @@ the precision table, read 2026-11-14):
 * **Tick size.** Fills only happen at real book levels, which are always on the
   tick. The limit price (the whale's price plus 3 cents) is not rounded to the
   tick, but that never changes which levels qualify.
-* **Rounding.** Not done. For a market buy Polymarket rounds the dollar amount
-  down to the cent and the shares down to 4 decimals at a 0.01 tick (3 to 6
-  depending on the tick). Polymarket US trades in steps of 0.01 contracts. Paper fills keep every
-  decimal, and the small wallet's stakes are not rounded to the cent.
+* **Rounding.** Not done. Paper fills keep every decimal, and the small wallet's
+  stakes are not rounded to the cent.
+
+  **Correction (same day, re-read while building it).** I first wrote that
+  Polymarket rounds the shares to 4 decimals at a 0.01 tick. The page says otherwise:
+  shares are rounded down to **2** decimals at every tick size (the "size
+  decimals"), and it is the dollar amount that has 3 to 6 decimals depending on the
+  tick ("round it up first to Amount decimals + 4, then down to Amount decimals").
+  Polymarket US allows decimal quantities only on markets whose minimum is below
+  one contract (0.01 on almost all of them). `precision.py` follows the corrected
+  reading.
 
 **Proposed fix.** Apply the precision table to every paper fill on both venues and
 round wallet stakes down to the cent. The effect is pennies a trade.
