@@ -258,6 +258,8 @@ color:var(--ink2)}
 .rule-tests{list-style:none;margin:6px 0 12px;padding:0}.rule-tests li{padding:9px 0;border-top:1px solid var(--border)}
 .rule-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.rule-head .pill{white-space:nowrap;flex:none}
 .rule-now{margin-top:3px;color:var(--ink2);font-size:14px;font-variant-numeric:tabular-nums}
+.review-list{list-style:none;margin:6px 0 0;padding:0}.review-list li{padding:7px 0;border-top:1px solid var(--border);
+font-size:14px;line-height:1.45}.review-list code{font-size:13px}
 .hbar .hbar-axis{fill:var(--axis)}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:5px 16px;font-size:14px;margin:6px 0 0}
 .kv dt{color:var(--ink2)}.kv dd{margin:0;font-variant-numeric:tabular-nums}

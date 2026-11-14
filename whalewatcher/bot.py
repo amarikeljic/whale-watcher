@@ -138,6 +138,12 @@ class Bot:
     def enabled(self) -> list[str]:
         return [s for s in BOT_STRATEGIES if self.strategy_cfg(s).enabled]
 
+    def limit_for(self, strategy: str, whale_price: float) -> float:
+        """The fill-or-kill limit: the whale's price plus the strategy's own chase limit,
+        or the bot's (tight_hold tests a second one)."""
+        own = self.strategy_cfg(strategy).max_slippage
+        return whale_price + (self.cfg.max_slippage if own is None else own)
+
     # -- the account -------------------------------------------------------------------
 
     def account(self, strategy: str) -> Account:
@@ -249,7 +255,7 @@ class Bot:
             else:
                 blocked = self.limit_reason(strategy, stake, alert["condition_id"], event_key)
                 decision = (Decision("SKIPPED", blocked) if blocked else
-                            self.decide_buy(book, stake, market, limit_price=whale_price + self.cfg.max_slippage))
+                            self.decide_buy(book, stake, market, limit_price=self.limit_for(strategy, whale_price)))
             compare = strategy in HOLD and decision.status != "SKIPPED" and market is not None
             zero = shadow_fill(whale_price, stake, market) if compare else None
             human_due = (decided_at + self.cfg.human_delay_seconds
@@ -287,7 +293,7 @@ class Bot:
              slippage(walk, book.best_ask if book else None), skip_code, horizon[0], horizon[1],
              # The asks as they were, so an order of any size can be priced later (bankroll.py).
              json.dumps([[lv.price, lv.size] for lv in book.asks[:BOOK_LEVELS_KEPT]]) if book and book.asks else None,
-             whale_price + self.cfg.max_slippage if strategy != "placebo_late" and whale_price is not None else None,
+             self.limit_for(strategy, whale_price) if strategy != "placebo_late" and whale_price is not None else None,
              book.min_order_size if book else None, book.tick_size if book else None))
 
     def set_whale_position(self, alert_id: int, shares: float | None) -> None:

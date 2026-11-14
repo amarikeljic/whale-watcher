@@ -94,7 +94,8 @@ async def test_a_whale_buy_is_filled_from_the_book_at_detection(live_app, fake_h
     assert "Paper bot: bought $10 at 0.440, 3s after the whale" in alert["message"]
     assert live_app.db.one("SELECT COUNT(*) n FROM paper_trades")["n"] == 0, "no new old-rule trades"
     assert {r["strategy"]: r["status"] for r in trades(live_app)} == {
-        "flat_hold": "FILLED", "flat_mirror": "FILLED", "scaled_hold": "FILLED", "placebo_late": "PENDING"}
+        "flat_hold": "FILLED", "flat_mirror": "FILLED", "scaled_hold": "FILLED", "placebo_late": "PENDING",
+        "tight_hold": "MISSED"}, "the book is 2c above the whale: past tight_hold's 1c limit, inside flat_hold's 3c"
 
 
 async def test_fees_are_charged_per_level_on_the_way_in(live_app, fake_http, clock):
@@ -417,7 +418,48 @@ async def test_stats_put_the_bot_first_and_keep_the_old_rule_as_its_own_section(
     assert "DETECTION DELAY (whale's fill -> our detector saw it), n=1 alerts: median 3.0s" in text
     assert "1 from the global feed, 0 that only the per-wallet backstop saw" in text
     assert "polymarket / hold_to_resolution" in text and "By watchlist status (flat_hold):" in text
-    assert len(load_bot_trades(live_app)) == 4
+    assert len(load_bot_trades(live_app)) == 5
     from whalewatcher.stats import daily_summary
     from whalewatcher.stats import SUMMARY_LIMIT
     assert len(daily_summary(live_app)) <= SUMMARY_LIMIT
+
+
+# -- a second chase limit (owner's question 8, 2026-11-14) ----------------------------------------------
+
+
+async def test_tight_hold_gives_up_one_cent_above_the_whale_and_flat_hold_three(live_app, fake_http, clock):
+    world, monitor, bot = setup(live_app, fake_http, asks=((0.425, 1000),))      # half a cent above the whale
+    world.trade(WHALE, NOW - 3, COND, size=1500, price=0.42, usdc=630, feed=True)
+    await monitor.poll_once()
+    tight = one(live_app, "tight_hold")
+    assert tight["status"] == "FILLED" and tight["limit_price"] == pytest.approx(0.43)
+    assert one(live_app, "flat_hold")["limit_price"] == pytest.approx(0.45)
+
+    world.add_market(FakeMarket("0xn", end_date=NOW + 30 * DAY))
+    world.set_book("0xn-t0", [(0.44, 1000)], [(0.40, 500)])                     # 2 cents above
+    world.trade(WHALE, NOW - 2, "0xn", size=1500, price=0.42, usdc=630, feed=True)
+    await monitor.poll_once()
+    rows = {t["strategy"]: t for t in trades(live_app) if t["condition_id"] == "0xn"}
+    assert rows["flat_hold"]["status"] == "FILLED"
+    assert rows["tight_hold"]["status"] == "MISSED" and rows["tight_hold"]["reason"].startswith("price ran")
+
+
+async def test_the_report_compares_the_two_limits_on_the_same_signals(live_app, fake_http, clock):
+    from whalewatcher.stats import render
+    world, monitor, bot = setup(live_app, fake_http)                            # the book is 2c above the whale
+    world.trade(WHALE, NOW - 3, COND, size=1500, price=0.42, usdc=630, feed=True)
+    await monitor.poll_once()
+    world.markets[COND].resolved_at, world.markets[COND].payouts = clock.now + 60, [1.0, 0.0]
+    clock.advance(700)
+    await bot.settle()
+    text = render(live_app)
+    assert ("single: chase limit on the same 1 settled signals (a miss is $0): up to 3c +$12.72 (1 filled) | "
+            "up to 1c +$0.00 (0 filled)") in text, "the 3c limit caught a winner the 1c limit missed"
+
+
+def test_a_strategys_own_chase_limit_is_checked():
+    from whalewatcher.config import Config, ConfigError, validate
+    cfg = Config()
+    cfg.bot.tight_hold.max_slippage = 1.5
+    with pytest.raises(ConfigError, match="tight_hold.max_slippage"):
+        validate(cfg)

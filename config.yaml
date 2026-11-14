@@ -80,6 +80,14 @@ bot:
     max_market_exposure_usd: 30   # open cost in one market
     max_event_exposure_usd: 50    # ...and in one event (one game has several markets)
     daily_loss_limit_usd: 100     # realised loss in a UTC day that pauses new entries
+  tight_hold:                     # the same as flat_hold, with a 1-cent chase limit instead of 3:
+    starting_bankroll: 1000       # does paying up to 3 cents more than the whale cost the edge?
+    stake_usd: 10
+    max_stake_usd: 10
+    max_market_exposure_usd: 30
+    max_event_exposure_usd: 50
+    daily_loss_limit_usd: 100
+    max_slippage: 0.01            # this strategy's own limit: the whale's price + 1 cent
   flat_mirror:                    # fixed stake, sold when the whale sells
     starting_bankroll: 1000
     stake_usd: 10

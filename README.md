@@ -225,6 +225,15 @@ rule (a book walk 60 s later). Paper trades made before the bot model stay in
 `paper_trades` under their old label and `stats` shows them as their own
 section.
 
+*A second chase limit* (`tight_hold`, the owner's question 8). The same signals,
+stake and book read as the headline, but it gives up 1 cent above the whale's
+price instead of 3. Most signals sit 1 to 2 cents above the whale (22 and about 10
+of 57 on the test copy), so 1 cent changes about a third of them, where a looser
+6 cents would change 4. `stats` compares the two on the same settled signals,
+counting a miss as $0, with the interval of the difference. Its own setting is
+`bot.tight_hold.max_slippage`. It is listed as an exploratory variation: it can
+only replace the headline by passing the decision rule on later signals.
+
 *CLV.* Pre-game fills are compared with the closing line as before. Every fill,
 in-play included, also gets the price **1, 5 and 30 minutes** after it, which is
 the only honest reference for a bet placed during a game. `stats` and the Edge
@@ -297,7 +306,9 @@ is the hurdle a copy strategy has to clear before anything else.
 ### The daily summary (v2 Phase 5)
 
 Once a day (`stats.daily_summary_hour_utc`) the runner writes it to the log, and
-`stats --brief` prints it any time. Per runner it puts **the last 24 hours beside
+`stats --brief` prints it any time. The same figures are on the dashboard's
+Overview page, one card per runner plus a "Last nightly review" card, laid out to
+fit a phone. Per runner it puts **the last 24 hours beside
 all-time**: signals filled, missed and skipped, closed trades, net P&L, mean
 return per trade with its 95% interval, win rate, and fees and slippage, so no
 profit figure appears without its n and interval. Then the decision rule, what

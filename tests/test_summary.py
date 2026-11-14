@@ -63,3 +63,20 @@ async def test_the_nightly_reviews_changes_are_listed(app):
 async def test_before_any_review_the_summary_says_so(app):
     Fixture(app.db, NOW).trade(A, 2, pnl=1.0)
     assert "watchlist: no nightly review has run yet" in daily_summary(app)
+
+
+def test_the_overview_carries_the_daily_summary(tmp_path):
+    from dashfix import small
+    from whalewatcher import dashboard as dash
+    from whalewatcher.config import Config
+    path = str(tmp_path / "ww.sqlite3")
+    fx = small(path, NOW)
+    fx.db.execute("INSERT INTO watchlist_events (at, run_id, wallet, action, detail) VALUES (?, 3, ?, 'ADD', ?)",
+                  (NOW - 3600, "0x" + "e" * 40, "passed the entry rules: rank 2 by roi"))
+    fx.db.close()
+    html = dash.render(Config(database_path=path), path, "/", {"outages": "include"}, now=NOW)[1]
+    assert "Last 24 hours and all-time: Bot" in html and "Last 24 hours and all-time: Polymarket US" in html
+    assert "Signals: filled / missed / skipped" in html and "Mean return per trade, 95% CI" in html
+    assert "Last nightly review" in html and "Added 1, removed 0" in html
+    assert "0xeeee…eeee" in html and "passed the entry rules: rank 2 by roi" in html
+    assert "today" not in html.lower().replace("todays", "")

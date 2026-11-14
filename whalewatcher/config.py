@@ -152,6 +152,14 @@ class StrategyConfig:
     max_market_exposure_usd: float = 30.0   # open cost in one market
     max_event_exposure_usd: float = 50.0    # ...and in one event: wallets pile into the same game
     daily_loss_limit_usd: float = 100.0     # realised loss in a UTC day that pauses new entries
+    max_slippage: float | None = None       # this strategy's own chase limit; None: bot.max_slippage
+
+
+def _tight() -> StrategyConfig:
+    """The owner asked to test a second chase limit (2026-11-14). 1 cent, because most
+    signals sit 1 to 2 cents above the whale's price: a looser limit would change 4
+    signals in 57, a tighter one about a third of them."""
+    return StrategyConfig(max_slippage=0.01)
 
 
 def _scaled() -> StrategyConfig:
@@ -175,6 +183,7 @@ class BotConfig:
     recheck_book: bool = True               # Part 4 #6: read the book again after each decision (measurement only)
     recheck_seconds: float = 1.0            # ... this long after it
     flat_hold: StrategyConfig = field(default_factory=StrategyConfig)
+    tight_hold: StrategyConfig = field(default_factory=_tight)
     flat_mirror: StrategyConfig = field(default_factory=StrategyConfig)
     scaled_hold: StrategyConfig = field(default_factory=_scaled)
     placebo_late: StrategyConfig = field(default_factory=StrategyConfig)
@@ -416,7 +425,7 @@ def _build(cls: type, raw: dict[str, Any], where: str, base: Any = None) -> Any:
     return dataclasses.replace(base, **values)
 
 
-BOT_STRATEGIES = ("flat_hold", "flat_mirror", "scaled_hold", "placebo_late")
+BOT_STRATEGIES = ("flat_hold", "tight_hold", "flat_mirror", "scaled_hold", "placebo_late")
 
 
 def validate(cfg: Config) -> None:
@@ -530,6 +539,8 @@ def validate(cfg: Config) -> None:
             raise ConfigError(f"bot.{name}: stake_usd and starting_bankroll must be positive")
         if st.max_stake_usd < st.stake_usd:
             raise ConfigError(f"bot.{name}.max_stake_usd cannot be below stake_usd")
+        if st.max_slippage is not None and not 0 <= st.max_slippage < 1:
+            raise ConfigError(f"bot.{name}.max_slippage must be at least 0 and below 1")
     p = cfg.paper
     if p.stake_usd <= 0:
         raise ConfigError("paper.stake_usd must be positive")

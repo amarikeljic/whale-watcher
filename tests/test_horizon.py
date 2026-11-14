@@ -108,7 +108,8 @@ async def test_a_market_ending_too_far_away_is_skipped_by_every_strategy(live_ap
     assert (await signal(world, monitor)).alerts == 1, "the alert is still posted: only the paper trade is skipped"
     rows = trades(live_app)
     assert {r["strategy"]: r["status"] for r in rows} == {
-        "flat_hold": "SKIPPED", "flat_mirror": "SKIPPED", "scaled_hold": "SKIPPED", "placebo_late": "SKIPPED"}, \
+        "flat_hold": "SKIPPED", "tight_hold": "SKIPPED", "flat_mirror": "SKIPPED", "scaled_hold": "SKIPPED",
+        "placebo_late": "SKIPPED"}, \
         "the placebo faces the same rule as the strategies it is a control for"
     t = rows[0]
     assert t["skip_code"] == "too_long" and t["reason"] == "too_long: closes in 21.0 days (limit 14)"

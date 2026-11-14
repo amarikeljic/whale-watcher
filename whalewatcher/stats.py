@@ -502,6 +502,29 @@ def exit_comparison(by: dict[tuple[str, str], list[dict]], runner: str, samples:
             f"{n} both closed: {_pct(m)}, 95% CI {ci}"]
 
 
+def limit_comparison(app: App, by: dict[tuple[str, str], list[dict]], runner: str, samples: int) -> list[str]:
+    """The owner's question 8: does chasing the price up to 3 cents above the whale beat
+    stopping at 1? Same signals, same stake, a miss counted as $0, both settled."""
+    loose, tight = by.get((runner, BOT_HEADLINE), []), by.get((runner, "tight_hold"), [])
+    if not tight:
+        return []
+    done = {t["alert_id"]: t for t in tight if t["status"] in ("FILLED", "MISSED") and t["closed_at"] is not None}
+    pairs = [(t, done[t["alert_id"]]) for t in loose if t["alert_id"] in done
+             and t["status"] in ("FILLED", "MISSED") and t["closed_at"] is not None]
+    a, b = app.cfg.bot.max_slippage * 100, (app.cfg.bot.tight_hold.max_slippage or 0) * 100
+    if not pairs:
+        return [f"  {runner}: chase limit {a:.0f}c against {b:.0f}c: no signal both have settled yet"]
+    diffs = [(x["pnl"] or 0.0) - (y["pnl"] or 0.0) for x, y in pairs]
+    m, lo, hi = two_way_bootstrap_mean_ci(diffs, [x["wallet"] for x, _ in pairs], [event_key(x) for x, _ in pairs],
+                                          samples=samples)
+    ci = "-" if lo is None else f"[{_money(lo)}, {_money(hi)}]"
+    return [f"  {runner}: chase limit on the same {len(pairs)} settled signals (a miss is $0): up to {a:.0f}c "
+            f"{_money(sum(x['pnl'] or 0.0 for x, _ in pairs))} ({sum(x['status'] == 'FILLED' for x, _ in pairs)} "
+            f"filled) | up to {b:.0f}c {_money(sum(y['pnl'] or 0.0 for _, y in pairs))} "
+            f"({sum(y['status'] == 'FILLED' for _, y in pairs)} filled) | {a:.0f}c minus {b:.0f}c per signal "
+            f"{_money(m)}, 95% CI {ci}"]
+
+
 def settlement_lines(rows: list[dict], samples: int) -> list[str]:
     """Part 4 #9 and #13: how long the payout took to be recorded, and P&L by how the
     market resolved."""
@@ -542,7 +565,10 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
         if group is None:
             head[0] += f" | bankroll ${acct.equity:,.2f}"
         return head
+    tight = app.cfg.bot.tight_hold.max_slippage
     note = {"flat_hold": "bot fill at detection, held to resolution; the headline",
+            "tight_hold": f"the same, but it gives up {tight * 100:.0f}c above the whale's price instead of "
+                          f"{app.cfg.bot.max_slippage * 100:.0f}c" if tight is not None else "a second chase limit",
             "flat_mirror": "bot fill, sold when the whale sells",
             "scaled_hold": "stake grows with the whale's size, capped",
             "placebo_late": "the control: same outcome at a random later time"}.get(strategy, "")
@@ -653,6 +679,7 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
                          f"{_pct(m)}, 95% CI {ci} -> {verdict}")
         lines += cutoff_lines(app, runner, by.get((runner, BOT_HEADLINE), []))
         lines += exit_comparison(by, runner, samples)
+        lines += limit_comparison(app, by, runner, samples)
         if not brief:
             lines += markout_wallet_lines(by.get((runner, BOT_HEADLINE), []), app.cfg)
             lines += settlement_lines([t for t in trades if t.get("runner") == runner], samples)
@@ -1295,29 +1322,53 @@ def _side_by_side(day: dict[str, Any], ever: dict[str, Any]) -> list[str]:
     return lines
 
 
-def watchlist_lines(app: App, *, show: int = 5) -> list[str]:
-    """What the latest nightly review changed (v2 Phase 5), from watchlist_events."""
+@dataclass
+class ReviewChanges:
+    """What the latest nightly review changed on the watchlist (v2 Phase 5)."""
+    at: int
+    members: int
+    added: list[tuple[str, str]]       # (wallet, why)
+    removed: list[tuple[str, str]]
+    failed: int
+    turned_away: int
+
+
+def last_review(app: App) -> ReviewChanges | None:
+    """None when no review has run, or the database is from before the watchlist."""
     from . import watchlist as wl
     try:
         last = app.db.one("SELECT run_id FROM watchlist_events WHERE run_id IS NOT NULL ORDER BY id DESC LIMIT 1")
     except Exception:  # noqa: BLE001 - a database from before the watchlist
-        return []
+        return None
     if last is None:
-        return ["watchlist: no nightly review has run yet"]
+        return None
     events = app.db.query("SELECT * FROM watchlist_events WHERE run_id = ? ORDER BY id", (last["run_id"],))
-    at = max(e["at"] for e in events)
     members = app.db.one("SELECT COUNT(*) n FROM watchlist_membership WHERE removed_at IS NULL")["n"]
     by: dict[str, list[Any]] = defaultdict(list)
     for e in events:
         by[e["action"]].append(e)
-    lines = [f"watchlist, nightly review of {iso(at)[:16]} UTC: {members} members now | added {len(by[wl.ADD])}, "
-             f"removed {len(by[wl.REMOVE])}, failed a review {len(by[wl.FAIL])}, turned away {len(by[wl.REJECT])}"]
-    for sign, action in (("+", wl.ADD), ("-", wl.REMOVE)):
-        for e in by[action][:show]:
-            detail = (e["detail"] or "").strip()
-            lines.append(f"  {sign} {e['wallet'][:6]}…{e['wallet'][-4:]}: {detail[:110]}{'…' if len(detail) > 110 else ''}")
-        if len(by[action]) > show:
-            lines.append(f"  … and {len(by[action]) - show} more (`watchlist --last`)")
+    return ReviewChanges(at=max(e["at"] for e in events), members=members,
+                         added=[(e["wallet"], (e["detail"] or "").strip()) for e in by[wl.ADD]],
+                         removed=[(e["wallet"], (e["detail"] or "").strip()) for e in by[wl.REMOVE]],
+                         failed=len(by[wl.FAIL]), turned_away=len(by[wl.REJECT]))
+
+
+def watchlist_lines(app: App, *, show: int = 5) -> list[str]:
+    """What the latest nightly review changed (v2 Phase 5), from watchlist_events."""
+    try:
+        app.db.one("SELECT 1 FROM watchlist_events LIMIT 1")
+    except Exception:  # noqa: BLE001 - a database from before the watchlist
+        return []
+    r = last_review(app)
+    if r is None:
+        return ["watchlist: no nightly review has run yet"]
+    lines = [f"watchlist, nightly review of {iso(r.at)[:16]} UTC: {r.members} members now | added {len(r.added)}, "
+             f"removed {len(r.removed)}, failed a review {r.failed}, turned away {r.turned_away}"]
+    for sign, items in (("+", r.added), ("-", r.removed)):
+        for wallet, why in items[:show]:
+            lines.append(f"  {sign} {wallet[:6]}…{wallet[-4:]}: {why[:110]}{'…' if len(why) > 110 else ''}")
+        if len(items) > show:
+            lines.append(f"  … and {len(items) - show} more (`watchlist --last`)")
     return lines
 
 

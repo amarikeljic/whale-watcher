@@ -39,9 +39,9 @@ from .db import SCHEMA_VERSION, Database
 from .horizon import BUCKETS as CLOSE_BUCKETS
 from .horizon import UNKNOWN as NO_END
 from .horizon import bucket as horizon_bucket
-from .stats import (Scope, Scoped, bucket, cutoff_report, decision_rule, event_key, in_play, load_bot_trades,
-                    load_trades, markout_columns, markout_groups, markouts, outage_windows, recheck_report,
-                    scope_rows, summarise, us_comparison)
+from .stats import (SUMMARY_WINDOW, Scope, Scoped, _period, bucket, cutoff_report, decision_rule, event_key,
+                    in_play, last_review, load_bot_trades, load_trades, markout_columns, markout_groups, markouts,
+                    outage_windows, recheck_report, scope_rows, summarise, us_comparison)
 from .stats_util import mean, median
 from .timeutil import iso, now_ts, parse_as_of, start_of_day
 from .version import MODEL_VERSION
@@ -56,6 +56,7 @@ US_KEY = "us/flat_hold"          # row A: the runner `us` (polymarket_us.py)
 BASE_KEY = "single/flat_hold"
 LABELS = {
     "single/flat_hold": "Bot: flat stake, hold",
+    "single/tight_hold": "Bot: flat stake, hold, 1c limit",
     "single/flat_mirror": "Bot: flat stake, mirror exits",
     "single/scaled_hold": "Bot: scaled stake, hold",
     "single/placebo_late": "Control: same outcome, later",
@@ -382,7 +383,7 @@ def overview(c: Ctx) -> str:
                   table_headers=["Period"] + [label_of(k) for k in keys], table_rows=table_rows,
                   legend=[(label_of(k), SERIES[k]) for k in keys])
     counts = ", ".join(f"{label_of(k)} n={len(by_key[k])}" for k in keys)
-    body += '<div class="grid">' + decision_card(c) + cost_card + v.card(
+    body += '<div class="grid">' + decision_card(c) + summary_cards(c) + cost_card + v.card(
         "Cumulative P&L by strategy", cum, wide=True,
         note=f"Closed trades only, by the date they closed. Shaded bands are outage windows. {counts}")
 
@@ -430,6 +431,49 @@ def decision_card(c: Ctx) -> str:
                        f"counting {scope.label}. "
                        "An event is one game or question: several fills in it count once. The date range and wallet "
                        "filters do not narrow it.", wide=True)
+
+
+def summary_cards(c: Ctx) -> str:
+    """The daily summary on the dashboard (the owner's question 27): per runner, the
+    last 24 hours beside all-time, then what the latest nightly review changed. The
+    same figures as the summary the runner logs once a day."""
+    out = ""
+    for runner, title in (("single", "Bot"), ("us", "Polymarket US: the same signals")):
+        rows = [r for r in c.records if r.get("runner") == runner and r["strategy"] == "flat_hold"]
+        if not rows and runner != "single":
+            continue
+        day, ever = _period(rows, c.now - SUMMARY_WINDOW, SAMPLES), _period(rows, None, SAMPLES)
+
+        def cells(p: dict[str, Any]) -> list[str]:
+            s = p["s"]
+            return [f"{p['filled']} / {p['missed']} / {p['skipped']}", str(s.settled),
+                    v.money(s.total_pnl) if s.settled else "-",
+                    f"{v.pct(s.mean_roi)} {ci_text(s)}" if s.settled else "-",
+                    "-" if s.win_rate is None else f"{s.win_rate:.0%}",
+                    f"${p['fees']:,.2f} / ${p['slippage']:,.2f}"]
+        labels = ["Signals: filled / missed / skipped", "Closed trades", "Net P&L", "Mean return per trade, 95% CI",
+                  "Win rate", "Fees / slippage"]
+        # Stacked, not a three-column table: an interval in each column does not fit a phone.
+        table = '<ul class="rule-tests">' + "".join(
+            f'<li><div class="rule-head"><span>{v.esc(label)}</span></div><dl class="kv">'
+            f'<dt>Last 24 hours</dt><dd>{v.esc(a)}</dd><dt>All-time</dt><dd>{v.esc(b)}</dd></dl></li>'
+            for label, a, b in zip(labels, cells(day), cells(ever))) + "</ul>"
+        out += v.card(f"Last 24 hours and all-time: {title}", table,
+                      note="The daily summary's figures. The last 24 hours count signals made and trades closed in "
+                           "that time. Every money figure sits beside its count and range. The date range and wallet "
+                           "filters do not narrow it.", wide=True)
+    review = last_review(c.app)
+    if review is None:
+        return out + v.card("Last nightly review", '<p class="empty">No nightly review has run yet.</p>', wide=True)
+    items = "".join(f'<li><span class="pill {cls}">{word}</span> <code>{v.esc(w[:6])}…{v.esc(w[-4:])}</code> '
+                    f'{v.esc(why)}</li>' for word, cls, group in (("added", "good", review.added),
+                                                                   ("removed", "bad", review.removed))
+                    for w, why in group)
+    head = (f"{iso(review.at)[:16]} UTC: {review.members} wallets watched now. Added {len(review.added)}, removed "
+            f"{len(review.removed)}, failed a review {review.failed}, turned away {review.turned_away}.")
+    return out + v.card("Last nightly review", f'<p class="card-note">{v.esc(head)}</p>'
+                        + (f'<ul class="review-list">{items}</ul>' if items else
+                           '<p class="empty">Nobody was added or removed.</p>'), wide=True)
 
 
 def overview_wallets(c: Ctx) -> str:
