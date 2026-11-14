@@ -51,7 +51,7 @@ MODEL_SOURCES = (
     "horizon.py", "ledger.py", "markets.py", "monitor.py", "paper.py", "polymarket.py", "polymarket_us.py",
     "scoring.py", "timeutil.py", "watchlist.py",
 )
-MODEL_SOURCE_DIGEST = "5305fffa58d2e6e2"
+MODEL_SOURCE_DIGEST = "3395b863c16351ab"
 
 _COMMIT = re.compile(r"[0-9a-f]{4,40}(-dirty)?")
 # Sections that change nothing about a decision: where the database is, how the API
@@ -94,6 +94,22 @@ def _strip_docstrings(tree: ast.AST) -> ast.AST:
     return tree
 
 
+def _canon(node: Any) -> str:
+    """A syntax tree as text, the same on every Python version: fields that are None or
+    empty are left out (3.13's ast.dump leaves them out, 3.12's does not)."""
+    if isinstance(node, ast.AST):
+        fields = []
+        for name in node._fields:
+            value = getattr(node, name, None)
+            if value is None or value == []:
+                continue
+            fields.append(f"{name}={_canon(value)}")
+        return f"{type(node).__name__}({','.join(fields)})"
+    if isinstance(node, list):
+        return "[" + ",".join(_canon(x) for x in node) + "]"
+    return repr(node)
+
+
 def source_digest(root: Path | None = None) -> str:
     """A hash of the decision code's syntax trees (so comments and docstrings do not
     count) plus the shipped config.yaml."""
@@ -101,7 +117,7 @@ def source_digest(root: Path | None = None) -> str:
     h = hashlib.sha256()
     for name in MODEL_SOURCES:
         tree = _strip_docstrings(ast.parse((root / name).read_text()))
-        h.update(name.encode() + b"\0" + ast.dump(tree, include_attributes=False).encode() + b"\0")
+        h.update(name.encode() + b"\0" + _canon(tree).encode() + b"\0")
     shipped = root.parent / "config.yaml"
     if shipped.exists():
         import yaml

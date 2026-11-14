@@ -1,2 +1,14 @@
-aiohttp>=3.9,<4
-PyYAML>=6.0
+# Pinned to the exact versions tested, sub-dependencies included (Python 3.12).
+# What each one is for: docs/dependencies.md. Change a version on purpose only,
+# and ask the owner before adding a package.
+aiohttp==3.14.5
+aiohappyeyeballs==2.7.1
+aiosignal==1.4.0
+attrs==26.1.0
+frozenlist==1.8.0
+idna==3.20
+multidict==7.2.1
+propcache==0.5.4
+typing_extensions==4.16.0
+yarl==1.25.1
+PyYAML==6.0.3

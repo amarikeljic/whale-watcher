@@ -1,4 +1,7 @@
-FROM python:3.12-slim
+# Pinned by digest (the multi-platform index for python:3.12-slim, read from the Docker
+# registry on 2026-11-14), so a rebuild uses the same base. To move to a newer base on
+# purpose, replace the digest and note it in docs/dependencies.md.
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 WORKDIR /app
 
