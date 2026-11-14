@@ -575,6 +575,9 @@ ADDED_COLUMNS = (
 STAMPED_TABLES = ("alerts", "bot_trades", "paper_trades", "bankroll_runs", "score_runs")
 STAMP_COLUMNS = (("code_commit", "TEXT"), ("model_version", "INTEGER"), ("settings_hash", "TEXT"))
 ADDED_COLUMNS += tuple((11, table, column, decl) for table in STAMPED_TABLES for column, decl in STAMP_COLUMNS)
+ADDED_COLUMNS += (
+    (11, "outage_windows", "kind", "TEXT"),     # runner | detector | data (outages.py); NULL: entered by hand
+)
 
 
 class Database:

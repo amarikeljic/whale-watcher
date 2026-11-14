@@ -429,9 +429,19 @@ Wallets (with a page per wallet and the watchlist timeline), Trades (with CSV
 export), Sim wallet (the small wallet and its amount form), US venue (row A
 beside the international baseline), Breakdowns and Health. One filter row
 scopes every number on a page: date range, day or week, strategy, venue,
-wallet, days to close, and "exclude outage windows". The US venue page uses
-only the date range and the outage switch, and Sim wallet uses none: a
-wallet is one path through all of its signals.
+wallet, days to close, model version (the current one unless picked) and
+"Include outage windows" (off unless ticked). The US venue page uses only the
+date range, the version and the outage switch. Sim wallet follows the version
+and the outage switch and nothing else: a wallet is one path through all of its
+signals.
+
+**Outage windows** (`outages.py`, v2.1 Part 4 #15). The service records them
+itself: when the runner or the detector starts again after a stop long enough
+to make a signal late (longer than `bot.max_signal_age_seconds`), when the
+runner sees the detector's heartbeat stop (until it moves again), and when
+Polymarket's data API stops answering (from the first failed attempt to the
+first answer). Signals made inside a window are left out of every result by
+default; the Health page lists each window and who recorded it.
 
 * **It reads, with one exception.** The database is opened read-only and
   query-only and every page is a GET. The one thing the site can change is the

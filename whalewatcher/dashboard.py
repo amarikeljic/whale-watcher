@@ -97,6 +97,10 @@ def outages(app: Any) -> list[tuple[int, int]]:
     return outage_windows(app)
 
 
+OUTAGE_SOURCES = {"runner": "the service: runner stopped", "detector": "the service: detector stopped",
+                  "data": "the service: data API down"}
+
+
 # Query value -> the band of horizon.bucket() it selects.
 CLOSE_FILTERS = {"all": None, "lt1": CLOSE_BUCKETS[0], "1-7": CLOSE_BUCKETS[1], "7-14": CLOSE_BUCKETS[2],
                  "gt14": CLOSE_BUCKETS[3], "none": NO_END}
@@ -1183,9 +1187,13 @@ def health(c: Ctx) -> str:
     body += v.card("Outage windows", v.table(
         ["From (UTC)", "To (UTC)", "Cause", "Recorded by", "Hours"],
         [[iso(r["start_ts"])[:16], iso(r["end_ts"])[:16] if r["end_ts"] else "still going",
-          (r["cause"] or "", None, "wrap"), r["source"], f"{((r['end_ts'] or now) - r['start_ts']) / 3600:.1f}"]
+          (r["cause"] or "", None, "wrap"), OUTAGE_SOURCES.get(r["kind"] or "", r["source"]),
+          f"{((r['end_ts'] or now) - r['start_ts']) / 3600:.1f}"]
          for r in rows], sortable=False, numeric_from=4, empty="No outage has been recorded."),
-        note="Shaded on every time chart. Tick \"Exclude outage windows\" to leave their signals out of the numbers.")
+        note="Shaded on every time chart. Signals made inside a window are left out of every number unless "
+             "\"Include outage windows\" is ticked. The service records a window itself when the runner or the "
+             "detector was stopped long enough to make a signal late, when the detector's heartbeat stops, and "
+             "when Polymarket's data API stops answering.")
     body += v.card("What this page cannot show", '<p class="card-note">Individual failed requests are written to the '
                    "container logs (<code>docker compose logs detector</code>), not to the database, so they are not "
                    "charted here. The heartbeats above stop when either process stops succeeding.</p>")

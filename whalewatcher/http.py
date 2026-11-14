@@ -195,6 +195,11 @@ class HttpClient:
         else:
             health.failed(error)
 
+    def failing_for(self, host: str) -> float | None:
+        """Seconds since ``host`` last answered, while it is failing; None while it answers."""
+        h = self.health.get(host)
+        return None if h is None or h.failing_since is None else time.monotonic() - h.failing_since
+
     def outage(self, host: str, *, after: float = OUTAGE_AFTER_SECONDS,
                attempts: int = OUTAGE_ATTEMPTS) -> str | None:
         """A description of the outage if ``host`` has stopped answering, else None."""

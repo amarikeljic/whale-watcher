@@ -29,7 +29,7 @@ import sys
 import time
 from collections import deque
 
-from . import bankroll
+from . import bankroll, outages
 from .app import App, open_app
 from .bot import Bot
 from .config import Config
@@ -94,8 +94,28 @@ class Service:
         self._wallet_checked = -WALLET_CHECK_EVERY      # look on the first cycle
         self._quiet_since = 0.0
 
+    def _record_restart(self) -> None:
+        """Part 4 #15: a runner starting again after a stop long enough to make a signal
+        late records the gap as an outage window. A data window a stopped runner left
+        open ends where that runner's heartbeats ended."""
+        app = self.app
+        try:
+            beat = app.db.get_state(HEARTBEAT_KEY)
+            last = None if beat is None else int(beat)
+            now = int(app.clock())
+            if last is not None:
+                outages.close_window(app.db, outages.DATA, last)
+            gap = outages.record_gap(app.db, outages.RUNNER, last, now, outages.min_gap(app.cfg),
+                                     outages.describe_gap("runner", now - (last or now)))
+            if gap is not None:
+                self.notice(f"outage window recorded: {outages.describe_gap('runner', now - (last or now))}. "
+                            "Signals in it are left out of the results by default.")
+        except Exception:
+            log.exception("could not record the restart gap; carrying on")
+
     async def run(self, *, cycles: int | None = None) -> None:
         app, cfg = self.app, self.app.cfg
+        self._record_restart()
         if seed_from_monitored(app):          # first start after the v2 upgrade
             sync_monitored(app, None)
         recalculate(app)                      # v2.1: cost columns for trades made before they existed
@@ -245,12 +265,16 @@ class Service:
 
     async def _report_outage(self) -> None:
         problem = self.app.http.outage(DATA_HOST)
+        now = int(self.app.clock())
         if problem and self._outage_reported is None:
             self._outage_reported = problem
+            failing = getattr(self.app.http, "failing_for", lambda _host: None)(DATA_HOST)
+            outages.open_window(self.app.db, outages.DATA, now - int(failing or 0), problem)
             self.notice(f"Polymarket data is unreachable. {problem}. Alerts and paper fills are paused until it "
                         "answers again.")
         elif problem is None and self._outage_reported is not None:
             self._outage_reported = None
+            outages.close_window(self.app.db, outages.DATA, now)
             self.notice("Polymarket data is answering again.", good=True)
         # The detector is a separate process: if it stops, nothing is detected and
         # silence would look exactly like a quiet market.
@@ -263,11 +287,17 @@ class Service:
         warming_up = beat is None and time.monotonic() - self._started < self.detector_grace
         if stale and not self._detector_down and not warming_up:
             self._detector_down = True
+            outages.open_window(self.app.db, outages.DETECTOR, int(beat) if beat is not None else now,
+                                f"the detector's heartbeat stopped (last {iso(beat)})")
             self.notice(f"the detector is not running (last heartbeat {iso(beat)}). No whale fills are being "
                         "detected until it is back.")
         elif not stale and self._detector_down:
             self._detector_down = False
+            outages.close_window(self.app.db, outages.DETECTOR, now)
             self.notice("the detector is running again.", good=True)
+        elif not stale:
+            # A window a stopped runner left open, or one the detector did not close itself.
+            outages.close_window(self.app.db, outages.DETECTOR, now)
 
 
 async def run_detector(app: App, stop: asyncio.Event, *, cycles: int | None = None) -> None:
@@ -275,6 +305,14 @@ async def run_detector(app: App, stop: asyncio.Event, *, cycles: int | None = No
     backstop every alerts.poll_interval_seconds, a heartbeat every few seconds."""
     detector = Detector(app)
     interval = app.cfg.bot.feed_poll_seconds
+    try:     # Part 4 #15: a restart after a gap is an outage window (or ends the one the runner opened)
+        beat = app.db.get_state(DETECTOR_HEARTBEAT_KEY)
+        now = int(app.clock())
+        last = None if beat is None else int(beat)
+        outages.record_gap(app.db, outages.DETECTOR, last, now, outages.min_gap(app.cfg),
+                           outages.describe_gap("detector", now - (last or now)))
+    except Exception:
+        log.exception("could not record the detector's restart gap; carrying on")
     log.info("detector started: global trade feed every %gs, per-wallet backstop every %ds",
              interval, app.cfg.alerts.poll_interval_seconds)
     done = published = backstop = errors = 0
