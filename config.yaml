@@ -215,6 +215,7 @@ fees:
         combos: 0.05
 
 stats:
+  decision_min_events: 100        # the decision rule: mean CLV above 0 and the 95% CI above 0 after this many settled events
   min_settled_for_conclusions: 30
   bootstrap_samples: 10000
   daily_summary_hour_utc: 13

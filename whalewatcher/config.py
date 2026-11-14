@@ -82,6 +82,9 @@ class PaperConfig:
 @dataclass
 class StatsConfig:
     min_settled_for_conclusions: int = 30
+    # The decision rule (v2 Phase 5): "Copying has an edge if mean CLV stays above 0 and the
+    # 95% CI for ROI excludes 0 after 100 settled events." This is its 100.
+    decision_min_events: int = 100
     bootstrap_samples: int = 10_000
     daily_summary_hour_utc: int = 13
 

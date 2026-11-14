@@ -27,6 +27,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .app import App
 from .horizon import DAY, NO_END_DATE, TOO_LONG, days_to_close, held_days, scheduled_end
@@ -259,6 +260,79 @@ def scope_lines(sc: Scoped, scope: Scope) -> list[str]:
         lines.append(f"  left out: {sc.in_outages} signals inside {sc.windows} outage window(s) "
                      "(`stats --include-outages` counts them)")
     return lines
+
+
+# -- the decision rule (v2 Phase 5) -------------------------------------------------------------
+
+
+@dataclass
+class DecisionRule:
+    """The owner's rule, set before the results were in: "Copying has an edge if mean CLV
+    stays above 0 and the 95% CI for ROI excludes 0 after 100 settled events." Judged on
+    the headline (single / flat_hold), one model version, outages left out. An event is
+    one game or question: several fills in it count once."""
+    events: int
+    need: int
+    clv: float | None = None
+    clv_n: int = 0
+    mean: float | None = None
+    lo: float | None = None
+    hi: float | None = None
+
+    @property
+    def text(self) -> str:
+        return (f"Copying has an edge if mean CLV stays above 0 and the 95% CI for ROI excludes 0 after "
+                f"{self.need} settled events.")
+
+    @property
+    def enough(self) -> bool:
+        return self.events >= self.need
+
+    # Float noise is not an edge: +0.05 and -0.05 average to 5e-17, which is not "above 0".
+    TOLERANCE = 1e-9
+
+    @property
+    def clv_above(self) -> bool:
+        return self.clv is not None and self.clv > self.TOLERANCE
+
+    @property
+    def ci_above(self) -> bool:
+        return self.lo is not None and self.lo > self.TOLERANCE
+
+    @property
+    def ci_below(self) -> bool:
+        return self.hi is not None and self.hi < -self.TOLERANCE
+
+    @property
+    def met(self) -> bool:
+        return self.enough and self.clv_above and self.ci_above
+
+    @property
+    def verdict(self) -> str:
+        if not self.enough:
+            return f"not decided yet: {self.events} of {self.need} settled events"
+        if self.met:
+            return f"copying has an edge: both tests pass after {self.events} settled events"
+        if self.ci_below:
+            return f"copying loses money: the whole interval is below 0 after {self.events} settled events"
+        failed = [what for ok, what in ((self.clv_above, "mean CLV is not above 0"),
+                                         (self.ci_above, "the interval includes 0")) if not ok]
+        return f"no edge shown after {self.events} settled events: " + " and ".join(failed)
+
+
+def decision_rule(s: Summary, cfg) -> DecisionRule:
+    return DecisionRule(events=s.events, need=int(cfg.stats.decision_min_events), clv=s.avg_clv, clv_n=s.clv_n,
+                        mean=s.mean_roi, lo=s.ci_low, hi=s.ci_high)
+
+
+def decision_line(rule: DecisionRule) -> str:
+    def yes(ok: bool) -> str:
+        return "yes" if ok else "no"
+    clv = "-" if rule.clv is None else f"{rule.clv:+.3f}"
+    ci = "-" if rule.lo is None else f"[{_pct(rule.lo)}, {_pct(rule.hi)}]"
+    return (f"  decision rule: {rule.events} of {rule.need} settled events | mean CLV {clv} (n={rule.clv_n} "
+            f"pre-game fills), above 0: {yes(rule.clv_above)} | 95% CI for mean ROI {ci}, above 0: "
+            f"{yes(rule.ci_above)} -> {rule.verdict}")
 
 
 # -- after the fill (Part 4 #5) and the book a second later (Part 4 #6) ---------------------------
@@ -502,6 +576,8 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
         lines.append(cost_line(traded))
     else:
         lines.append("  no closed trades yet, so no P&L.")
+    if runner == "single" and strategy == BOT_HEADLINE and group is None:
+        lines.append(decision_line(decision_rule(s, app.cfg)))
     if brief:
         return lines
 
@@ -1183,17 +1259,84 @@ def export_bot_csv(app: App, path: str) -> int:
     return len(trades)
 
 
+SUMMARY_WINDOW = DAY       # "today" in the daily summary: the 24 hours up to it (see daily_summary)
+# A guard, not a target. It was 1,900 while the summary was posted as a chat message; it now
+# goes to the log and `stats --brief`, and two runners plus a nightly review came to 3,500 on real data.
+SUMMARY_LIMIT = 6000
+
+
+def _period(rows: list[dict], since: float | None, samples: int) -> dict[str, Any]:
+    """Signals made since ``since``, and trades CLOSED since then (None: all of them)."""
+    from .costs import breakdown
+    signals = [t for t in rows if since is None or (t["signal_ts"] or 0) >= since]
+    closed = [t for t in rows if t["status"] == "FILLED" and t["closed_at"] is not None
+              and (since is None or t["closed_at"] >= since)]
+    c = breakdown(closed)
+    return {"filled": sum(t["status"] == "FILLED" for t in signals),
+            "missed": sum(t["status"] == "MISSED" for t in signals),
+            "skipped": sum(t["status"] == "SKIPPED" for t in signals),
+            "s": summarise("period", closed, samples=samples), "fees": c.fees, "slippage": c.slippage}
+
+
+def _side_by_side(day: dict[str, Any], ever: dict[str, Any]) -> list[str]:
+    """Today and all-time, each with its n and interval (no profit figure without them)."""
+    def cells(p: dict[str, Any]) -> list[str]:
+        s = p["s"]
+        return [f"{p['filled']} / {p['missed']} / {p['skipped']}", str(s.settled),
+                _money(s.total_pnl) if s.settled else "-",
+                f"{_pct(s.mean_roi)} {_ci_text(s)}" if s.settled else "-",
+                f"{s.win_rate:.0%}" if s.win_rate is not None else "-",
+                f"${p['fees']:,.2f} / ${p['slippage']:,.2f}"]
+    labels = ["signals: filled / missed / skipped", "closed trades (n)", "net P&L", "mean ROI per trade, 95% CI",
+              "win rate", "fees / slippage"]
+    lines = [f"  {'':<36}{'last 24 h':<26}all-time"]
+    for label, a, b in zip(labels, cells(day), cells(ever)):
+        lines.append(f"  {label:<36}{a:<26}{b}")
+    return lines
+
+
+def watchlist_lines(app: App, *, show: int = 5) -> list[str]:
+    """What the latest nightly review changed (v2 Phase 5), from watchlist_events."""
+    from . import watchlist as wl
+    try:
+        last = app.db.one("SELECT run_id FROM watchlist_events WHERE run_id IS NOT NULL ORDER BY id DESC LIMIT 1")
+    except Exception:  # noqa: BLE001 - a database from before the watchlist
+        return []
+    if last is None:
+        return ["watchlist: no nightly review has run yet"]
+    events = app.db.query("SELECT * FROM watchlist_events WHERE run_id = ? ORDER BY id", (last["run_id"],))
+    at = max(e["at"] for e in events)
+    members = app.db.one("SELECT COUNT(*) n FROM watchlist_membership WHERE removed_at IS NULL")["n"]
+    by: dict[str, list[Any]] = defaultdict(list)
+    for e in events:
+        by[e["action"]].append(e)
+    lines = [f"watchlist, nightly review of {iso(at)[:16]} UTC: {members} members now | added {len(by[wl.ADD])}, "
+             f"removed {len(by[wl.REMOVE])}, failed a review {len(by[wl.FAIL])}, turned away {len(by[wl.REJECT])}"]
+    for sign, action in (("+", wl.ADD), ("-", wl.REMOVE)):
+        for e in by[action][:show]:
+            detail = (e["detail"] or "").strip()
+            lines.append(f"  {sign} {e['wallet'][:6]}…{e['wallet'][-4:]}: {detail[:110]}{'…' if len(detail) > 110 else ''}")
+        if len(by[action]) > show:
+            lines.append(f"  … and {len(by[action]) - show} more (`watchlist --last`)")
+    return lines
+
+
 def daily_summary(app: App, scope: Scope = Scope()) -> str:
     """The short version: what `stats --brief` prints and what the runner writes to
-    its log once a day. Per runner: net P&L with its n and interval, where the money
-    went, what the time-to-close cutoff skipped, and the small wallet. Kept under
-    2,000 characters so it stays one screen. The full report is ``stats`` and the
-    dashboard."""
+    its log once a day. Per runner, the last 24 hours beside all-time (v2 Phase 5),
+    each figure with its n and interval: signals, closed trades, net P&L, the costs.
+    Then the decision rule, what the time-to-close cutoff skipped, the small wallet,
+    and what the latest nightly review changed on the watchlist.
+
+    "Today" is the 24 hours up to the summary, not the calendar day, so that each trade
+    is in exactly one daily summary whatever hour it is written. The full report is
+    ``stats`` and the dashboard."""
     from . import bankroll
     everything = load_bot_trades(app)
     if not everything:        # only old-rule or simulated trades: the old short report
         text = render(app, with_breakdowns=False, brief_backtest=True, scope=scope)
-        return text if len(text) <= 1900 else text[:1890] + "\n…"
+        return text if len(text) <= SUMMARY_LIMIT else text[:SUMMARY_LIMIT - 10] + "\n…"
+    since = app.clock() - SUMMARY_WINDOW
     windows = outage_windows(app)
     sc = scope_rows(app, everything, scope, windows=windows)
     bots = sc.rows
@@ -1206,20 +1349,17 @@ def daily_summary(app: App, scope: Scope = Scope()) -> str:
         rows = by.get((runner, BOT_HEADLINE), [])
         traded = [t for t in rows if t["status"] != "SKIPPED"]
         s = summarise(runner, traded, samples=samples)
-        lines.append(f"{runner} / {BOT_HEADLINE} (paper)")
+        lines.append(f"{runner} / {BOT_HEADLINE} (paper, {scope.short})")
         if s.settled < threshold:
             lines.append(f"  ⚠ only {s.settled} closed trades (need {threshold}): everything here is noise so far")
-        if s.settled:
-            lines.append(f"  net {_money(s.total_pnl)} on ${s.total_cost:,.2f} staked, n={s.settled} closed | ROI "
-                         f"{_pct(s.roi)} | mean per trade {_pct(s.mean_roi)}, 95% CI {_ci_text(s)} | win rate "
-                         f"{s.win_rate:.0%}")
-            lines.append(cost_line(traded).split("   (")[0])
-        else:
+        lines += _side_by_side(_period(rows, since, samples), _period(rows, None, samples))
+        if not s.settled:
             lines.append("  no closed trades yet, so no P&L")
+        if runner == "single":
+            lines.append(decision_line(decision_rule(s, app.cfg)))
         c = cutoff_report(app, rows)
         limit = "off" if c.limit is None else f"{c.limit:g}-day"
-        lines.append(f"  signals {len(rows)}: filled {s.filled}, missed {s.missed}, skipped {len(rows) - len(traded)} "
-                     f"| open {s.open} | time-to-close cutoff ({limit}) skipped {c.too_long + c.no_end_date} "
+        lines.append(f"  open {s.open} | time-to-close cutoff ({limit}) skipped {c.too_long + c.no_end_date} "
                      f"({TOO_LONG} {c.too_long}, {NO_END_DATE} {c.no_end_date})")
         try:
             for view in bankroll.views(bots, app.cfg, app.db, app.clock(), only=f"bot:{runner}"):
@@ -1242,7 +1382,8 @@ def daily_summary(app: App, scope: Scope = Scope()) -> str:
             if rows:
                 lines.append(f"single / {BOT_HEADLINE}, {model_label(version)} (kept apart): net {_money(s.total_pnl)}, "
                              f"n={s.settled} closed, 95% CI {_ci_text(s)}")
+    lines += watchlist_lines(app)
     lines += detection_lines(app)[:1]
     lines.append("Full report: `python -m whalewatcher stats`, or the dashboard.")
     text = "\n".join(lines)
-    return text if len(text) <= 1900 else text[:1890] + "\n…"
+    return text if len(text) <= SUMMARY_LIMIT else text[:SUMMARY_LIMIT - 10] + "\n…"

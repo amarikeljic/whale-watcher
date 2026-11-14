@@ -91,7 +91,7 @@ python -m whalewatcher wallet set 250               # change the amount (starts 
 python -m whalewatcher detector                     # watch trades, publish tracked wallets' fills (own container)
 python -m whalewatcher monitor [--cycles N] [--no-detector]   # the runner: alerts + the paper bot
 python -m whalewatcher settle
-python -m whalewatcher stats [--brief]              # the full report, or the short daily summary
+python -m whalewatcher stats [--brief]              # the full report, or the daily summary (last 24 h beside all-time)
 python -m whalewatcher stats --model before         # ...for the rows made before model versions (also: all, or a number)
 python -m whalewatcher stats --include-outages      # ...counting signals made inside outage windows
 python -m whalewatcher version                      # the model version and commit new rows get, and what each version changed
@@ -294,6 +294,22 @@ adds is the breakdown and the audit trail:
 On the trades checked so far fees cost about 1.5% of every dollar staked. That
 is the hurdle a copy strategy has to clear before anything else.
 
+### The daily summary (v2 Phase 5)
+
+Once a day (`stats.daily_summary_hour_utc`) the runner writes it to the log, and
+`stats --brief` prints it any time. Per runner it puts **the last 24 hours beside
+all-time**: signals filled, missed and skipped, closed trades, net P&L, mean
+return per trade with its 95% interval, win rate, and fees and slippage, so no
+profit figure appears without its n and interval. Then the decision rule, what
+the time-to-close cutoff skipped, the small wallet, and **what the latest nightly
+review changed**: members now, wallets added and removed with the reason, reviews
+failed and wallets turned away. "Today" is the 24 hours up to the summary, not
+the calendar day, so every trade lands in exactly one daily summary whatever hour
+it is written.
+
+Phase 5's other items: outage windows are recorded automatically (below). The
+healthchecks.io heartbeat and the nightly backups were dropped by the owner.
+
 ### Which code made a row (v2.1 Part 4)
 
 Every new alert, bot trade, paper trade, wallet run and score run records three
@@ -304,7 +320,7 @@ things (`whalewatcher/version.py`):
   The headline (stats and dashboard) counts **one model version: the current one**.
   A deploy that only changes documents, the dashboard or the reports keeps the
   number, so the sample keeps growing. Counting one commit instead would restart
-  the sample at every deploy and never reach the 100 trades the decision rule needs.
+  the sample at every deploy and never reach the 100 settled events the decision rule needs.
 * **Code commit**, passed in when the image is built (`GIT_COMMIT`, above).
 * **Settings fingerprint** of the loaded `config.yaml`. `stats` warns when one
   model version's rows were made under more than one.
@@ -327,13 +343,25 @@ do not count. It is a reminder, not a proof.
 The dashboard and `stats` also leave out signals made inside recorded outage
 windows unless asked (`Include outage windows`, `stats --include-outages`).
 
+### The decision rule (v2 Phase 5)
+
+Set before the results were in: **"Copying has an edge if mean CLV stays above 0
+and the 95% CI for ROI excludes 0 after 100 settled events."** It is judged on
+`single / flat_hold` only, in the current model version, outages left out. An
+event is one game or question, so several fills in it count once. The Overview
+page shows the rule, its three tests (settled events with a progress bar, mean
+CLV, the interval) and a plain verdict: not decided yet, an edge, no edge shown,
+or copying loses money. `stats` and the daily summary print the same line, and
+`experiments` judges every forward test by the same rule. The 100 is
+`stats.decision_min_events`. A hair of float noise does not count as above 0.
+
 ### Every variation, and what counts as proof (v2.1 Part 4)
 
 Dozens of variations are tracked (strategies, the control, the US venue, the zero
 and one-minute comparisons, the old rule, simulated replays, stake sizes, and
 every breakdown slice). At 95% intervals, a few would look good by luck alone.
 So only one result answers "does copying make money": `single / flat_hold`
-against the decision rule (100 settled signals, the interval above zero).
+against the decision rule above.
 
 `experiments` (also in `stats` and on the Edge page) lists every variation with
 its role (primary, control, comparison, exploratory, simulated), start date, n,

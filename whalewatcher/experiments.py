@@ -5,8 +5,8 @@ With dozens of variations, each judged at a 95% interval, a few will look good b
 alone. So:
 
 * Only ONE result can answer "does copying make money": the primary, ``single /
-  flat_hold``, against the decision rule (at least ``bankroll.auto_min_history``
-  settled signals, 100, with a 95% interval for the return per trade above zero).
+  flat_hold``, against the owner's decision rule (stats.DecisionRule): mean CLV above 0
+  and the 95% interval for the return per trade above 0, after 100 settled events.
 * Anything else that looks good (its interval above zero) is FLAGGED the first time it
   does, with the date (``experiment_flags``, written by the runner). From then on only
   signals after that date count for it: the forward test. It counts as shown only once
@@ -26,6 +26,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from .stats import DecisionRule, in_play
 from .stats_util import two_way_bootstrap_mean_ci
 from .timeutil import iso
 
@@ -51,12 +52,25 @@ class Experiment:
     mean: float | None = None       # return per trade
     lo: float | None = None
     hi: float | None = None
+    events: int = 0                 # settled events (a game or question counts once)
+    clv: float | None = None        # mean closing-line value, pre-game fills
+    clv_n: int = 0
     flagged_at: int | None = None   # when it first looked good (non-primary, live only)
     after_n: int = 0                # settled among signals after the flag
     after_mean: float | None = None
     after_lo: float | None = None
     after_hi: float | None = None
+    after_events: int = 0
+    after_clv: float | None = None
+    after_clv_n: int = 0
     status: str = ""
+
+    def rule(self, cfg: Any) -> DecisionRule:
+        return DecisionRule(self.events, decision_n(cfg), self.clv, self.clv_n, self.mean, self.lo, self.hi)
+
+    def forward_rule(self, cfg: Any) -> DecisionRule:
+        return DecisionRule(self.after_events, decision_n(cfg), self.after_clv, self.after_clv_n, self.after_mean,
+                            self.after_lo, self.after_hi)
 
     @property
     def looks_good(self) -> bool:
@@ -64,8 +78,19 @@ class Experiment:
 
 
 def decision_n(cfg: Any) -> int:
-    """The decision rule's sample size (config.py: the same bar the automatic stake uses)."""
-    return int(cfg.bankroll.auto_min_history)
+    """The decision rule's settled events (stats.decision_min_events, 100)."""
+    return int(cfg.stats.decision_min_events)
+
+
+def _rule_inputs(rows: list[dict], roi, price: str) -> tuple[int, float | None, int]:
+    """(settled events, mean CLV, its n) for the decision rule. CLV is the closing price
+    minus the price paid (``price``: our fill, or the comparison's own price), pre-game
+    fills only: an in-play fill has no closing line."""
+    settled = [r for r in rows if roi(r) is not None]
+    events = len({r.get("event_slug") or r.get("event_key") or r.get("condition_id") for r in settled})
+    clvs = [r["closing_price"] - r[price] for r in settled if r.get("closing_price") is not None
+            and r.get(price) is not None and not in_play(r)]
+    return events, (sum(clvs) / len(clvs) if clvs else None), len(clvs)
 
 
 def _interval(rows: list[dict], roi) -> tuple[int, float | None, float | None, float | None]:
@@ -107,15 +132,19 @@ def build(app: Any, rows: list[dict] | None = None) -> list[Experiment]:
     flags = {r["key"]: r for r in _flags(app)}
     out: list[Experiment] = []
 
-    def add(key: str, name: str, role: str, group: list[dict], roi, *, live: bool = True) -> None:
+    def add(key: str, name: str, role: str, group: list[dict], roi, *, live: bool = True,
+            price: str = "fill_price") -> None:
         e = Experiment(key, name, role, started=min((int(r["signal_ts"] if "runner" in r else r["alert_ts"])
                                                      for r in group), default=None))
         e.n, e.mean, e.lo, e.hi = _interval(group, roi)
+        if live:
+            e.events, e.clv, e.clv_n = _rule_inputs(group, roi, price)
         flag = flags.get(key)
         if flag is not None:
             e.flagged_at = flag["flagged_at"]
             after = [r for r in group if (r["signal_ts"] if "runner" in r else r["alert_ts"]) > e.flagged_at]
             e.after_n, e.after_mean, e.after_lo, e.after_hi = _interval(after, roi)
+            e.after_events, e.after_clv, e.after_clv_n = _rule_inputs(after, roi, price)
         e.status = _status(e, app.cfg, live=live)
         out.append(e)
 
@@ -131,9 +160,9 @@ def build(app: Any, rows: list[dict] | None = None) -> list[Experiment]:
     head = [r for r in bot if r["runner"] == "single" and r["strategy"] == "flat_hold"]
     if head:
         add("column:zero", "single / flat_hold at the whale's own price (zero latency)", COMPARISON, head,
-            _column_roi("zero_pnl", "zero_cost"))
+            _column_roi("zero_pnl", "zero_cost"), price="zero_price")
         add("column:human", "single / flat_hold a minute later (the old rule's delay)", COMPARISON, head,
-            _column_roi("human_pnl", "human_cost"))
+            _column_roi("human_pnl", "human_cost"), price="human_price")
     # The old rule and the replays: from the rows given when they include them (the
     # dashboard's records do), else read here.
     paper = [r for r in rows if "runner" not in r] or load_trades(app)
@@ -157,17 +186,17 @@ def _paper_roi(t: dict) -> float | None:
 def _status(e: Experiment, cfg: Any, *, live: bool) -> str:
     need = decision_n(cfg)
     if e.role == PRIMARY:
-        if e.n >= need and e.looks_good:
-            return f"meets the decision rule: {e.n} settled, interval above zero"
-        return f"the headline: {e.n} of {need} settled needed" + (", interval above zero so far" if e.looks_good else "")
+        return f"the headline, against the decision rule: {e.rule(cfg).verdict}"
     if not live:
         return "fixed data: listed, never tested forward"
     if e.flagged_at is None:
         return "interval includes zero or below" if e.n else "no settled trades yet"
     since = iso(e.flagged_at)[:10]
-    if e.after_n >= need and e.after_lo is not None and e.after_lo > 0:
-        return f"looked good on {since}; since then {e.after_n} settled with the interval above zero: shown forward"
-    return f"looked good on {since}; forward test: {e.after_n} of {need} settled since then"
+    forward = e.forward_rule(cfg)
+    if forward.met:
+        return (f"looked good on {since}; since then {forward.events} settled events meet the decision rule on "
+                "their own: shown forward")
+    return f"looked good on {since}; forward test: {forward.events} of {need} settled events since then"
 
 
 def _flags(app: Any) -> list[Any]:

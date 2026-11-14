@@ -39,9 +39,9 @@ from .db import SCHEMA_VERSION, Database
 from .horizon import BUCKETS as CLOSE_BUCKETS
 from .horizon import UNKNOWN as NO_END
 from .horizon import bucket as horizon_bucket
-from .stats import (Scope, Scoped, bucket, cutoff_report, event_key, in_play, load_bot_trades, load_trades,
-                    markout_columns, markout_groups, markouts, outage_windows, recheck_report, scope_rows,
-                    summarise, us_comparison)
+from .stats import (Scope, Scoped, bucket, cutoff_report, decision_rule, event_key, in_play, load_bot_trades,
+                    load_trades, markout_columns, markout_groups, markouts, outage_windows, recheck_report,
+                    scope_rows, summarise, us_comparison)
 from .stats_util import mean, median
 from .timeutil import iso, now_ts, parse_as_of, start_of_day
 from .version import MODEL_VERSION
@@ -382,7 +382,7 @@ def overview(c: Ctx) -> str:
                   table_headers=["Period"] + [label_of(k) for k in keys], table_rows=table_rows,
                   legend=[(label_of(k), SERIES[k]) for k in keys])
     counts = ", ".join(f"{label_of(k)} n={len(by_key[k])}" for k in keys)
-    body += '<div class="grid">' + cost_card + v.card(
+    body += '<div class="grid">' + decision_card(c) + cost_card + v.card(
         "Cumulative P&L by strategy", cum, wide=True,
         note=f"Closed trades only, by the date they closed. Shaded bands are outage windows. {counts}")
 
@@ -398,6 +398,38 @@ def overview(c: Ctx) -> str:
                 legend=[("Gain", "pos"), ("Loss", "neg")]),
         note=f"n={s.settled} closed trades", wide=True)
     return body + overview_wallets(c) + "</div>"
+
+
+def decision_card(c: Ctx) -> str:
+    """v2 Phase 5: the owner's decision rule, and how far the headline is from it. It
+    counts every settled event of the headline in the chosen model version: the date
+    range and wallet filters do not narrow it."""
+    rows = [r for r in c.records if r.get("key") == BASE_KEY and r["status"] != "SKIPPED"]
+    rule = decision_rule(summarise("decision", rows, samples=SAMPLES), c.app.cfg)
+    done = min(100.0, 100.0 * rule.events / rule.need) if rule.need else 0.0
+    progress = (f'<svg class="progress" viewBox="0 0 100 6" preserveAspectRatio="none" role="img" '
+                f'aria-label="{rule.events} of {rule.need} settled events">'
+                f'<rect class="progress-track" x="0" y="0" width="100" height="6" rx="3"/>'
+                f'<rect class="progress-fill" x="0" y="0" width="{done:.1f}" height="6" rx="3"/></svg>')
+
+    clv = "-" if rule.clv is None else f"{v.cents(rule.clv)} (n={rule.clv_n} pre-game fills)"
+    ci = "-" if rule.lo is None else f"{v.pct(rule.mean)}, 95% CI [{v.pct(rule.lo)}, {v.pct(rule.hi)}]"
+    # A stacked list rather than a table: three columns do not fit a phone.
+    tests = [(f"At least {rule.need} settled events", f"{rule.events} of {rule.need}" + progress, rule.enough),
+             ("Mean CLV above 0", v.esc(clv), rule.clv_above),
+             ("95% CI for ROI above 0", v.esc(ci), rule.ci_above)]
+    table = '<ul class="rule-tests">' + "".join(
+        f'<li><div class="rule-head"><span>{v.esc(name)}</span><span class="pill {"good" if ok else ""}">'
+        f'{"yes" if ok else "not yet"}</span></div><div class="rule-now">{now}</div></li>'
+        for name, now, ok in tests) + "</ul>"
+    kind = "good" if rule.met else ("bad" if rule.enough and rule.ci_below else ("warn" if rule.enough else "info"))
+    scope = Scope(c.f.model, not c.f.no_outages)
+    return v.card("The decision rule", f'<p class="rule-text">“{v.esc(rule.text)}”</p>' + table
+                  + v.banner(rule.verdict[0].upper() + rule.verdict[1:] + ".", kind),
+                  note=f"Set before the results were in. Judged only on the headline strategy ({label_of(BASE_KEY)}), "
+                       f"counting {scope.label}. "
+                       "An event is one game or question: several fills in it count once. The date range and wallet "
+                       "filters do not narrow it.", wide=True)
 
 
 def overview_wallets(c: Ctx) -> str:

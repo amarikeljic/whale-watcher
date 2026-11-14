@@ -419,4 +419,5 @@ async def test_stats_put_the_bot_first_and_keep_the_old_rule_as_its_own_section(
     assert "polymarket / hold_to_resolution" in text and "By watchlist status (flat_hold):" in text
     assert len(load_bot_trades(live_app)) == 4
     from whalewatcher.stats import daily_summary
-    assert len(daily_summary(live_app)) <= 1900
+    from whalewatcher.stats import SUMMARY_LIMIT
+    assert len(daily_summary(live_app)) <= SUMMARY_LIMIT

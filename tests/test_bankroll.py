@@ -416,7 +416,8 @@ async def test_the_runner_notices_a_new_amount_and_the_reports_show_the_wallet(l
     brief = daily_summary(live_app)
     assert "$250.00 wallet, run #2: $250.00 from" in brief and "$250.00 wallet, replay of every signal: equity $" in brief
     assert "time-to-close cutoff (off) skipped 0 (too_long 0, no_end_date 0)" in brief
-    assert "no closed trades yet, so no P&L" in brief and len(brief) < 1900 and "without the cutoff" not in brief
+    from whalewatcher.stats import SUMMARY_LIMIT
+    assert "no closed trades yet, so no P&L" in brief and len(brief) < SUMMARY_LIMIT and "without the cutoff" not in brief
 
 
 def test_the_wallet_command_sets_and_shows_the_amount(tmp_path, monkeypatch, capsys):
