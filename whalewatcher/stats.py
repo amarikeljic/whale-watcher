@@ -562,7 +562,7 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
         lines.append("  skipped: " + ", ".join(f"{k} {v}" for k, v in sorted(why.items())))
     if runner != US_RUNNER and group is None:   # row A prices every signal: it has no bankroll and no limits
         lines.append(f"  paper bankroll ${acct.equity:,.2f} (started ${acct.starting:,.2f}) | open at cost "
-                     f"${acct.open_cost:,.2f} | free ${acct.cash:,.2f} | closed today {_money(acct.today)} "
+                     f"${acct.open_cost:,.2f} | free ${acct.cash:,.2f} | closed since 00:00 UTC {_money(acct.today)} "
                      "(the bot's operating account: every model version, as its risk limits see it)")
     if s.settled:
         lines.append(f"  total P&L {_money(s.total_pnl)} on ${s.total_cost:,.2f} staked (n={s.settled} closed) | "
@@ -1259,7 +1259,7 @@ def export_bot_csv(app: App, path: str) -> int:
     return len(trades)
 
 
-SUMMARY_WINDOW = DAY       # "today" in the daily summary: the 24 hours up to it (see daily_summary)
+SUMMARY_WINDOW = DAY       # the daily summary's "last 24 hours" column (see daily_summary)
 # A guard, not a target. It was 1,900 while the summary was posted as a chat message; it now
 # goes to the log and `stats --brief`, and two runners plus a nightly review came to 3,500 on real data.
 SUMMARY_LIMIT = 6000
@@ -1279,7 +1279,7 @@ def _period(rows: list[dict], since: float | None, samples: int) -> dict[str, An
 
 
 def _side_by_side(day: dict[str, Any], ever: dict[str, Any]) -> list[str]:
-    """Today and all-time, each with its n and interval (no profit figure without them)."""
+    """The last 24 hours and all-time, each with its n and interval (no profit figure without them)."""
     def cells(p: dict[str, Any]) -> list[str]:
         s = p["s"]
         return [f"{p['filled']} / {p['missed']} / {p['skipped']}", str(s.settled),
@@ -1289,7 +1289,7 @@ def _side_by_side(day: dict[str, Any], ever: dict[str, Any]) -> list[str]:
                 f"${p['fees']:,.2f} / ${p['slippage']:,.2f}"]
     labels = ["signals: filled / missed / skipped", "closed trades (n)", "net P&L", "mean ROI per trade, 95% CI",
               "win rate", "fees / slippage"]
-    lines = [f"  {'':<36}{'last 24 h':<26}all-time"]
+    lines = [f"  {'':<36}{'last 24 hours':<26}all-time"]
     for label, a, b in zip(labels, cells(day), cells(ever)):
         lines.append(f"  {label:<36}{a:<26}{b}")
     return lines
@@ -1328,8 +1328,8 @@ def daily_summary(app: App, scope: Scope = Scope()) -> str:
     Then the decision rule, what the time-to-close cutoff skipped, the small wallet,
     and what the latest nightly review changed on the watchlist.
 
-    "Today" is the 24 hours up to the summary, not the calendar day, so that each trade
-    is in exactly one daily summary whatever hour it is written. The full report is
+    The first column is the 24 hours up to the summary, not the calendar day, so that
+    each trade is in exactly one daily summary whatever hour it is written. The full report is
     ``stats`` and the dashboard."""
     from . import bankroll
     everything = load_bot_trades(app)

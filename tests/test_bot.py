@@ -202,7 +202,7 @@ async def test_a_daily_loss_pauses_new_entries_until_the_next_utc_day(live_app, 
     world.set_book("0xn-t0", [(0.44, 1000)], [(0.42, 500)])
     await buy(world, monitor, clock, "0xn")
     paused = trades(live_app, "flat_hold")[-1]
-    assert paused["status"] == "SKIPPED" and paused["reason"].startswith("daily loss limit: lost $10.00 today (limit $8)")
+    assert paused["status"] == "SKIPPED" and paused["reason"].startswith("daily loss limit: lost $10.00 since 00:00 UTC (limit $8)")
 
     clock.advance(DAY)                                  # a new UTC day
     world.add_market(FakeMarket("0xo", end_date=NOW + 30 * DAY))

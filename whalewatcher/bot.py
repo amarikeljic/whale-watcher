@@ -168,7 +168,7 @@ class Bot:
         c = self.strategy_cfg(strategy)
         acct = self.account(strategy)
         if acct.today <= -c.daily_loss_limit_usd:
-            return (f"daily loss limit: lost ${-acct.today:,.2f} today (limit ${c.daily_loss_limit_usd:,.0f}); "
+            return (f"daily loss limit: lost ${-acct.today:,.2f} since 00:00 UTC (limit ${c.daily_loss_limit_usd:,.0f}); "
                     "new entries paused until 00:00 UTC")
         if acct.cash < stake:
             return f"bankroll: ${acct.cash:,.2f} free, stake ${stake:,.2f}"

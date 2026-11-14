@@ -91,7 +91,7 @@ python -m whalewatcher wallet set 250               # change the amount (starts 
 python -m whalewatcher detector                     # watch trades, publish tracked wallets' fills (own container)
 python -m whalewatcher monitor [--cycles N] [--no-detector]   # the runner: alerts + the paper bot
 python -m whalewatcher settle
-python -m whalewatcher stats [--brief]              # the full report, or the daily summary (last 24 h beside all-time)
+python -m whalewatcher stats [--brief]              # the full report, or the daily summary (last 24 hours beside all-time)
 python -m whalewatcher stats --model before         # ...for the rows made before model versions (also: all, or a number)
 python -m whalewatcher stats --include-outages      # ...counting signals made inside outage windows
 python -m whalewatcher version                      # the model version and commit new rows get, and what each version changed
@@ -303,9 +303,9 @@ return per trade with its 95% interval, win rate, and fees and slippage, so no
 profit figure appears without its n and interval. Then the decision rule, what
 the time-to-close cutoff skipped, the small wallet, and **what the latest nightly
 review changed**: members now, wallets added and removed with the reason, reviews
-failed and wallets turned away. "Today" is the 24 hours up to the summary, not
-the calendar day, so every trade lands in exactly one daily summary whatever hour
-it is written.
+failed and wallets turned away. The first column is the last 24 hours up to the
+summary, not the calendar day, so every trade lands in exactly one daily summary
+whatever hour it is written.
 
 Phase 5's other items: outage windows are recorded automatically (below). The
 healthchecks.io heartbeat and the nightly backups were dropped by the owner.

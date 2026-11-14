@@ -32,7 +32,7 @@ async def test_the_last_24_hours_sit_beside_all_time_each_with_n_and_interval(ap
     assert rows["net P&L"] == ("+$5.00", "-$1.00")
     day_ci, all_ci = rows["mean ROI per trade, 95% CI"]
     assert day_ci.startswith("+50.0%") and "[" in all_ci, "an interval in both columns: no profit figure without one"
-    assert "last 24 h" in text and "all-time" in text
+    assert "last 24 hours" in text and "all-time" in text and "today" not in text.lower()
     assert "decision rule: 3 of 100 settled events" in text
 
 
