@@ -52,8 +52,9 @@ SELECT p.*, a.wallet, a.kind, a.outcome, a.whale_price, a.whale_usd, a.first_fil
 FROM paper_trades p
 JOIN alerts a ON a.id = p.alert_id
 LEFT JOIN poly_markets m ON m.condition_id = p.condition_id
-ORDER BY p.alert_ts, p.id
+{where}ORDER BY p.alert_ts, p.id
 """
+SIM_PREFIX = "backtest:"         # a simulated replay's strategy name starts with this
 
 
 @dataclass
@@ -95,9 +96,19 @@ class Summary:
         return self.ci_low is not None and self.ci_high is not None and self.ci_low <= 0 <= self.ci_high
 
 
-def load_trades(app: App) -> list[dict]:
+def load_trades(app: App, *, sims: bool = True) -> list[dict]:
+    """Old-rule paper trades, and the simulated replays unless ``sims`` is False. The
+    replays are most of the rows (24,800 of 25,000 on the live copy, 2026-11-14) and only
+    the Edge page and a replay's own view show them."""
     from .costs import apply_policy
-    return [horizon_fields(apply_policy(dict(r)), r["fill_ts"] or r["alert_ts"]) for r in app.db.query(QUERY)]
+    sql = QUERY.format(where="" if sims else f"WHERE p.strategy NOT LIKE '{SIM_PREFIX}%' ")
+    return [horizon_fields(apply_policy(dict(r)), r["fill_ts"] or r["alert_ts"]) for r in app.db.query(sql)]
+
+
+def sim_strategies(app: App) -> list[tuple[str, str]]:
+    """(strategy, venue) of every simulated replay, without loading its rows."""
+    return [(r["strategy"], r["venue"]) for r in app.db.query(
+        f"SELECT DISTINCT strategy, venue FROM paper_trades WHERE strategy LIKE '{SIM_PREFIX}%'")]
 
 
 def horizon_fields(d: dict, entered: float | None) -> dict:
@@ -460,6 +471,81 @@ def detection_lines(app: App) -> list[str]:
                if late else "")]
 
 
+NO_MARKET = "market metadata unavailable"       # bot.decide_buy's reason when Gamma has no market
+LOST_WINDOW = 7 * DAY
+
+
+@dataclass
+class SettleCheck:
+    """Can every signal be traded, and every trade settle?
+
+    Polymarket's new market format (Protocol V2) starts on 2026-11-23, and most sports
+    move to it on 2026-12-01. Two failures would be silent without this: a fill whose
+    token its market does not list never settles (it stays open, holds a wallet slot
+    and never reaches the decision rule), and a market Gamma cannot find turns its
+    signals into misses."""
+    v2_markets: int = 0
+    v2_signals: int = 0          # headline signals on v2 markets
+    v2_filled: int = 0
+    stuck: list[dict] = field(default_factory=list)    # open fills on a resolved market that does not list the token
+    lost: int = 0                # headline signals missed for lack of market data, last 7 days
+    signals: int = 0             # all headline signals, last 7 days
+
+    @property
+    def ok(self) -> bool:
+        return not self.stuck and not self.lost
+
+
+def settle_check(app: Any, now: int | None = None) -> SettleCheck:
+    from .markets import market_from_row
+    now = int(app.clock()) if now is None else now
+    out = SettleCheck()
+    try:
+        v2 = app.db.one("SELECT COUNT(*) n FROM poly_markets WHERE version = 'v2'")
+    except Exception:  # noqa: BLE001 - a database from before schema 12 has no version column
+        return out
+    out.v2_markets = v2["n"]
+    head = "b.runner = 'single' AND b.strategy = ?"
+    row = app.db.one(f"SELECT COUNT(*) n, SUM(b.status = 'FILLED') f FROM bot_trades b JOIN poly_markets m "
+                     f"ON m.condition_id = b.condition_id WHERE {head} AND m.version = 'v2'", (BOT_HEADLINE,))
+    out.v2_signals, out.v2_filled = row["n"], row["f"] or 0
+    row = app.db.one(f"SELECT COUNT(*) n, SUM(b.reason = ?) lost FROM bot_trades b WHERE {head} AND b.signal_ts >= ?",
+                     (NO_MARKET, BOT_HEADLINE, now - LOST_WINDOW))
+    out.signals, out.lost = row["n"], row["lost"] or 0
+    # The US runner settles from the US venue's own results, not by token: left out.
+    open_fills = app.db.query("SELECT b.id, b.runner, b.strategy, b.token_id, b.condition_id FROM bot_trades b "
+                              "JOIN poly_markets m ON m.condition_id = b.condition_id WHERE b.status = 'FILLED' "
+                              "AND b.closed_at IS NULL AND b.runner != ? AND m.resolved = 1 AND m.payouts IS NOT NULL",
+                              (US_RUNNER,))
+    if open_fills:
+        ids = sorted({r["condition_id"] for r in open_fills})
+        marks = ",".join("?" * len(ids))
+        markets = {r["condition_id"]: market_from_row(r)
+                   for r in app.db.query(f"SELECT * FROM poly_markets WHERE condition_id IN ({marks})", ids)}
+        out.stuck = [dict(r, slug=markets[r["condition_id"]].slug) for r in open_fills
+                     if markets[r["condition_id"]].outcome_index_of(r["token_id"]) is None]
+    return out
+
+
+def settle_check_lines(app: Any, *, brief: bool = False) -> list[str]:
+    c = settle_check(app)
+    if brief and c.ok:
+        return []
+    out = [(f"CAN EVERY TRADE SETTLE? (Polymarket's new market format starts 2026-11-23, most sports 2026-12-01) "
+            f"new-format markets seen: {c.v2_markets}, headline signals on them: {c.v2_signals} ({c.v2_filled} filled) "
+            f"| open fills that cannot settle: {len(c.stuck)} | signals missed for lack of market data, last 7 days: "
+            f"{c.lost} of {c.signals}")]
+    if c.stuck:
+        sample = ", ".join(f"#{r['id']} {r['runner']}/{r['strategy']} on {r['slug'] or r['condition_id'][:12]}"
+                           for r in c.stuck[:3])
+        out.append(f"  ! {len(c.stuck)} open fills cannot settle: their market has resolved but does not list "
+                   f"their token, so they will stay open. A bug to fix. First: {sample}")
+    if c.lost:
+        out.append(f"  ! {c.lost} signals in the last 7 days were missed because Gamma had no data for their "
+                   "market. More than a stray one or two means the market lookup is failing.")
+    return out
+
+
 def cost_line(rows: list[dict]) -> str:
     """Gross, costs and net of the closed trades. Every headline figure is already net."""
     from .costs import breakdown
@@ -687,6 +773,7 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
     if not brief:
         lines += followup_lines(app, trades, samples)
     lines += detection_lines(app)
+    lines += settle_check_lines(app)
     if with_breakdowns:
         headline = [t for t in trades if t["strategy"] == BOT_HEADLINE and t["status"] != "SKIPPED"
                     and t["runner"] != US_RUNNER]
@@ -1435,6 +1522,7 @@ def daily_summary(app: App, scope: Scope = Scope()) -> str:
                              f"n={s.settled} closed, 95% CI {_ci_text(s)}")
     lines += watchlist_lines(app)
     lines += detection_lines(app)[:1]
+    lines += settle_check_lines(app, brief=True)
     lines.append("Full report: `python -m whalewatcher stats`, or the dashboard.")
     text = "\n".join(lines)
     return text if len(text) <= SUMMARY_LIMIT else text[:SUMMARY_LIMIT - 10] + "\n…"

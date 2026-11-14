@@ -395,6 +395,42 @@ token), and the dashboard shows no configuration.
 webhook addresses. Delete it, and delete the two webhooks in Discord so the
 addresses stop working.
 
+## Found in the review of 2026-11-14
+
+Checked on the 6 GB live copy and against live Gamma data.
+
+* **Fills on new-format markets would never settle: fixed.** Polymarket starts
+  Protocol V2 on 2026-11-23 and moves most sports to it on 2026-12-01. Its markets
+  trade under `positionIds`, chosen by the market's `version`. The code read
+  `clobTokenIds` only, so a V2 fill's token matched no outcome and settlement skipped
+  it every time: open forever, a wallet slot held, never counted toward the decision
+  rule. Now chosen by version, both id lists kept, and V2's `resolutionStatus` read.
+  An end-to-end test fails on the old code and passes now. The Health page card "Can
+  every trade settle?" counts V2 markets, stuck fills and signals missed for lack of
+  market data. Not checkable before a real V2 market exists: whether the Data API
+  names V2 trades with the same condition id as Gamma.
+* **The position id decoder described the layout wrongly: corrected.** On 74 live
+  ids the outcome index was right every time, but the key inside is not the market's
+  `conditionId`. Nothing depended on it.
+* **A 1 GB index nobody reads: dropped** (schema 12). `wallet_trades (wallet,
+  condition_id)`: every query goes by fill key or by wallet and time (checked with
+  SQLite's query planner). It also slowed every insert.
+* **Every dashboard page loaded 24,800 replay rows: fixed.** Only Edge and the
+  replay views show them. Overview 1.28 s to 0.09 s, peak memory 185 MB to 45 MB;
+  the wallet page 2.45 s and 210 MB to 0.07 s and 45 MB (only the open tab is
+  worked out now).
+* **A stuck process stayed stuck: fixed.** Docker's healthcheck only marks a
+  container. The runner and the detector now exit after 15 minutes without a
+  finished step, and Docker restarts them.
+* **Not fixed: the database keeps growing.** Whale trade histories are 5.1 GB of
+  6 GB (7.5 million rows, 2,195 wallets). After the first load they grew 180,000 to
+  290,000 rows a day, about 120 to 200 MB, with one 1.8 million row day when the
+  review took in many new wallets. Rough guess: 50 to 70 GB a year. Shrinking it
+  means rewriting the table or deleting old history, which needs your OK.
+* **Not fixed: the Edge page and a replay's wallet tab still peak near 190 MB**
+  of the dashboard's 256 MB. Fine today. A second large replay would push them over,
+  and the dashboard would restart instead of showing the page.
+
 ## Parked for later
 
 Ideas the owner chose to keep for later. Nothing here is built.

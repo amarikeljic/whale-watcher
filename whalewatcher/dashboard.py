@@ -41,7 +41,9 @@ from .horizon import UNKNOWN as NO_END
 from .horizon import bucket as horizon_bucket
 from .stats import (SUMMARY_WINDOW, Scope, Scoped, _period, bucket, cutoff_report, decision_rule, event_key,
                     in_play, last_review, load_bot_trades, load_trades, markout_columns, markout_groups, markouts,
-                    outage_windows, recheck_report, scope_rows, summarise, us_comparison)
+                    outage_windows, recheck_report, scope_rows, settle_check, sim_strategies, summarise,
+                    us_comparison)
+from .stats import SIM_PREFIX
 from .stats_util import mean, median
 from .timeutil import iso, now_ts, parse_as_of, start_of_day
 from .version import MODEL_VERSION
@@ -78,16 +80,24 @@ def label_of(key: str) -> str:
 # -- data -----------------------------------------------------------------------------------
 
 
-def load_records(app: Any) -> list[dict]:
-    """Every paper trade, bot and old rule and simulated, as one list with one set of names."""
+SIM_PAGES = ("/edge",)      # pages that show the simulated replays whatever the filters
+
+
+def sim_key(strategy: str, venue: str) -> str:
+    return f"sim/{strategy[len(SIM_PREFIX):]}/{venue}"
+
+
+def load_records(app: Any, *, sims: bool = True) -> list[dict]:
+    """Every paper trade, bot and old rule and (unless ``sims`` is False) simulated, as one
+    list with one set of names."""
     out = []
     for t in load_bot_trades(app):
         t.update(key=f"{t['runner']}/{t['strategy']}", simulated=False,
                  market_venue="polymarket_us" if t["runner"] == "us" else "polymarket")
         out.append(t)
-    for t in load_trades(app):
-        sim = str(t["strategy"]).startswith("backtest:")
-        t.update(key=f"sim/{t['strategy'][9:]}/{t['venue']}" if sim else f"old/{t['strategy']}",
+    for t in load_trades(app, sims=sims):
+        sim = str(t["strategy"]).startswith(SIM_PREFIX)
+        t.update(key=sim_key(t["strategy"], t["venue"]) if sim else f"old/{t['strategy']}",
                  market_venue=t["venue"], simulated=sim, reason=t.get("miss_reason"), markout_price=None,
                  human_pnl=None, detect_delay=None, decided_at=t.get("fill_ts"), signal_ts=t.get("trigger_fill_ts"),
                  best_ask=t.get("alert_ask"), probation=t.get("probation"))
@@ -1236,21 +1246,25 @@ def bankroll_page(c: Ctx, query: Any) -> tuple[str, str]:
     """(title, body). Not scoped by the filter row: a wallet is one path through all its signals."""
     app = c.app
     amount = bankroll.wallet_amount(app.db)
-    all_views = bankroll.views(c.records, app.cfg, app.db, c.now, amount=amount)
-    keys = [w.key for w in all_views]
+    # A tab per signal source, but only the open tab's wallet is worked out: a replay's
+    # runs over its 24,000 signals cost seconds and most of the page's memory. The replay
+    # tabs are listed by name, without loading their rows (build_ctx).
+    replays = [f"sim:{s[len(SIM_PREFIX):]}" for s, venue in sim_strategies(app) if venue == "polymarket"]
+    keys = bankroll.ordered_keys(bankroll.signals_by_source(c.records, app.cfg), replays)
     src = query.get("src") if query.get("src") in keys else (keys[0] if keys else "")
-    view = next((w for w in all_views if w.key == src), None)
+    view = next(iter(bankroll.views(c.records, app.cfg, app.db, c.now, amount=amount, only=src)), None) if src else None
     title = f"${amount:,.2f} wallet"
     body = wallet_form(amount, query.get("saved") or "", (query.get("error") or "")[:200]) + scope_note(c)
     params = bankroll.Params.of(app.cfg, amount)
     body += (f'<p class="card-note">{v.esc(params.describe())}. The fee is inside the stake and a stake is never '
              "more than the cash. Open positions are valued at their last recorded best bid, or at the price paid "
              "when none was recorded.</p>")
+    if keys:
+        body += '<nav class="tabs" aria-label="Signal source">' + "".join(
+            f'<a href="/bankroll?{urlencode({"src": key})}" class="{"on" if key == src else ""}">'
+            f'{v.esc(bankroll.source_label(key))}</a>' for key in keys) + "</nav>"
     if view is None:
         return title, body + v.banner("No signals yet.", "info")
-    body += '<nav class="tabs" aria-label="Signal source">' + "".join(
-        f'<a href="/bankroll?{urlencode({"src": w.key})}" class="{"on" if w.key == src else ""}">{v.esc(w.label)}</a>'
-        for w in all_views) + "</nav>"
     if view.simulated:
         body += v.banner("These signals come from a simulated backtest, not from live paper trading.", "info")
     body += '<div class="grid">'
@@ -1428,6 +1442,24 @@ def health(c: Ctx) -> str:
         note="A day with far fewer fills than its neighbours, or many that only the backstop saw, means the feed "
              "had trouble. (n in the tooltip = backstop-only fills.)")
 
+    chk = settle_check(app, now)
+    if chk.stuck:
+        body += v.banner(f"{len(chk.stuck)} open fills cannot settle: their market has resolved but does not list "
+                         "their token, so they will stay open and hold a wallet slot. This is a bug to fix.", "bad")
+    if chk.lost:
+        body += v.banner(f"{chk.lost} signals in the last 7 days were missed because Gamma had no data for their "
+                         "market. More than a stray one or two means the market lookup is failing.", "warn")
+    body += v.card("Can every trade settle?", v.table(
+        ["Check", "Now"],
+        [["Markets in Polymarket's new format (V2) seen", str(chk.v2_markets)],
+         ["Headline signals on them", f"{chk.v2_signals} ({chk.v2_filled} filled)"],
+         ["Open fills that cannot settle", str(len(chk.stuck))],
+         ["Signals missed for lack of market data, last 7 days", f"{chk.lost} of {chk.signals}"]],
+        sortable=False, numeric_from=1),
+        note="Polymarket starts a new market format on 2026-11-23, and most sports move to it on 2026-12-01. Its "
+             "markets use a new kind of token id. Both failures above would otherwise be silent: a fill whose token "
+             "its market does not list never settles, and a market that cannot be found turns signals into misses.")
+
     rows = app.db.query("SELECT * FROM outage_windows ORDER BY start_ts DESC") if c.windows else []
     body += v.card("Outage windows", v.table(
         ["From (UTC)", "To (UTC)", "Cause", "Recorded by", "Hours"],
@@ -1496,8 +1528,15 @@ def wallet_page(c: Ctx, wallet: str) -> str:
 def build_ctx(cfg: Config, db: Database, query: Any, path: str, now: int | None = None) -> Ctx:
     now = now_ts() if now is None else now
     app = SimpleNamespace(db=db, cfg=cfg, clock=lambda: now, wall=lambda: float(now))
-    records = load_records(app)
+    # The simulated replays are most of the rows. Only the Edge page (every variation), a
+    # replay's own view and the wallet page's replay tabs show them. Every other page
+    # leaves them out, so it skips loading them.
+    sims = (path in SIM_PAGES or str(query.get("strategy") or "").startswith("sim/")
+            or (path == "/bankroll" and str(query.get("src") or "").startswith("sim:")))
+    records = load_records(app, sims=sims)
     present = {r["key"] for r in records}
+    if not sims:
+        present |= {sim_key(s, venue) for s, venue in sim_strategies(app)}     # still offered in the menu
     strategies = [k for k in LABELS if k in present] + sorted(k for k in present if k not in LABELS)
     f = Filters.parse(query, now, strategies)
     live_wallets = sorted({r["wallet"] for r in records if not r["simulated"] and r["wallet"]})

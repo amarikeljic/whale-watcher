@@ -39,15 +39,17 @@ under SIMULATED, apart from the live ones:
 docker compose exec whale-watcher python -m whalewatcher backtest --dataset data/optimize-folds.json
 ```
 
-## Deploying the Part 4 batch (2026-11-14)
+## Deploying the Part 4 batch and the review fixes (2026-11-14)
 
-1. **Check free disk first.** Opening the database upgrades it to schema 11, and
+1. **Check free disk first.** Opening the database upgrades it to schema 12, and
    before that it copies the whole file to `data/backups/`. It needs free space of
    about the database's size, and refuses to upgrade (changing nothing) if there
    is not enough: `du -h data/whalewatcher.sqlite3` against `df -h .`
 2. **Deploy:** `GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build`
-3. **What the first start does.** On a 6 GB copy of the live data the upgrade took
-   70 seconds, backup included, and kept every row. Then:
+3. **What the first start does.** On a 6 GB copy of the live data the upgrade to
+   schema 11 took 70 seconds and the step to 12 another 24, backups included, and
+   kept every row. Schema 12 drops one index nobody reads (1 GB of that copy; its
+   space is reused by new rows, the file does not shrink). Then:
    * the gap while the service was down is recorded as an outage window, so
      signals from the restart are left out of results;
    * the headline starts again at model 1, from zero. Everything from before is
@@ -714,11 +716,31 @@ tables and two columns to `alerts`. Existing rows are untouched. The wallets v1
 was monitoring are carried over as members. If the disk has no room for the
 backup, it stops and changes nothing.
 
-**Protocol V2** (`protocol.py`). Sports markets move to Polymarket's Protocol
-V2 on 2026-12-01, where outcome tokens are position ids. The decoder for those
-ids is in place and tested against the layout in Polymarket's own SDK. It is
-not yet checked against a live V2 market (none exists before 2026-11-23) and
-nothing depends on it yet.
+**Protocol V2.** New markets move to Polymarket's Protocol V2 from 2026-11-23,
+and most sports (soccer, NFL, college football, basketball, tennis, esports) on
+2026-12-01. A V2 market trades under position ids instead of CLOB token ids.
+Following Polymarket's migration guide
+(https://docs.polymarket.com/migrate/polymarket-v2/api-integrations.md), a
+market's outcome ids are chosen by its `version` ("v2": `positionIds`, "v1":
+`clobTokenIds`, even when both are listed, which 37 of 100 open v1 markets
+already do), the other kind is kept too, and a V2 market's fallback payout reads
+`resolutionStatus`. Without this, a fill on a V2 market would never settle: it
+would stay open, hold a wallet slot and never count toward the decision rule
+(`tests/test_market_versions.py` fails that way on the old code). The Health page
+card "Can every trade settle?" and a line in `stats` count V2 markets, any fill
+that cannot settle, and signals missed for lack of market data. Still unchecked
+until a real V2 market exists: whether the Data API reports V2 trades under the
+same condition id Gamma uses. If it does not, that card shows it within a day.
+
+`protocol.py` decodes a position id offline. Checked on 74 live ids: the outcome
+index inside is always right, but the market key inside is not Gamma's
+`conditionId`, so nothing maps ids back to markets that way.
+
+**Watchdog** (`service.Watchdog`). If the runner's or the detector's main loop
+finishes no step for 15 minutes (a step normally takes seconds, every request
+gives up after 20 s and the database after 60 s), the process exits and Docker's
+`restart: unless-stopped` starts it again. Docker's healthcheck cannot do this:
+outside Swarm an unhealthy container is only marked, never restarted.
 
 ## Where this deviates from the spec, and why
 

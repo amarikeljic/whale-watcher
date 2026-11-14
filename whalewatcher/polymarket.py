@@ -182,6 +182,11 @@ class MarketInfo:
     resolved_at: int | None = None
     payouts: list[float] | None = None
     uma_statuses: str = ""      # the UMA resolution history, a JSON list (uma_history)
+    # Protocol V2 (outcome_ids). token_ids are the ids this market trades under, picked by
+    # its version. alt_token_ids are the other kind, same order, kept so a trade written
+    # with either kind still finds its outcome.
+    version: str = "v1"
+    alt_token_ids: list[str] = field(default_factory=list)
 
     @property
     def disputed(self) -> bool:
@@ -192,10 +197,20 @@ class MarketInfo:
         return self.game_start_time is not None or bool(self.sports_market_type) or self.category == "sports"
 
     def outcome_index_of(self, token_id: str) -> int | None:
-        try:
-            return self.token_ids.index(token_id)
-        except ValueError:
+        """The outcome a token id stands for. A token this misses can never settle, so
+        both id lists are tried, then the same number written another way (hex or decimal)."""
+        lists = (self.token_ids, self.alt_token_ids)
+        for ids in lists:
+            if token_id in ids:
+                return ids.index(token_id)
+        want = _as_uint(token_id)
+        if want is None:
             return None
+        for ids in lists:
+            for i, t in enumerate(ids):
+                if _as_uint(t) == want:
+                    return i
+        return None
 
     def close_reference_ts(self) -> int | None:
         """The 'closing' instant for CLV as the spec defines it.
@@ -232,6 +247,7 @@ class MarketInfo:
         tags = [t for t in tags if t]
         fee = raw.get("feeSchedule") or {}
         fees_enabled = bool(raw.get("feesEnabled"))
+        version, ids, alt = outcome_ids(raw)
         return cls(
             condition_id=str(raw.get("conditionId") or "").lower(),
             question=str(raw.get("question") or ""),
@@ -241,7 +257,7 @@ class MarketInfo:
             category=category_from_tags(tags),
             tags=tags,
             outcomes=[str(o) for o in _json_list(raw.get("outcomes"))],
-            token_ids=[str(t) for t in _json_list(raw.get("clobTokenIds"))],
+            token_ids=ids,
             end_date=parse_time(raw.get("endDate")),
             closed=bool(raw.get("closed")),
             closed_time=parse_time(raw.get("closedTime")),
@@ -256,11 +272,19 @@ class MarketInfo:
             description=str(raw.get("description") or ""),
             resolution_source=str(raw.get("resolutionSource") or ""),
             uma_statuses=uma_history(raw),
+            version=version,
+            alt_token_ids=alt,
         )
 
     def gamma_final_payouts(self, raw: dict[str, Any]) -> list[float] | None:
-        """Gamma's ``outcomePrices`` once UMA says resolved: the fallback payout."""
-        if str(raw.get("umaResolutionStatus") or "").lower() != "resolved" or not raw.get("closed"):
+        """Gamma's ``outcomePrices`` once the market says resolved: the fallback payout.
+
+        A V2 market says so in ``resolutionStatus`` (inactive, active or resolved); a V1
+        market keeps ``umaResolutionStatus``.
+        https://docs.polymarket.com/migrate/polymarket-v2/api-integrations.md ("Track
+        Resolution Through Gamma")."""
+        status = raw.get("resolutionStatus") if _version(raw) == "v2" else raw.get("umaResolutionStatus")
+        if str(status or "").lower() != "resolved" or not raw.get("closed"):
             return None
         prices = [_float(p, -1) for p in _json_list(raw.get("outcomePrices"))]
         if not prices or any(p < 0 or p > 1 for p in prices):
@@ -268,6 +292,39 @@ class MarketInfo:
         if abs(sum(prices) - 1) > 0.02:
             return None
         return prices
+
+
+def _version(raw: dict[str, Any]) -> str:
+    """Gamma's ``version`` for a market, lower case. Missing means a market from before
+    Protocol V2 existed, so v1."""
+    return str(raw.get("version") or "v1").strip().lower()
+
+
+def outcome_ids(raw: dict[str, Any]) -> tuple[str, list[str], list[str]]:
+    """(version, the outcome ids this market trades under, the other kind of id).
+
+    https://docs.polymarket.com/migrate/polymarket-v2/api-integrations.md ("Select the
+    Trading ID"): choose by ``version``, even when both fields are present. "v2":
+    ``positionIds``, an array of decimal strings. "v1": ``clobTokenIds``, a JSON-encoded
+    array. Both are in outcome order. Checked live on 2026-11-14: 37 of 100 open v1
+    markets already carry ``positionIds`` too, so choosing by presence would pick the
+    wrong ids for markets trading today."""
+    version = _version(raw)
+    clob = [str(t) for t in _json_list(raw.get("clobTokenIds"))]
+    positions = [str(t) for t in _json_list(raw.get("positionIds"))]
+    if version == "v2":
+        return version, positions, clob
+    return version, clob, positions
+
+
+def _as_uint(value: Any) -> int | None:
+    """A token id as a number, from decimal or 0x-hex text. None if it is neither."""
+    text = str(value or "").strip()
+    try:
+        number = int(text, 16) if text[:2].lower() == "0x" else int(text) if text.isdigit() else None
+    except ValueError:
+        return None
+    return number if number is not None and number >= 0 else None
 
 
 def uma_history(raw: dict[str, Any]) -> str:

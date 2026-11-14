@@ -24,8 +24,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+import threading
 import time
 from collections import deque
 
@@ -48,6 +50,53 @@ log = logging.getLogger(__name__)
 HEARTBEAT_KEY = "heartbeat"
 WALLET_CHECK_EVERY = 30.0      # seconds between looks at the wallet amount (one small query)
 HEARTBEAT_EVERY = 5.0          # seconds between heartbeat writes: the loops tick faster than that
+# A main-loop step that has not finished in this long is stuck, not slow: every request
+# gives up after 20 s, the database after 60 s, and the nightly review runs in a child
+# process. Measured steps take seconds.
+WATCHDOG_SECONDS = 900
+WATCHDOG_EXIT = 70             # EX_SOFTWARE
+
+
+class Watchdog:
+    """Ends the process when its main loop stops finishing steps, so Docker's
+    ``restart: unless-stopped`` starts it again, and the restart gap becomes an outage
+    window like any other.
+
+    Docker's healthcheck cannot do this: outside Swarm an unhealthy container is only
+    marked, never restarted. A thread, not an asyncio task: a stuck event loop could not
+    run the task meant to notice it."""
+
+    def __init__(self, name: str, limit: float = WATCHDOG_SECONDS, *, clock=time.monotonic, exit_=os._exit) -> None:
+        self.name, self.limit = name, limit
+        self._clock, self._exit = clock, exit_
+        self.last = clock()
+        self._stopped = threading.Event()
+
+    def beat(self) -> None:
+        self.last = self._clock()
+
+    def check(self) -> bool:
+        """True while the loop is alive. Ends the process when it is not."""
+        idle = self._clock() - self.last
+        if idle <= self.limit:
+            return True
+        log.critical("%s: no step has finished for %.0f s (limit %.0f s). Stuck: exiting so Docker restarts it",
+                     self.name, idle, self.limit)
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        self._exit(WATCHDOG_EXIT)
+        return False
+
+    def start(self, every: float = 30.0) -> Watchdog:
+        def watch() -> None:
+            while not self._stopped.wait(every):
+                if not self.check():
+                    return
+        threading.Thread(target=watch, name=f"watchdog-{self.name}", daemon=True).start()
+        return self
+
+    def stop(self) -> None:
+        self._stopped.set()
 DETECTOR_STALE_SECONDS = 90
 
 
@@ -130,6 +179,7 @@ class Service:
                  interval)
         done = 0
         totals = {"fills": 0, "alerts": 0, "skipped": 0, "errors": 0}
+        watchdog = Watchdog("runner").start() if cycles is None else None
         while not self.stop.is_set():
             started = time.monotonic()
             try:
@@ -162,6 +212,8 @@ class Service:
                     # missed heartbeat shows on the Health page, a dead process trades nothing.
                     log.exception("heartbeat failed; continuing")
             done += 1
+            if watchdog is not None:
+                watchdog.beat()
             if cycles is not None and done >= cycles:
                 break
             wait = max(0.0, interval - (time.monotonic() - started))
@@ -169,6 +221,8 @@ class Service:
                 await asyncio.wait_for(self.stop.wait(), timeout=wait)
             except TimeoutError:
                 pass
+        if watchdog is not None:
+            watchdog.stop()
         if self.us is not None:
             await self.us.drain()             # let any Polymarket US pricing in flight finish and be recorded
         await self.bot.drain()                # and the second book reads (Part 4 #6)
@@ -335,6 +389,7 @@ async def run_detector(app: App, stop: asyncio.Event, *, cycles: int | None = No
              interval, app.cfg.alerts.poll_interval_seconds)
     done = published = backstop = errors = 0
     beat_at = line_at = 0.0
+    watchdog = Watchdog("detector").start() if cycles is None else None
     while not stop.is_set():
         started = time.monotonic()
         try:
@@ -357,12 +412,16 @@ async def run_detector(app: App, stop: asyncio.Event, *, cycles: int | None = No
         except Exception:
             log.exception("detector heartbeat failed; continuing")     # a busy database must not end the detector
         done += 1
+        if watchdog is not None:
+            watchdog.beat()
         if cycles is not None and done >= cycles:
             break
         try:
             await asyncio.wait_for(stop.wait(), timeout=max(0.0, interval - (time.monotonic() - started)))
         except TimeoutError:
             pass
+    if watchdog is not None:
+        watchdog.stop()
     log.info("detector stopped after %d steps", done)
 
 

@@ -63,6 +63,13 @@ Spec: https://docs.polymarket.com/api-spec/gamma-openapi.yaml
   (JSON strings), `endDate closed closedTime gameStartTime sportsMarketType`,
   `negRisk acceptingOrders description resolutionSource umaResolutionStatus
   outcomePrices feesEnabled feeSchedule{rate,exponent,takerOnly,rebateRate}`.
+* Protocol V2 (https://docs.polymarket.com/migrate/polymarket-v2/api-integrations.md):
+  `version` ("v1" or "v2") picks the outcome ids, even when both fields are present:
+  "v2" uses `positionIds` (a real array of decimal strings), "v1" `clobTokenIds`
+  (a JSON-encoded array). A V2 market reports resolution in `resolutionStatus`
+  (`inactive`, `active`, `resolved`); V1 keeps `umaResolutionStatus`. Seen live on
+  2026-11-14: every market carries `version: "v1"`, and 37 of 100 open ones already
+  list `positionIds` as well.
 * Time formats seen: `2026-11-08T04:59:59.999Z`, `2026-09-29 23:00:00+00`,
   `2026-11-06 03:30:03.883336+00`, `...+00:00:00`.
 

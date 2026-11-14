@@ -17,6 +17,8 @@ x-common: &common
     args:
       GIT_COMMIT: ${GIT_COMMIT:-unknown}
   image: whale-watcher
+  # Also how a stuck process comes back: the runner and the detector exit by themselves
+  # after 15 minutes without a finished step (service.Watchdog), and Docker restarts them.
   restart: unless-stopped
   volumes:
     - ./data:/app/data

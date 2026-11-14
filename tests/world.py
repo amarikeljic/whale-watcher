@@ -34,11 +34,16 @@ class FakeMarket:
     sports_market_type: str | None = None
     event_title: str | None = None
     uma_statuses: str | None = None     # Gamma's umaResolutionStatuses, e.g. '["proposed", "disputed"]'
+    version: str | None = None          # "v2": Protocol V2, traded under positionIds; None: no field, as before
+
+    def token(self, index: int) -> str:
+        """The id a trade on this market carries: a position id on a v2 market."""
+        return f"{self.cond}-p{index}" if self.version == "v2" else f"{self.cond}-t{index}"
 
     def gamma(self) -> dict[str, Any]:
         closed = self.resolved_at is not None or self.closed_time is not None
         event = self.event or f"e-{self.cond}"
-        return {
+        raw = {
             "conditionId": self.cond, "question": self.question or f"Will {self.cond} happen?",
             "slug": self.slug or f"m-{self.cond}",
             "events": [{"slug": event, "title": self.event_title or f"Event {event}"}],
@@ -53,11 +58,19 @@ class FakeMarket:
             "feesEnabled": self.fee_rate > 0,
             "feeSchedule": {"rate": self.fee_rate, "exponent": 1, "takerOnly": True, "rebateRate": 0.25},
             "description": f"Resolves Yes if {self.cond} happens.", "acceptingOrders": self.accepting_orders,
-            "umaResolutionStatus": "resolved" if self.resolved_at else None,
+            "umaResolutionStatus": "resolved" if self.resolved_at and self.version != "v2" else None,
             "umaResolutionStatuses": self.uma_statuses if self.uma_statuses is not None else (
                 '["proposed", "proposed"]' if self.resolved_at else "[]"),
             "outcomePrices": json.dumps([str(p) for p in (self.payouts or [0.5, 0.5])]),
         }
+        if self.version is not None:
+            # https://docs.polymarket.com/migrate/polymarket-v2/api-integrations.md: a v2 market
+            # lists positionIds (an array) and says it resolved in resolutionStatus.
+            raw["version"] = self.version
+        if self.version == "v2":
+            raw["positionIds"] = [self.token(0), self.token(1)]
+            raw["resolutionStatus"] = "resolved" if self.resolved_at else "active"
+        return raw
 
 
 class World:
@@ -123,7 +136,8 @@ class World:
             "proxy_wallet": wallet, "timestamp": ts, "condition_id": cond, "type": type_, "size": size,
             "usdc_size": usdc if usdc is not None else round(size * price, 6),
             "transaction_hash": tx or f"0x{ts:x}{len(self.activity) + len(self.global_trades)}", "price": price,
-            "token_id": f"{cond}-t{index}" if type_ in ("TRADE", "REDEEM") else "",
+            "token_id": (self.markets[cond].token(index) if cond in self.markets else f"{cond}-t{index}")
+            if type_ in ("TRADE", "REDEEM") else "",
             "side": side if type_ == "TRADE" else "", "outcome_index": index if type_ in ("TRADE", "REDEEM") else 999,
             "outcome": ["Yes", "No"][index] if type_ in ("TRADE", "REDEEM") else "",
             "title": f"Will {cond} happen?", "slug": f"m-{cond}", "event_slug": f"e-{cond}",

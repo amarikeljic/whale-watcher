@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 # US market's own resolution rules, deadline and best bid on each `us` row (Part 3b's
 # rules side by side, and the spread). 11: v2.1 Part 4, which code made each row (code
 # commit, model version, settings hash) and the Part 4 measurements.
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 BUSY_TIMEOUT_MS = 60_000
 SLOW_STATEMENT_SECONDS = 2.0
 
@@ -67,7 +67,6 @@ CREATE TABLE IF NOT EXISTS wallet_trades (
     seen_at       INTEGER NOT NULL    -- when this service first saw the row
 );
 CREATE INDEX IF NOT EXISTS wallet_trades_wallet_ts ON wallet_trades (wallet, ts);
-CREATE INDEX IF NOT EXISTS wallet_trades_wallet_cond ON wallet_trades (wallet, condition_id);
 
 -- Which time ranges of a wallet's activity are already stored, so a rescore
 -- only fetches what is new.
@@ -637,6 +636,10 @@ ADDED_COLUMNS += (
     # Part 4 #8: the bids behind a mark, [[price, shares], ...] best first, so a position can be
     # valued at what selling ALL of it would fetch. US positions are keyed us:<slug>:<side>.
     (11, "position_marks", "bids_json", "TEXT"),
+    # Protocol V2 (polymarket.outcome_ids): the market's version, and the other kind of
+    # outcome id (positionIds on a v1 market, clobTokenIds on a v2 one), JSON list
+    (12, "poly_markets", "version", "TEXT"),
+    (12, "poly_markets", "alt_token_ids", "TEXT"),
 )
 
 
@@ -678,6 +681,11 @@ class Database:
                     # new column; no existing value changes.
                     self.conn.execute("UPDATE bot_trades SET paid_at = closed_at WHERE paid_at IS NULL "
                                       "AND closed_at IS NOT NULL")
+                if version < 12 and has_data:
+                    # No query reads wallet_trades by (wallet, condition_id): every one goes
+                    # by fill_key or by (wallet, ts). The index was 1 GB of a 6 GB database
+                    # and slowed every insert. Its pages are reused by new rows.
+                    self.conn.execute("DROP INDEX IF EXISTS wallet_trades_wallet_cond")
                 if version < 5 and has_data:
                     # The one outage known before outages were recorded: the owner's ISP
                     # was down on 2026-11-09 from 11:27 to about 16:46 UTC. Only for a

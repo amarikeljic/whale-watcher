@@ -12,7 +12,7 @@ from test_bot import COND, WHALE, setup
 from test_polymarket_us import us_raw
 from whalewatcher import dashboard as dash
 from whalewatcher.config import Config
-from whalewatcher.db import Database
+from whalewatcher.db import SCHEMA_VERSION, Database
 from whalewatcher.horizon import DELAYED, DISPUTED, FIFTY_FIFTY, NORMAL, resolution_type
 from whalewatcher.polymarket import uma_history
 from whalewatcher.polymarket_us import UsMarket, UsRowA
@@ -91,7 +91,7 @@ def test_the_upgrade_names_the_payout_time_of_trades_already_closed(tmp_path):
     raw.commit()
     raw.close()
     again = Database(path)
-    assert again.one("SELECT paid_at FROM bot_trades")["paid_at"] == closed and again.schema_version == 11
+    assert again.one("SELECT paid_at FROM bot_trades")["paid_at"] == closed and again.schema_version == SCHEMA_VERSION
     again.close()
 
 

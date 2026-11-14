@@ -114,6 +114,23 @@ class Fixture:
             "VALUES (?, 'polymarket', 'hold_to_resolution', 'FILLED', ?, ?, 10, 1, ?, ?, 0.5, 20, 0, 10, ?, ?, ?)",
             (alert_id, f"{cond}-t0", cond, ts + 35, ts + 95, ts + DAY // 2, pnl, ts))
 
+    def replay(self, wallet: str, days_ago: float, pnl: float, *, strategy: str = "backtest:spec") -> None:
+        """A simulated replay's paper trade (strategy ``backtest:...``), as the backtest writes it."""
+        self.n += 1
+        cond = f"0xr{self.n}"
+        ts = self.now - int(days_ago * DAY)
+        self.market(cond)
+        alert_id = self.db.execute(
+            "INSERT INTO alerts (wallet, condition_id, token_id, kind, first_fill_ts, last_fill_ts, trigger_fill_ts, "
+            "whale_shares, whale_usd, whale_price, fills, detected_at, status, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (wallet, cond, f"{cond}-t0", "NEW", ts, ts, ts, 1000, 600, 0.5, 1, ts, "BACKTEST", ts)).lastrowid
+        self.db.execute(
+            "INSERT INTO paper_trades (alert_id, venue, strategy, status, token_id, condition_id, stake_usd, due_poll, "
+            "alert_ts, fill_ts, fill_price, contracts, fees, cost, settled_at, pnl, updated_at) "
+            "VALUES (?, 'polymarket', ?, 'FILLED', ?, ?, 10, 1, ?, ?, 0.5, 20, 0, 10, ?, ?, ?)",
+            (alert_id, strategy, f"{cond}-t0", cond, ts, ts + 90, ts + DAY // 2, pnl, ts))
+
     def member(self, wallet: str, added_days_ago: float, *, removed_days_ago: float | None = None,
                reason: str = "passed the entry rules: rank 1 by roi", why_removed: str | None = None,
                probation_days: int = 14) -> None:

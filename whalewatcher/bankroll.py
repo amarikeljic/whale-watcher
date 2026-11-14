@@ -47,6 +47,7 @@ from __future__ import annotations
 import bisect
 import json
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -817,6 +818,17 @@ def live_runners(signals: dict[str, list[Signal]]) -> list[str]:
     return sorted({"single"} | {k[4:] for k in signals if k.startswith("bot:")})
 
 
+def ordered_keys(signals: dict[str, list[Signal]], extra: Iterable[str] = ()) -> list[str]:
+    """Every wallet's source key in display order: the bot's runners first (``single``
+    always), then the old rule, then the simulated replays. ``extra``: keys known to exist
+    whose rows were not loaded (the replays, listed without reading them)."""
+    keys = sorted(set(signals) | set(extra), key=lambda k: ({"bot": 0, "old": 1, "sim": 2}[k.partition(":")[0]], k))
+    for runner in live_runners(signals):
+        if f"bot:{runner}" not in keys:
+            keys.insert(0, f"bot:{runner}")
+    return keys
+
+
 def views(records: list[dict], cfg: Config, db: Any, now: float, *, amount: float | None = None,
           only: str | set[str] | None = None, compare: str | bool = False) -> list[View]:
     """``only``: one source key, or a set of them. ``compare``: True adds the stake-size
@@ -826,10 +838,7 @@ def views(records: list[dict], cfg: Config, db: Any, now: float, *, amount: floa
     signals = signals_by_source(records, cfg)
     marks = load_marks(db)
     with_cutoff, without = Params.of(cfg, amount), Params.of(cfg, amount, cutoff=False)
-    keys = sorted(signals, key=lambda k: ({"bot": 0, "old": 1, "sim": 2}[k.partition(":")[0]], k))
-    for runner in live_runners(signals):
-        if f"bot:{runner}" not in keys:
-            keys.insert(0, f"bot:{runner}")
+    keys = ordered_keys(signals)
     out = []
     for key in keys:
         if wanted is not None and key not in wanted:

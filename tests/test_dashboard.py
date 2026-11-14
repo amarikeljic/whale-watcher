@@ -408,3 +408,41 @@ def test_the_wallet_chart_marks_only_trades_skipped_for_lack_of_cash_or_a_slot()
     import html as h, json, re
     data = json.loads(h.unescape(re.search(r'data-chart="([^"]+)"', dash.wallet_chart(res)).group(1)))
     assert sum(n for _, n in data["skips"]) == 2, "the two no_slot skips are marked, the too_long one is not"
+
+
+def test_replays_load_only_where_they_are_shown(tmp_path, monkeypatch):
+    """The simulated replays are most of the rows. Pages that never show them skip loading
+    them, but the strategy menu still offers them, and the Edge page and a replay's own
+    view still show them."""
+    from dashfix import A, Fixture
+
+    from whalewatcher.db import Database
+    path = str(tmp_path / "ww.sqlite3")
+    db = Database(path)
+    fx = Fixture(db, NOW)
+    fx.trade(A, 3, pnl=2.0)
+    fx.old_rule(A, 4, pnl=1.0)
+    for k in range(3):
+        fx.replay(A, 5 + k, pnl=-1.0)
+    db.close()
+    asked = []
+    real = dash.load_trades
+    monkeypatch.setattr(dash, "load_trades", lambda app, sims=True: asked.append(sims) or real(app, sims=sims))
+
+    def page(route, **query):
+        asked.clear()
+        html = dash.render(Config(database_path=path), path, route, {"outages": "include", **query}, now=NOW)[1]
+        return html, asked[:]
+
+    html, sims = page("/")
+    assert sims == [False] and 'value="sim/spec/polymarket"' in html, "offered in the menu, not loaded"
+    html, sims = page("/edge")
+    assert sims == [True] and "Simulated: spec on polymarket" in html
+    html, sims = page("/bankroll")
+    assert sims == [False] and "src=sim%3Aspec" in html, "the wallet page lists the replay's tab without loading it"
+    html, sims = page("/bankroll", src="sim:spec")
+    assert sims == [True] and "These signals come from a simulated backtest" in html and 'class="on"' in html
+    html, sims = page("/trades", strategy="sim/spec/polymarket")
+    assert sims == [True] and html.count("0xr") >= 3, "the replay's own view lists its trades"
+    for route in ("/wallets", "/breakdowns", "/health", "/us"):
+        assert page(route)[1] == [False], route

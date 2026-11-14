@@ -27,6 +27,7 @@ _COLUMNS = (
     "token_ids", "end_date", "closed", "closed_time", "game_start_time", "sports_market_type",
     "neg_risk", "accepting_orders", "fees_enabled", "fee_rate", "fee_exponent", "fee_taker_only",
     "description", "resolution_source", "resolved", "resolved_at", "payouts", "uma_statuses",
+    "version", "alt_token_ids",
 )
 
 
@@ -44,7 +45,13 @@ def _to_row(m: MarketInfo) -> dict:
         "resolution_source": m.resolution_source, "resolved": int(m.resolved),
         "resolved_at": m.resolved_at, "payouts": json.dumps(m.payouts) if m.payouts is not None else None,
         "uma_statuses": m.uma_statuses or None,
+        "version": m.version, "alt_token_ids": json.dumps(m.alt_token_ids),
     }
+
+
+def market_from_row(row) -> MarketInfo:
+    """A stored poly_markets row as a MarketInfo."""
+    return _from_row(row)
 
 
 def _from_row(row) -> MarketInfo:
@@ -63,6 +70,7 @@ def _from_row(row) -> MarketInfo:
         resolved=bool(row["resolved"]), resolved_at=row["resolved_at"],
         payouts=json.loads(row["payouts"]) if row["payouts"] else None,
         uma_statuses=row["uma_statuses"] or "",
+        version=row["version"] or "v1", alt_token_ids=json.loads(row["alt_token_ids"] or "[]"),
     )
 
 
