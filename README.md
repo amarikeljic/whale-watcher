@@ -68,6 +68,7 @@ python -m whalewatcher stats --model before         # ...for the rows made befor
 python -m whalewatcher stats --include-outages      # ...counting signals made inside outage windows
 python -m whalewatcher version                      # the model version and commit new rows get, and what each version changed
 python -m whalewatcher followup                     # what the whale did around each alert: other side, sold back, flags
+python -m whalewatcher experiments                  # every variation tracked, its role, n, interval and forward test
 python -m whalewatcher export --csv exports/paper_trades.csv
 python -m whalewatcher health                        # Docker healthcheck
 ```
@@ -290,6 +291,23 @@ do not count. It is a reminder, not a proof.
 
 The dashboard and `stats` also leave out signals made inside recorded outage
 windows unless asked (`Include outage windows`, `stats --include-outages`).
+
+### Every variation, and what counts as proof (v2.1 Part 4)
+
+Dozens of variations are tracked (strategies, the control, the US venue, the zero
+and one-minute comparisons, the old rule, simulated replays, stake sizes, and
+every breakdown slice). At 95% intervals, a few would look good by luck alone.
+So only one result answers "does copying make money": `single / flat_hold`
+against the decision rule (100 settled signals, the interval above zero).
+
+`experiments` (also in `stats` and on the Edge page) lists every variation with
+its role (primary, control, comparison, exploratory, simulated), start date, n,
+mean return with its interval, and status. When any other live variation first
+looks good, the runner records the date in `experiment_flags`, a table that
+refuses edits and deletes. From then on only its signals after that date count:
+it is shown only if those later signals meet the decision rule on their own.
+What it did before the flag is how it was found, so it cannot also be the proof.
+Simulated replays are listed but never flagged: their data is fixed.
 
 ### What the whale did around each alert (v2.1 Part 4)
 

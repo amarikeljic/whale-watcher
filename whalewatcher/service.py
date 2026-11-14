@@ -29,7 +29,7 @@ import sys
 import time
 from collections import deque
 
-from . import bankroll, followup, outages
+from . import bankroll, experiments, followup, outages
 from .app import App, open_app
 from .bot import Bot
 from .config import Config
@@ -271,6 +271,11 @@ class Service:
         if app.db.get_state("last_summary_day") != today and dt.hour >= cfg.stats.daily_summary_hour_utc:
             app.db.set_state("last_summary_day", today)
             log.info("daily summary (%s UTC):\n%s", today, daily_summary(app))
+            try:
+                for text in experiments.flag_new(app):     # Part 4 #2: start the forward test
+                    self.notice(f"experiment: {text}", good=True)
+            except Exception:
+                log.exception("could not check the experiments for a new forward test")
 
     def notice(self, text: str, *, good: bool = False) -> None:
         self.notices.append(text)
@@ -383,6 +388,9 @@ async def run_command(args, cfg: Config) -> int:
             n = await PaperEngine(app).settle()
             m = await Bot(app, Monitor.RUNNER).settle()
             print(f"settled {n} old-rule paper trades and {m} bot trades")
+            return 0
+        if args.command == "experiments":
+            print("\n".join(experiments.lines(app) or ["no variation has any data yet"]))
             return 0
         if args.command == "followup":
             from .stats import Scope, followup_lines, load_bot_trades, scope_rows

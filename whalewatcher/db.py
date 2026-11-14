@@ -430,6 +430,20 @@ CREATE TABLE IF NOT EXISTS fee_changes (
     old_value  REAL,
     new_value  REAL
 );
+-- v2.1 Part 4 #2: when a variation other than the headline first looked good. Only its
+-- signals after that moment count for it from then on (experiments.py). Written once.
+CREATE TABLE IF NOT EXISTS experiment_flags (
+    key          TEXT PRIMARY KEY,    -- bot:<runner>/<strategy> | column:zero | column:human
+    flagged_at   INTEGER NOT NULL,
+    n_at_flag    INTEGER,
+    mean_at_flag REAL,
+    lo_at_flag   REAL,
+    hi_at_flag   REAL
+);
+CREATE TRIGGER IF NOT EXISTS experiment_flags_keep BEFORE DELETE ON experiment_flags
+BEGIN SELECT RAISE(ABORT, 'experiment flags are never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS experiment_flags_fixed BEFORE UPDATE ON experiment_flags
+BEGIN SELECT RAISE(ABORT, 'experiment flags are never moved'); END;
 CREATE TABLE IF NOT EXISTS us_fee_seen (
     slug             TEXT PRIMARY KEY,
     fee_coefficient  REAL,

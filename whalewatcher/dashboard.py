@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlsplit
 
 from aiohttp import web
 
-from . import bankroll, followup
+from . import bankroll, experiments, followup
 from . import dashview as v
 from .config import Config
 from .costs import breakdown
@@ -461,7 +461,7 @@ def edge(c: Ctx) -> str:
                            table_headers=["Move from", "Fills"], table_rows=[[b["label"], str(b["v"])] for b in bars])
                    if marks else '<p class="empty">No fills old enough to have a 5-minute price yet.</p>',
                    note=f"Works for in-play fills too. n={len(marks)}.")
-    body += after_fill_card(c, rows) + recheck_card(rows)
+    body += after_fill_card(c, rows) + recheck_card(rows) + experiments_card(c)
 
     by_p: dict[int, dict[str, list[float]]] = defaultdict(lambda: {"clv": [], "mark": []})
     for r in rows:
@@ -568,6 +568,24 @@ def fee_changes_card(c: Ctx) -> str:
         sortable=False, numeric_from=9, empty="No published fee has changed since the service started watching."),
         note="When a market's own fee rate, or a Polymarket US market's coefficient, differs from the last one "
              "seen. Each trade keeps the rate it paid.")
+
+
+def experiments_card(c: Ctx) -> str:
+    """Part 4 #2: every variation, its role, and the forward test."""
+    try:
+        exps = experiments.build(c.app, c.records)
+    except Exception:  # noqa: BLE001 - a database older than the table
+        return ""
+    if not exps:
+        return ""
+    out = []
+    for e in exps:
+        ci = "-" if e.lo is None else f"{v.pct(e.mean)} [{v.pct(e.lo)}, {v.pct(e.hi)}]"
+        out.append([e.role, (e.name, None, "wrap"), iso(e.started)[:10] if e.started else "-", (str(e.n), e.n),
+                    (ci, e.mean or 0), (e.status, None, "wrap")])
+    return v.card("Every variation, and what counts as proof", v.table(
+        ["Role", "Variation", "Since", "Settled", "Mean return (95%)", "Status"], out, sortable=False, numeric_from=3),
+        note=experiments.luck_note(exps), wide=True)
 
 
 def after_fill_card(c: Ctx, rows: list[dict]) -> str:

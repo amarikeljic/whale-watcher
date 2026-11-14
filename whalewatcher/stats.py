@@ -1067,6 +1067,12 @@ def render(app: App, *, with_breakdowns: bool = True, brief_backtest: bool = Fal
             if with_breakdowns:
                 lines += _breakdown_lines(group, f" ({venue} / {strategy}, SIMULATED)",
                                           ("month", "category", "entry price", "wallet"))
+    if not brief_backtest:
+        from . import experiments
+        try:
+            lines += experiments.lines(app, scope_rows(app, everything, scope).rows)
+        except Exception as exc:  # noqa: BLE001 - a report must not fail on its newest section
+            lines.append(f"  (the experiments list could not be worked out: {type(exc).__name__}: {exc})")
     lines.append("")
     lines.append("Research and education only. Not financial advice.")
     return "\n".join(lines)

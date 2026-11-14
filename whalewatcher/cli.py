@@ -512,6 +512,8 @@ def build_parser() -> argparse.ArgumentParser:
                                        "each model version changed"),
                            ("followup", "fill in what the whale did around each alert (other side, sold back) "
                                         "and print the report"),
+                           ("experiments", "every variation tracked, its role, n and interval, and the forward test "
+                                           "of anything that looks good besides the headline"),
                            ("export", "write all paper trades to CSV"),
                            ("health", "exit 0 if the monitor loop has run recently (Docker healthcheck)")):
         sp = sub.add_parser(name, help=helptext)
