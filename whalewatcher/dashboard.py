@@ -365,7 +365,30 @@ def overview(c: Ctx) -> str:
                 table_rows=[[b["label"], v.money(b["v"]), str(b["n"])] for b in bars],
                 legend=[("Gain", "pos"), ("Loss", "neg")]),
         note=f"n={s.settled} closed trades", wide=True)
-    return body + "</div>"
+    return body + overview_wallets(c) + "</div>"
+
+
+def overview_wallets(c: Ctx) -> str:
+    """Part 2's wallet chart, one per runner, with its tiles and the sample-size warning.
+    Not scoped by the filters: a wallet is one path through all of its signals."""
+    app = c.app
+    try:
+        found = bankroll.views(c.records, app.cfg, app.db, c.now, only={"bot:single", "bot:us"})
+    except Exception as exc:  # noqa: BLE001 - the overview must still render
+        log.warning("wallet cards could not be worked out: %s", exc)
+        return ""
+    out = ""
+    for view in found:
+        res = view.live if view.live is not None else view.replay
+        amount = res.params.amount
+        shown = f"${amount:,.0f}" if amount == int(amount) else f"${amount:,.2f}"
+        which = (view.live.label if view.live is not None else
+                 "Replay of every signal: the live run starts when the runner next starts")
+        out += v.card(f"{shown} wallet: {view.label}",
+                      wallet_warnings(res, c.threshold) + wallet_tiles(res) + wallet_chart(res),
+                      note=f"{which}. Not affected by the filters above. The amount, stake sizes and the replay with "
+                           "and without the cutoff are on the Sim wallet page.", wide=True)
+    return out
 
 
 def histogram(values: list[float], lo: float = -0.2, hi: float = 0.2, step: float = 0.02) -> tuple[list[dict], int]:
@@ -675,6 +698,38 @@ def breakdowns(c: Ctx) -> str:
 # -- Polymarket US, row A (v2.1 Part 3b) ----------------------------------------------------------------
 
 
+RULES_SHOWN = 12          # matched markets whose two sets of rules are shown
+RULES_CHARS = 600
+
+
+def _clip(text: str | None) -> str:
+    text = " ".join((text or "").split())
+    return "-" if not text else text if len(text) <= RULES_CHARS else text[:RULES_CHARS].rsplit(" ", 1)[0] + " …"
+
+
+def rules_card(us_rows: list[dict]) -> str:
+    """Both sites' resolution rules for the most recent matched markets, side by side."""
+    seen: dict[str, dict] = {}
+    for r in sorted(us_rows, key=lambda r: -r["alert_ts"]):
+        if r.get("us_slug") and r.get("us_rules") and r["us_slug"] not in seen:
+            seen[r["us_slug"]] = r
+    rows = []
+    for r in list(seen.values())[:RULES_SHOWN]:
+        intl_end = r.get("scheduled_end") or r.get("market_end")
+        deadlines = (f"Intl {iso(int(intl_end))[:10] if intl_end else '-'} · "
+                     f"US {iso(int(r['us_end_date']))[:10] if r.get('us_end_date') else '-'}")
+        rows.append([((r.get("question") or r["us_slug"])[:80], None, "wrap"), (_clip(r.get("market_rules")), None, "wrap"),
+                     (_clip(r.get("us_rules")), None, "wrap"), (deadlines, None, "wrap")])
+    return v.card("Resolution rules side by side", v.table(
+        ["Market", "International rules", "Polymarket US rules", "End dates"], rows,
+        empty="No matched market has its US rules stored yet. They are stored from this version on.",
+        sortable=False, numeric_from=9),
+        note="The same bet on both sites, as each site words it, for the most recent matched markets. The two always "
+             "word it differently, so every matched market is shown: read the postponement and cancellation lines, "
+             "where a real difference would be. Sports end dates differ by design: the US venue sets about 14 days "
+             "after the game.", wide=True)
+
+
 def us_page(c: Ctx) -> str:
     """The same signals on Polymarket US, beside the international baseline. Scoped by
     the date range and the outage switch only: it is always these two rows."""
@@ -707,13 +762,13 @@ def us_page(c: Ctx) -> str:
     same = [r for r in base_rows if r["alert_id"] in alerted and r["status"] != "SKIPPED"]
     base_sum = summarise("base", same, samples=1500)
     n, m, lo, hi = cmp.paired
-    gap_mean = mean(cmp.gaps) if cmp.gaps else None
+    fill_mean = mean([g for _, g in cmp.fill_gaps]) if cmp.fill_gaps else None
     tiles = (v.tile("Signals priced", str(cmp.signals), "made since row A began")
              + v.tile("On Polymarket US", f"{cmp.on_us} ({cmp.on_us / cmp.signals:.0%})" if cmp.signals else "-",
                       "the same bet exists there")
              + v.tile("Filled there", str(us_sum.filled), f"{us_sum.missed} did not fill · {us_sum.settled} closed")
-             + v.tile("Mean price gap", "-" if gap_mean is None else v.cents(gap_mean),
-                      f"US ask minus international, n={len(cmp.gaps)}")
+             + v.tile("Mean fill-price gap", "-" if fill_mean is None else v.cents(fill_mean),
+                      f"US fill minus international, a share, n={len(cmp.fill_gaps)}")
              + v.tile("Fees, both filled", f"${cmp.fee_us:,.2f} vs ${cmp.fee_intl:,.2f}",
                       f"US vs international, n={cmp.both_filled}")
              + v.tile("ROI, US minus intl", "-" if not n else v.pct(m),
@@ -731,21 +786,48 @@ def us_page(c: Ctx) -> str:
              "outcome, read moments apart. Right of the line the US price was higher. The two ends collect "
              "everything beyond 5 cents.", wide=True)
 
-    def row(name: str, s: Any, fee: float) -> list:
-        return [name, (str(s.alerts), s.alerts), (str(s.filled), s.filled), (str(s.missed), s.missed),
-                (str(s.settled), s.settled), (v.money(s.total_pnl) if s.settled else "-", s.total_pnl,
-                                               v.tone(s.total_pnl) if s.settled else ""),
+    per: dict[int, list[float]] = defaultdict(list)
+    for ts, gap in cmp.fill_gaps:
+        per[f.period(ts)].append(gap)
+    points = [[p, round(sum(g) / len(g), 4), len(g)] for p, g in sorted(per.items())]
+    body += v.card("Fill-price gap over time", v.chart(
+        "line", {"series": [{"name": "US fill minus international fill", "cls": "s1", "points": points}],
+                 "y": "cents", "zero": True},
+        table_headers=["Period", "Mean gap a share", "Signals"],
+        table_rows=[[f.period_label(p), v.cents(g), str(k)] for p, g, k in points])
+        if points else '<p class="empty">No signal has a fill price on both venues yet.</p>',
+        note="For each signal, what the walk paid on Polymarket US minus what it paid on the international book, "
+             "or would have paid where the price ran past the limit. Each point is the mean of one "
+             f"{f.group}; the tooltip shows its n. Above the zero line, acting where you legally can cost more. "
+             f"Overall: {'-' if fill_mean is None else v.cents(fill_mean)} a share, n={len(cmp.fill_gaps)}.",
+        wide=True)
+
+    def rate(x: Any) -> tuple[str, float]:
+        return ("-", -9.0) if x is None else (f"{x:.0%}", x)
+
+    def per_share(x: Any) -> tuple[str, float]:
+        return ("-", -9.0) if x is None else (v.cents(x), x)
+
+    def row(name: str, s: Any, fig: dict) -> list:
+        return [name, (str(s.alerts), s.alerts), (str(s.filled), s.filled), rate(fig.get("missed_rate")),
+                rate(fig.get("not_on_us_rate")) if "not_on_us_rate" in fig else ("-", -9.0),
+                (str(s.settled), s.settled),
+                rate(s.win_rate) if s.settled else ("-", -9.0),
+                (v.money(s.total_pnl) if s.settled else "-", s.total_pnl, v.tone(s.total_pnl) if s.settled else ""),
                 (v.pct(s.roi), -9 if s.roi is None else s.roi),
                 (f"{v.pct(s.mean_roi)} {ci_text(s)}" if s.settled else "-", -9 if s.mean_roi is None else s.mean_roi),
-                (f"${fee:,.2f}", fee)]
+                per_share(fig.get("spread")), per_share(fig.get("slippage"))]
 
     body += v.card("The same signals on both venues", v.table(
-        ["Venue", "Signals", "Filled", "Did not fill", "Closed", "Net P&L", "ROI", "Mean ROI, 95% interval",
-         "Fees, both filled"],
-        [row("International (the baseline)", base_sum, cmp.fee_intl), row("Polymarket US (row A)", us_sum, cmp.fee_us)],
+        ["Venue", "Signals", "Filled", "Missed", "Not on US", "Closed", "Win rate", "Net P&L", "ROI",
+         "Mean ROI (95%)", "Spread", "Slippage"],
+        [row("International (the baseline)", base_sum, cmp.side.get("intl", {})),
+         row("Polymarket US (row A)", us_sum, cmp.side.get("us", {}))],
         sortable=False),
-        note="Signals the cutoff or a missing US market skipped are not counted as attempts. Fees are compared on "
-             "the signals both venues filled. The US fee coefficient is 0.095 on every market.", wide=True)
+        note="Never combined. Signals the cutoff or a missing US market skipped are not attempts. Missed rate: "
+             "attempts that did not fill. Spread: best ask minus best bid when we looked. Slippage: fill price minus "
+             "the best ask, a share. Fees on the signals both venues filled are in the tiles above. The US fee "
+             "coefficient is 0.095 on every market.", wide=True)
 
     body += v.card("Why a signal was not priced on Polymarket US", v.table(
         ["Reason", "Signals"], [[(k, None, "wrap"), (str(n_), n_)] for k, n_ in
@@ -753,6 +835,8 @@ def us_page(c: Ctx) -> str:
         empty="Every signal was priced there.", numeric_from=1),
         note="A market is matched by an exact rule on its name, or not at all. not_same_bet: crypto up or down "
              "covers the same window on both venues but settles on a different price index.", wide=True)
+
+    body += rules_card(us_rows)
 
     traded_us = [r for r in us_rows if r["status"] != "SKIPPED"]
     s = cmp.no_sports
@@ -814,14 +898,15 @@ def wallet_chart(res: Any) -> str:
     width = max(1.0, (t1 - t0) / RUG_BINS)
     bins: dict[int, int] = defaultdict(int)
     for e in res.entries:
-        if e.status == bankroll.SKIPPED:
+        # The markers the brief asked for: trades the wallet wanted but could not take.
+        if e.status == bankroll.SKIPPED and e.code in (bankroll.NO_CASH, bankroll.NO_SLOT):
             bins[int((e.signal.ts - t0) // width)] += 1
     data = {"points": [[int(p.ts), round(p.equity, 2), round(p.cash, 2)] for p in curve], "start": res.params.amount,
             "skips": [[int(t0 + (k + 0.5) * width), n] for k, n in sorted(bins.items())]}
     rows = [[iso(int(p.ts))[:16].replace("T", " "), v.money(p.equity, signed=False), v.money(p.cash, signed=False),
              v.money(p.tied, signed=False)] for p in curve[-200:]]
     legend = [("Equity", "s1"), ("Tied up in positions", "s2 area"), ("Free cash", "s3 area"),
-              ("Skipped signals", "rug")]
+              ("Skipped: no cash or no free slot", "rug")]
     return v.chart("wallet", data, table_headers=["When (UTC)", "Equity", "Free cash", "Tied up"], table_rows=rows,
                    legend=legend)
 

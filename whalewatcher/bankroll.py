@@ -730,8 +730,10 @@ def live_runners(signals: dict[str, list[Signal]]) -> list[str]:
 
 
 def views(records: list[dict], cfg: Config, db: Any, now: float, *, amount: float | None = None,
-          only: str | None = None, compare: str | bool = False) -> list[View]:
-    """``compare``: True adds the stake-size comparison to every view, a source key to that one only."""
+          only: str | set[str] | None = None, compare: str | bool = False) -> list[View]:
+    """``only``: one source key, or a set of them. ``compare``: True adds the stake-size
+    comparison to every view, a source key to that one only."""
+    wanted = None if only is None else ({only} if isinstance(only, str) else set(only))
     amount = wallet_amount(db) if amount is None else amount
     signals = signals_by_source(records, cfg)
     marks = load_marks(db)
@@ -742,7 +744,7 @@ def views(records: list[dict], cfg: Config, db: Any, now: float, *, amount: floa
             keys.insert(0, f"bot:{runner}")
     out = []
     for key in keys:
-        if only is not None and key != only:
+        if wanted is not None and key not in wanted:
             continue
         sigs = signals.get(key, [])
         view = View(key, source_label(key), run(sigs, with_cutoff, marks=marks, as_of=now, label="with the cutoff"),

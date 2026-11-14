@@ -17,8 +17,9 @@ class Fixture:
                game_start: int | None = None, end_date: int | None = None) -> None:
         self.db.execute(
             "INSERT OR IGNORE INTO poly_markets (condition_id, question, slug, event_slug, category, game_start_time, "
-            "end_date) VALUES (?,?,?,?,?,?,?)", (cond, question or f"Will {cond} happen?", f"m-{cond}",
-                                                 event or f"e-{cond}", category, game_start, end_date))
+            "end_date, description) VALUES (?,?,?,?,?,?,?,?)",
+            (cond, question or f"Will {cond} happen?", f"m-{cond}", event or f"e-{cond}", category, game_start,
+             end_date, f"Resolves Yes if {cond} happens. If the game is postponed beyond 7 days it resolves 50-50."))
 
     def trade(self, wallet: str, days_ago: float, *, strategy: str = "flat_hold", status: str = "FILLED",
               pnl: float | None = None, cost: float = 10.0, fill: float = 0.50, whale: float = 0.48,
@@ -66,26 +67,35 @@ class Fixture:
 
     def us(self, alert_id: int, *, status: str = "FILLED", pnl: float | None = None, us_ask: float | None = 0.51,
            intl_ask: float = 0.50, reason: str | None = None, skip_code: str | None = None, fees: float = 0.24,
-           slug: str | None = "aec-nfl-a-b-2026-11-01", side: str = "long") -> None:
+           slug: str | None = "aec-nfl-a-b-2026-11-01", side: str = "long", us_bid: float | None = None,
+           rules: str | None = None) -> None:
         """Row A for an existing signal: the same alert priced on Polymarket US."""
         a = self.db.one("SELECT * FROM alerts WHERE id = ?", (alert_id,))
+        # As the real code does, the US row carries the baseline's schedule for the cutoff.
+        base = self.db.one("SELECT scheduled_end, days_to_close FROM bot_trades WHERE runner = 'single' "
+                           "AND strategy = 'flat_hold' AND alert_id = ?", (alert_id,))
         filled = status == "FILLED"
+        # As the real code does: a price-ran miss keeps what the unlimited walk would have paid.
+        walked = filled or (status == "MISSED" and (reason or "").startswith("price ran"))
         closed = a["first_fill_ts"] + DAY // 2 if pnl is not None else None
         self.db.execute(
             "INSERT INTO bot_trades (runner, strategy, alert_id, wallet, condition_id, token_id, event_key, status, "
             "reason, signal_ts, detected_at, decided_at, stake_usd, whale_price, best_ask, fill_price, contracts, fees, "
             "cost, human_done, closed_at, result, pnl, updated_at, skip_code, fee_rate, fee_source, us_slug, us_side, "
-            "us_rule, intl_best_ask, price_gap, payout_per_share) VALUES ('us','flat_hold',?,?,?,?,?,?,?,?,?,?,10,?,?,"
-            "?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "us_rule, intl_best_ask, price_gap, payout_per_share, us_best_bid, us_rules, us_end_date, scheduled_end, "
+            "days_to_close) VALUES ('us','flat_hold',?,?,?,?,?,?,?,?,?,?,10,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+            "?,?)",
             (alert_id, a["wallet"], a["condition_id"], a["token_id"], f"e-{a['condition_id']}", status, reason,
              a["first_fill_ts"], a["first_fill_ts"] + 3, a["first_fill_ts"] + 5, a["whale_price"], us_ask,
-             us_ask if filled else None, 10 / us_ask if filled else None, fees if filled else None,
+             us_ask if walked else None, 10 / us_ask if filled else None, fees if filled else None,
              10 + fees if filled else None, closed, ("WIN" if (pnl or 0) > 0 else "LOSS") if pnl is not None else None,
              pnl, a["first_fill_ts"], skip_code, 0.095 if filled else None, "us" if filled else None,
              slug if skip_code != "not_on_us" else None, side if slug and skip_code != "not_on_us" else None,
              "game_winner" if slug else "none", intl_ask,
              None if us_ask is None else round(us_ask - intl_ask, 6),
-             (1.0 if pnl > 0 else 0.0) if pnl is not None else None))
+             (1.0 if pnl > 0 else 0.0) if pnl is not None else None, us_bid, rules,
+             a["first_fill_ts"] + 14 * DAY if slug and skip_code != "not_on_us" else None,
+             base["scheduled_end"] if base else None, base["days_to_close"] if base else None))
 
     def old_rule(self, wallet: str, days_ago: float, pnl: float) -> None:
         self.n += 1
@@ -147,7 +157,9 @@ def small(path: str, now: int) -> Fixture:
                      end_days=3, hold_days=3)
     # Row A, the same three signals on Polymarket US: the first filled a cent dearer and won
     # (+9.37 after a 24-cent fee), the second ran past the limit, the third is not listed there.
-    fx.us(one, pnl=9.37, us_ask=0.51, intl_ask=0.50)
+    fx.us(one, pnl=9.37, us_ask=0.51, intl_ask=0.50, us_bid=0.49,
+          rules="If the game is postponed, this market will remain open until the game has been completed. "
+                "If the game is canceled entirely, with no make-up game, this market will resolve 50-50.")
     fx.us(two, status="MISSED", us_ask=0.56, intl_ask=0.50, reason="price ran: filling $10 costs 0.560 a share, limit 0.510")
     fx.us(three, status="SKIPPED", us_ask=None, skip_code="not_on_us", slug=None,
           reason="not_on_us: no rule for politics markets")

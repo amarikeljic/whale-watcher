@@ -92,6 +92,7 @@ class UsMarket:
     fee_coefficient: float | None
     outcomes: list[str]
     sides: list[UsSide]
+    description: str = ""          # the market's resolution rules, as the venue words them
 
     @property
     def open(self) -> bool:
@@ -115,7 +116,8 @@ class UsMarket:
                    status=str(raw.get("status") or ""), closed=bool(raw.get("closed")),
                    game_start=parse_time(raw.get("gameStartTime")), end_date=parse_time(raw.get("endDate")),
                    tick=_num(raw.get("orderPriceMinTickSize")), min_qty=_num(raw.get("minimumTradeQty")),
-                   fee_coefficient=_num(raw.get("feeCoefficient")), outcomes=outcomes, sides=sides)
+                   fee_coefficient=_num(raw.get("feeCoefficient")), outcomes=outcomes, sides=sides,
+                   description=str(raw.get("description") or ""))
 
 
 @dataclass(slots=True)
@@ -137,6 +139,13 @@ class UsBook:
 
         return cls(slug, sorted(levels("bids"), key=lambda x: -x[0]), sorted(levels("offers"), key=lambda x: x[0]),
                    str(raw.get("state") or ""))
+
+    def best_bid_for(self, long: bool) -> float | None:
+        """What the side bought could be sold for now: the long side's best bid, or for
+        the short side 1 - the best offer (buying the instrument back closes the short)."""
+        if long:
+            return self.bids[0][0] if self.bids else None
+        return round(1 - self.offers[0][0], 6) if self.offers else None
 
     def asks_for(self, long: bool) -> list[tuple[float, float]]:
         """What a buyer of this side pays, cheapest first. The long side lifts the offers.
@@ -478,7 +487,7 @@ class UsRowA:
         book = await self.gateway.book(us.slug, nonce=nonce)
         decided_at = app.wall()
         asks = book.asks_for(long) if book else []
-        common.update(decided_at=decided_at, asks=asks)
+        common.update(decided_at=decided_at, asks=asks, us_bid=book.best_bid_for(long) if book else None)
         if not asks:
             return self._insert(alert, "MISSED", "nothing offered on the Polymarket US book", **common)
         stake = min(bot.flat_hold.stake_usd, bot.flat_hold.max_stake_usd)
@@ -502,7 +511,7 @@ class UsRowA:
                 decided_at: float | None = None, skip_code: str | None = None, us: UsMarket | None = None,
                 long: bool | None = None, rule: str | None = None, intl_ask: float | None = None,
                 asks: list[tuple[float, float]] | None = None, walk: Any = None, fees: float | None = None,
-                theta: float | None = None, would_pay: float | None = None,
+                theta: float | None = None, would_pay: float | None = None, us_bid: float | None = None,
                 horizon: tuple[Any, Any] = (None, None)) -> str:
         app, bot = self.app, self.app.cfg.bot
         decided_at = app.wall() if decided_at is None else decided_at
@@ -515,8 +524,8 @@ class UsRowA:
             "status, reason, signal_ts, detected_at, decided_at, stake_usd, whale_price, best_ask, fill_price, "
             "contracts, fees, cost, levels, human_done, whale_shares, updated_at, fee_rate, fee_source, "
             "slippage_cost, skip_code, scheduled_end, days_to_close, asks_json, limit_price, min_order_size, "
-            "us_slug, us_side, us_rule, intl_best_ask, price_gap) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "us_slug, us_side, us_rule, intl_best_ask, price_gap, us_rules, us_end_date, us_best_bid) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (RUNNER, STRATEGY, alert["id"], alert["wallet"], alert["condition_id"], alert["token_id"],
              self._event_key(alert), status, reason, signal_ts, detected_at, decided_at,
              min(bot.flat_hold.stake_usd, bot.flat_hold.max_stake_usd), whale, best,
@@ -527,7 +536,8 @@ class UsRowA:
              horizon[0], horizon[1], json.dumps([[p, q] for p, q in asks[:25]]) if asks else None,
              whale + bot.max_slippage if whale is not None else None, us.min_qty if us else None,
              us.slug if us else None, None if long is None else ("long" if long else "short"), rule, intl_ask,
-             best - intl_ask if best is not None and intl_ask is not None else None))
+             best - intl_ask if best is not None and intl_ask is not None else None,
+             us.description or None if us else None, us.end_date if us else None, us_bid))
         return status
 
     def _event_key(self, alert: dict) -> str:

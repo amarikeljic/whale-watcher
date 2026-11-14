@@ -120,7 +120,8 @@ BOT_HEADLINE = "flat_hold"
 US_RUNNER = "us"            # polymarket_us.RUNNER: the same signals priced on Polymarket US
 BOT_QUERY = """
 SELECT b.*, a.kind, a.outcome, a.whale_usd, a.probation, a.membership_id, a.detect_delay, a.trigger_fill_ts,
-       a.snapshot_run_id, m.category, m.question, m.slug, m.event_slug, m.game_start_time,
+       a.snapshot_run_id, a.alert_best_ask, a.alert_best_bid, m.description AS market_rules,
+       m.category, m.question, m.slug, m.event_slug, m.game_start_time,
        m.end_date AS market_end, m.resolved_at AS market_resolved_at, m.fee_rate AS market_fee_rate,
        m.fees_enabled AS market_fees_enabled, m.fee_exponent AS market_fee_exponent
 FROM bot_trades b
@@ -325,6 +326,20 @@ class UsComparison:
     fee_intl: float = 0.0
     paired: tuple[int, float | None, float | None, float | None] = (0, None, None, None)
     no_sports: Summary | None = None
+    fill_gaps: list[tuple[int, float]] = field(default_factory=list)   # (signal time, US fill - intl fill)
+    side: dict[str, dict[str, float | None]] = field(default_factory=dict)   # "intl" / "us" -> rates and averages
+
+
+def venue_figures(rows: list[dict], spread: Callable[[dict], float | None]) -> dict[str, float | None]:
+    """Missed rate, average spread when we looked, and average slippage (fill minus best
+    ask, a share) over the signals a venue tried to fill."""
+    tried = [r for r in rows if r["status"] in ("FILLED", "MISSED")]
+    filled = [r for r in tried if r["status"] == "FILLED"]
+    spreads = [x for x in (spread(r) for r in tried) if x is not None]
+    slips = [r["fill_price"] - r["best_ask"] for r in filled
+             if r.get("fill_price") is not None and r.get("best_ask") is not None]
+    return {"tried": len(tried), "missed_rate": (len(tried) - len(filled)) / len(tried) if tried else None,
+            "spread": mean(spreads) if spreads else None, "slippage": mean(slips) if slips else None}
 
 
 def us_comparison(us_rows: list[dict], base_rows: list[dict], samples: int) -> UsComparison:
@@ -348,6 +363,21 @@ def us_comparison(us_rows: list[dict], base_rows: list[dict], samples: int) -> U
             c.fee_us += t.get("fees") or 0.0
             c.fee_intl += other.get("fees") or 0.0
     c.paired = _paired(us_rows, base_rows, samples)
+    for t in us_rows:
+        other = base.get(t["alert_id"])
+        # What each venue's walk paid, or would have paid when the price ran past the limit.
+        if t.get("fill_price") is not None and other is not None and other.get("fill_price") is not None:
+            c.fill_gaps.append((int(t["alert_ts"]), t["fill_price"] - other["fill_price"]))
+    priced = {t["alert_id"] for t in us_rows}
+    c.side = {
+        "intl": venue_figures([b for b in base_rows if b["alert_id"] in priced],
+                              lambda r: (r["alert_best_ask"] - r["alert_best_bid"])
+                              if r.get("alert_best_ask") is not None and r.get("alert_best_bid") is not None else None),
+        "us": venue_figures(us_rows, lambda r: (r["best_ask"] - r["us_best_bid"])
+                            if r.get("best_ask") is not None and r.get("us_best_bid") is not None else None),
+    }
+    c.side["us"]["not_on_us_rate"] = (sum(1 for t in us_rows if t.get("skip_code") == "not_on_us") / len(us_rows)
+                                      if us_rows else None)
     rest = [t for t in us_rows if t["status"] != "SKIPPED" and (t.get("category") or "") != "sports"]
     c.no_sports = summarise("us, sports excluded", rest, samples=samples) if rest else None
     return c
@@ -368,9 +398,22 @@ def us_lines(us_rows: list[dict], base_rows: list[dict], samples: int) -> list[s
         lines.append(f"    US best ask minus international best ask, n={len(c.gaps)}: mean "
                      f"{(round(mean(c.gaps), 3) or 0.0):+.3f}, median {(round(median(c.gaps), 3) or 0.0):+.3f}; "
                      f"the US price was higher on {dearer} ({dearer / len(c.gaps):.0%})")
+    if c.fill_gaps:
+        gaps = [g for _, g in c.fill_gaps]
+        lines.append(f"    US fill minus international fill (or what each would have paid), n={len(gaps)}: "
+                     f"mean {(round(mean(gaps), 3) or 0.0):+.3f} a share")
     if c.both_filled:
         lines.append(f"    fees on the {c.both_filled} signals both venues filled: US ${c.fee_us:,.2f}, "
                      f"international ${c.fee_intl:,.2f}")
+
+    def fig(x: float | None, kind: str) -> str:
+        return "-" if x is None else f"{x:.0%}" if kind == "rate" else f"{(round(x, 3) or 0.0):+.3f}"
+
+    i, u = c.side.get("intl", {}), c.side.get("us", {})
+    lines.append(f"    international vs US: missed {fig(i.get('missed_rate'), 'rate')} vs {fig(u.get('missed_rate'), 'rate')}"
+                 f" | spread {fig(i.get('spread'), 'cents')} vs {fig(u.get('spread'), 'cents')}"
+                 f" | slippage {fig(i.get('slippage'), 'cents')} vs {fig(u.get('slippage'), 'cents')} a share"
+                 f" | not on US {fig(u.get('not_on_us_rate'), 'rate')}")
     n, m, lo, hi = c.paired
     if n:
         ci = "-" if lo is None else f"[{_pct(lo)}, {_pct(hi)}]"

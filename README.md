@@ -258,6 +258,10 @@ The bot stakes a fixed $10 on every signal from a bankroll that never runs dry.
 A person with $100 cannot. `bankroll.py` runs the same signals through a small
 wallet: `python -m whalewatcher wallet show`, or the **Sim wallet** page.
 
+* **Where to see it.** A wallet card for each runner on the Overview page
+  (equity, return, drawdown, taken vs skipped, fees, and a chart of equity, cash
+  and money tied up, with marks where a trade was skipped for lack of cash or a
+  free slot), and everything else on the Sim wallet page.
 * **Amount.** $100 by default. Set it on the dashboard or with
   `wallet set 250` (above $0, at most $100,000, two decimals). It lives in the
   `settings` table, the only thing the dashboard may write.
@@ -358,7 +362,11 @@ the runner makes, in the background so the bot never waits for it:
 The rows live in the same ledger under the runner `us`, so `stats`, the
 dashboard (strategy "Polymarket US", venue filter, the **US venue** page) and
 the small wallet all show it, and none of them mix it with the international
-numbers. `python -m whalewatcher us match` prints the match rate on recent
+numbers. The US venue page shows both venues side by side (missed rate, not-on-US
+rate, win rate, net P&L, ROI with its interval, spread, slippage), the fill-price
+gap with its trend over time, and both sites' resolution rules for the latest
+matched markets. Each US row stores the US market's rules, end date and best
+bid as published when it was priced. `python -m whalewatcher us match` prints the match rate on recent
 alerts.
 
 * Crypto up/down exists on both venues for the same window but settles on a

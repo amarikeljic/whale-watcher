@@ -40,9 +40,9 @@ Found along the way (not on your list):
   copies of its trades do badly ("our own record"). It reads only the old-rule
   paper trades, which stopped growing when the bot model started. So that rule
   has not seen a new trade since. Details under 3.
-* **Owed work from Parts 2 and 3b**, already approved, being fixed separately:
-  the $100 wallet chart belongs on the Overview page, its markers should show
-  only trades skipped for lack of cash or slots, and the Polymarket US page lacks
+* **Owed work from Parts 2 and 3b**, already approved, now fixed: the $100
+  wallet chart is on the Overview page for each runner, its markers show only
+  trades skipped for lack of cash or a free slot, and the Polymarket US page has
   both sites' resolution rules side by side, the fill-price gap with its trend,
   and win rate, missed rate, spread and slippage in the side-by-side table.
 

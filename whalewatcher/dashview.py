@@ -457,7 +457,7 @@ JS = r"""
       var lines = [{ label: day(p[0]) }, { cls: "s1", value: fmt(p[1], "usd"), label: "Equity" },
                    { cls: "s2", value: fmt(p[1] - p[2], "usd"), label: "Tied up in positions" },
                    { cls: "s3", value: fmt(p[2], "usd"), label: "Free cash" }];
-      if (skipped) lines.push({ value: String(skipped), label: "signals skipped before the next change" });
+      if (skipped) lines.push({ value: String(skipped), label: "skipped for lack of cash or a free slot" });
       showTip(evt, lines);
     }
     hit.addEventListener("pointermove", move); hit.addEventListener("pointerdown", move);

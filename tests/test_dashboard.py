@@ -153,7 +153,7 @@ def test_the_wallet_page_replays_the_fixture_to_the_hand_checked_equity(site):
     assert "Not enough data: 5 settled wallet trades (need at least 30)" in html
     assert "1 of 6 fills are priced from a smaller order or from the best ask" in html
     assert "too_long" in html and "The market was scheduled to end beyond the time-to-close cutoff." in html
-    assert 'data-kind="wallet"' in html and "Tied up in positions" in html and "Skipped signals" in html
+    assert 'data-kind="wallet"' in html and "Tied up in positions" in html and "Skipped: no cash or no free slot" in html
     assert "With and without the time-to-close cutoff" in html and "Old rule (v1), human delay" in html
     assert "The runner has not started a wallet run yet" in html
     assert 'action="/settings/wallet-amount"' in html and 'value="100.00"' in html
@@ -263,7 +263,14 @@ def test_the_us_page_puts_the_same_signals_on_both_venues_side_by_side(site):
     assert "trades are visible on Polymarket US, so there is nothing to copy there" in html
     assert "Nothing is ordered anywhere" in html
     assert "2 (67%)" in html, "three signals priced, two of them exist on Polymarket US"
-    assert "+0.035" in html and "n=2" in html, "gaps of +0.01 and +0.06: mean +0.035"
+    assert "+0.035" in html and "n=2" in html, \
+        "fill gaps of +0.01 (filled) and +0.06 (what the walk would have paid when the price ran): mean +0.035"
+    assert "Fill-price gap over time" in html and "<th class=\"num\">Missed</th>" in html and "Win rate" in html
+    assert "<th class=\"num\">Spread</th>" in html and "+0.020" in html, "the US fill: best ask 0.51, best bid 0.49"
+    assert "<th class=\"num\">Slippage</th>" in html and "Not on US" in html and "33%" in html, \
+        "one of three signals is not on US"
+    assert "Resolution rules side by side" in html and "remain open until the game has been completed" in html
+    assert "If the game is postponed beyond 7 days it resolves 50-50" in html, "the international wording beside it"
     assert "$0.24 vs $0.00" in html, "fees on the one signal both venues filled"
     assert "n=1, 95% interval" in html and "-33.5%" in html, "9.37 / 10.24 against 12.50 / 10: 91.5% minus 125%"
     assert "International (the baseline)" in html and "Polymarket US (row A)" in html
@@ -364,3 +371,26 @@ def test_a_difference_of_nothing_is_never_printed_as_minus_zero():
     from whalewatcher import dashview as dv
     assert dv.cents(0.57 - 0.58 + 0.01) == "+0.000" and dv.cents(-0.0004) == "+0.000"
     assert dv.cents(-0.0006) == "-0.001" and dv.cents(0.013) == "+0.013" and dv.cents(None) == "-"
+
+
+def test_the_overview_carries_the_wallet_chart_for_each_runner(site):
+    html = site("/")
+    assert "$100 wallet: Bot, runner single" in html and "$100 wallet: Polymarket US: same signals, US book" in html
+    assert html.count('data-kind="wallet"') == 2 and "Not affected by the filters above" in html
+    assert "Total return" in html and "Max drawdown" in html and "Taken / skipped" in html and "Total fees" in html
+    assert "Not enough data:" in html, "the same sample-size warning as everywhere else"
+    assert html.count('data-kind="wallet"') == 2, "the filters do not multiply or hide it"
+    assert site("/", strategy="us/flat_hold").count('data-kind="wallet"') == 2
+
+
+def test_the_wallet_chart_marks_only_trades_skipped_for_lack_of_cash_or_a_slot():
+    from whalewatcher.bankroll import Params, Signal, run
+    sigs = [Signal(id=f"bot:{i}", ts=100 + i, token_id=f"t{i}", condition_id=f"c{i}", event_key=f"e{i}",
+                   base_status="FILLED", price=0.5, scheduled_end=(100 + i + 40 * 86_400) if i == 3 else None)
+            for i in range(5)]
+    res = run(sigs, Params(amount=100.0, onramp_cost_pct=0.0, max_open_positions=2, max_per_event_fraction=0.5,
+                           max_days_to_close=14, skip_if_no_end_date=False), as_of=1000)
+    assert [e.code for e in res.entries] == [None, None, "no_slot", "too_long", "no_slot"]
+    import html as h, json, re
+    data = json.loads(h.unescape(re.search(r'data-chart="([^"]+)"', dash.wallet_chart(res)).group(1)))
+    assert sum(n for _, n in data["skips"]) == 2, "the two no_slot skips are marked, the too_long one is not"

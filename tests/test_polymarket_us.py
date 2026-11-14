@@ -37,6 +37,8 @@ def us_raw(slug=US_SLUG, *, sides=(("Jaguars", True), ("Titans", False)), kind="
             "closed": status != "MARKET_STATUS_OPEN", "gameStartTime": __import__("whalewatcher.timeutil", fromlist=["iso"]).iso(start),
             "orderPriceMinTickSize": 0.01, "minimumTradeQty": min_qty, "feeCoefficient": fee,
             "outcomes": json.dumps([s[0] for s in sides]),
+            "description": "If the game is postponed, this market will remain open until the game has been completed.",
+            "endDate": __import__("whalewatcher.timeutil", fromlist=["iso"]).iso(start + 14 * DAY),
             "marketSides": [{"description": name, "long": long, "team": {"name": f"Team {name}", "alias": name}}
                             for name, long in sides]}
 
@@ -456,3 +458,23 @@ def test_without_kickoff_times_only_the_same_date_is_accepted():
     assert pick(candidates(intl("nba-lal-bos-2026-11-06")), {timed.slug: timed},
                 intl("nba-lal-bos-2026-11-06", outcomes=("Lakers", "Celtics")), 0).found, \
         "with both kickoff times the neighbouring date is fine: the times prove it is the same game"
+
+
+
+async def test_the_us_row_keeps_the_us_rules_deadline_and_best_bid(live_app, fake_http, clock):
+    from whalewatcher.stats import render
+    world, _, monitor, row_a = setup(live_app, fake_http, bids=((0.42, 500),), offers=((0.45, 500),))
+    await signal(world, monitor, row_a)
+    t = us_row(live_app)
+    assert t["us_rules"].startswith("If the game is postponed, this market will remain open")
+    assert t["us_end_date"] == KICKOFF + 14 * DAY and t["us_best_bid"] == 0.42
+    text = render(live_app)
+    assert "US fill minus international fill (or what each would have paid), n=1: mean +0.010 a share" in text
+    assert "international vs US: missed 0% vs 0% | spread +0.020 vs +0.030" in text
+
+
+async def test_a_shorts_best_bid_is_one_minus_the_best_offer(live_app, fake_http, clock):
+    world, _, monitor, row_a = setup(live_app, fake_http, bids=((0.44, 500),), offers=((0.47, 500),))
+    await signal(world, monitor, row_a, index=1, price=0.55)
+    t = us_row(live_app)
+    assert t["us_side"] == "short" and t["us_best_bid"] == pytest.approx(0.53), "buying the instrument back at 0.47"

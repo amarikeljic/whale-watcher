@@ -29,8 +29,10 @@ log = logging.getLogger(__name__)
 # time-to-close cutoff (skip code, scheduled end and days to it, real resolution time).
 # 8: v2.1 Part 2, the small wallet (settings, bankroll_runs, position_marks, and the
 # ask levels each signal saw). 9: v2.1 Part 3b, row A: which Polymarket US market and
-# side a `us` row was priced on, and the gap between the two venues' best asks.
-SCHEMA_VERSION = 9
+# side a `us` row was priced on, and the gap between the two venues' best asks. 10: the
+# US market's own resolution rules, deadline and best bid on each `us` row (Part 3b's
+# rules side by side, and the spread).
+SCHEMA_VERSION = 10
 BUSY_TIMEOUT_MS = 60_000
 SLOW_STATEMENT_SECONDS = 2.0
 
@@ -562,6 +564,9 @@ ADDED_COLUMNS = (
     (9, "bot_trades", "us_rule", "TEXT"),          # the matching rule: game_winner | crypto_updown | none
     (9, "bot_trades", "intl_best_ask", "REAL"),    # the international best ask the baseline saw
     (9, "bot_trades", "price_gap", "REAL"),        # US best ask minus the international best ask
+    (10, "bot_trades", "us_rules", "TEXT"),        # the US market's resolution rules, as published when we decided
+    (10, "bot_trades", "us_end_date", "INTEGER"),  # the US market's end date (sports: the game plus about 14 days)
+    (10, "bot_trades", "us_best_bid", "REAL"),     # best bid for the side bought (a short's is 1 - the best offer)
 )
 
 
