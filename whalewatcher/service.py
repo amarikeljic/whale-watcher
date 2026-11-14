@@ -246,6 +246,12 @@ class Service:
             app.db.set_state("last_settle_at", now)
             if settled or closed:
                 log.info("settled %d old-rule paper trades and %d bot trades", settled, closed)
+        if self.us is not None and now - int(app.db.get_state("last_us_marks_at", 0)) >= cfg.bankroll.mark_interval_seconds:
+            app.db.set_state("last_us_marks_at", now)
+            try:
+                await self.us.mark_positions()     # Part 4 #8: US positions marked from the US book
+            except Exception:
+                log.exception("could not mark the Polymarket US positions; trying again later")
         if now - int(app.db.get_state("last_followup_at", 0)) >= cfg.followup.update_every_seconds:
             app.db.set_state("last_followup_at", now)
             try:

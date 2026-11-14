@@ -147,6 +147,13 @@ class UsBook:
             return self.bids[0][0] if self.bids else None
         return round(1 - self.offers[0][0], 6) if self.offers else None
 
+    def bids_for(self, long: bool) -> list[tuple[float, float]]:
+        """What the side held would fetch, best first. The long side hits the bids; a short
+        is closed by buying the instrument back at the offers, worth 1 - offer to it."""
+        if long:
+            return list(self.bids)
+        return [(round(1 - price, 6), qty) for price, qty in self.offers]
+
     def asks_for(self, long: bool) -> list[tuple[float, float]]:
         """What a buyer of this side pays, cheapest first. The long side lifts the offers.
         The other side is a short of the same instrument: it hits the bids, and a
@@ -198,6 +205,11 @@ class UsGateway:
                 return None
             raise
         return _num((payload or {}).get("settlement"))
+
+
+def us_mark_key(slug: str, side: str) -> str:
+    """position_marks key of a Polymarket US position (Part 4 #8)."""
+    return f"us:{slug}:{side}"
 
 
 # -- fees ---------------------------------------------------------------------------------------------
@@ -572,6 +584,32 @@ class UsRowA:
         return (row["event_slug"] if row else None) or alert["condition_id"]
 
     # -- settling ---------------------------------------------------------------------------------------
+
+    async def mark_positions(self) -> int:
+        """Part 4 #8: open US positions marked from the US book itself (before, they took
+        the international token's marks). Keyed ``us:<slug>:<side>`` in position_marks."""
+        app = self.app
+        rows = app.db.query("SELECT DISTINCT us_slug, us_side FROM bot_trades WHERE runner = ? AND status = 'FILLED' "
+                            "AND closed_at IS NULL AND us_slug IS NOT NULL AND us_side IS NOT NULL", (RUNNER,))
+        now, done, books = int(app.clock()), 0, {}
+        for r in rows:
+            slug = r["us_slug"]
+            if slug not in books:
+                self._calls += 1
+                nonce = f"{int(app.wall() * 1000)}{self._calls}" if self.cfg.bypass_cache else None
+                try:
+                    books[slug] = await self.gateway.book(slug, nonce=nonce)
+                except Exception as exc:  # noqa: BLE001 - a mark is not worth stopping for
+                    log.debug("no Polymarket US mark for %s: %s", slug, exc)
+                    books[slug] = None
+            book = books[slug]
+            bids = book.bids_for(r["us_side"] == "long") if book is not None else []
+            if not bids:
+                continue
+            app.db.execute("INSERT OR IGNORE INTO position_marks (token_id, ts, best_bid, bids_json) VALUES (?,?,?,?)",
+                           (us_mark_key(slug, r["us_side"]), now, bids[0][0], json.dumps([[p, q] for p, q in bids[:25]])))
+            done += 1
+        return done
 
     async def settle(self) -> int:
         """Close every ``us`` position whose US market has settled, at what the US

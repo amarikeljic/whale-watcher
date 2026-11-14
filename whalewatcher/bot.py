@@ -382,8 +382,9 @@ class Bot:
                 continue
             if book is None or book.best_bid is None:
                 continue
-            app.db.execute("INSERT OR IGNORE INTO position_marks (token_id, ts, best_bid) VALUES (?,?,?)",
-                           (token, now, book.best_bid))
+            app.db.execute("INSERT OR IGNORE INTO position_marks (token_id, ts, best_bid, bids_json) VALUES (?,?,?,?)",
+                           (token, now, book.best_bid,
+                            json.dumps([[lv.price, lv.size] for lv in book.bids[:BOOK_LEVELS_KEPT]])))
             done += 1
         return done
 

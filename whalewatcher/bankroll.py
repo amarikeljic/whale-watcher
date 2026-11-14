@@ -206,6 +206,11 @@ class Signal:
     # amount at amount_decimals (None: not rounded, Polymarket US documents no rule).
     share_step: float = SHARE_STEP
     amount_decimals: int | None = DEFAULT_AMOUNT_DECIMALS
+    mark_key: str | None = None      # where its marks are kept: the token, or us:<slug>:<side> on Polymarket US
+
+    @property
+    def marked_as(self) -> str:
+        return self.mark_key or self.token_id
 
 
 # Skips that say the bet does not exist on the venue (polymarket_us.py). A wallet on that
@@ -244,6 +249,7 @@ class Point:
     ts: float
     equity: float
     cash: float
+    conservative: float | None = None   # open positions at what selling all of each would fetch, after the fee
 
     @property
     def tied(self) -> float:
@@ -257,6 +263,14 @@ class Result:
     start_ts: float | None = None
     entries: list[Entry] = field(default_factory=list)
     curve: list[Point] = field(default_factory=list)
+
+    @property
+    def conservative_equity(self) -> float:
+        """Equity with every open position valued at what selling ALL of it into the
+        recorded bids would fetch, after the taker fee (Part 4 #8). Never above equity."""
+        last = self.curve[-1] if self.curve else None
+        return self.start_cash if last is None else (last.conservative if last.conservative is not None
+                                                     else last.equity)
 
     @property
     def start_cash(self) -> float:
@@ -318,6 +332,7 @@ class Result:
         settled = self.settled
         return {
             "amount": self.params.amount, "equity": round(self.equity, 4), "cash": round(self.cash, 4),
+            "conservative_equity": round(self.conservative_equity, 4),
             "total_return": round(self.total_return, 6), "max_drawdown_usd": round(dd, 4),
             "max_drawdown_pct": round(dd_pct, 6), "signals": len(self.entries), "taken": len(self.taken),
             "skipped": dict(self.skipped), "missed": self.missed, "settled": len(settled),
@@ -329,21 +344,40 @@ class Result:
 
 
 class Marks:
-    """Best bids recorded for open positions, per token, for marking equity."""
+    """Best bids recorded for open positions, per token (or us:<slug>:<side>), for
+    marking equity, and the bids behind each mark (Part 4 #8) where they were kept."""
 
     def __init__(self, rows: Any = ()) -> None:
-        by: dict[str, tuple[list[float], list[float]]] = defaultdict(lambda: ([], []))
-        for token, ts, bid in sorted(rows, key=lambda r: (r[0], r[1])):
+        by: dict[str, tuple[list[float], list[float], list[Any]]] = defaultdict(lambda: ([], [], []))
+        for row in sorted(rows, key=lambda r: (r[0], r[1])):
+            token, ts, bid = row[0], row[1], row[2]
+            depth = row[3] if len(row) > 3 else None
             by[token][0].append(ts)
             by[token][1].append(bid)
+            by[token][2].append(depth)
         self._by = dict(by)
 
-    def at(self, token: str, ts: float) -> float | None:
+    def _index(self, token: str, ts: float) -> tuple[Any, int] | None:
         series = self._by.get(token)
         if not series:
             return None
         i = bisect.bisect_right(series[0], ts)
-        return series[1][i - 1] if i else None
+        return (series, i - 1) if i else None
+
+    def at(self, token: str, ts: float) -> float | None:
+        found = self._index(token, ts)
+        return None if found is None else found[0][1][found[1]]
+
+    def depth_at(self, token: str, ts: float) -> list[tuple[float, float]] | None:
+        """The bids behind the mark in force at ``ts``, best first, or None (a mark from
+        before depth was kept, or no mark)."""
+        found = self._index(token, ts)
+        if found is None or not found[0][2][found[1]]:
+            return None
+        try:
+            return [(float(p), float(q)) for p, q in json.loads(found[0][2][found[1]])]
+        except (ValueError, TypeError):
+            return None
 
 
 # -- pricing one order ----------------------------------------------------------------------------
@@ -493,14 +527,34 @@ def run(signals: list[Signal], params: Params, *, marks: Marks | None = None, st
     evidence = Evidence(signals, params) if params.stake_mode == "auto" else None
 
     def value(e: Entry, ts: float) -> float:
-        bid = marks.at(e.signal.token_id, ts)
+        bid = marks.at(e.signal.marked_as, ts)
         return e.contracts * (bid if bid is not None else e.price)
+
+    def sale_value(e: Entry, ts: float) -> float:
+        """What selling all of it would fetch, after the taker fee: down the recorded
+        bids, nothing for what they cannot absorb. Without depth, the best bid (or the
+        price paid) less the fee. Never more than value()."""
+        sig, depth = e.signal, marks.depth_at(e.signal.marked_as, ts)
+        if depth is None:
+            px = marks.at(sig.marked_as, ts)
+            px = e.price if px is None else px
+            fills = [(px, e.contracts)] if px else []
+        else:
+            fills, left = [], e.contracts
+            for price, size in depth:
+                if left <= 1e-9:
+                    break
+                take = min(size, left)
+                fills.append((price, take))
+                left -= take
+        gross = sum(p * q for p, q in fills)
+        return min(value(e, ts), max(0.0, gross - taker_fee(fills, sig.fee_rate, sig.fee_exponent)))
 
     def equity_at(ts: float) -> float:
         return cash + sum(value(e, ts) for e in open_)
 
     def point(ts: float) -> None:
-        res.curve.append(Point(ts, equity_at(ts), cash))
+        res.curve.append(Point(ts, equity_at(ts), cash, cash + sum(sale_value(e, ts) for e in open_)))
 
     def settle_until(ts: float) -> None:
         nonlocal cash
@@ -630,6 +684,8 @@ def signal_of(rec: dict, cfg: Config) -> Signal | None:
         wallet=rec.get("wallet"), question=rec.get("question") or "",
         venue_skip=rec.get("skip_code") if rec.get("skip_code") in SIGNAL_SKIPS else None,
         share_step=(rec.get("min_order_size") or SHARE_STEP) if rec.get("runner") == "us" else SHARE_STEP,
+        mark_key=(f"us:{rec['us_slug']}:{rec['us_side']}" if rec.get("runner") == "us" and rec.get("us_slug")
+                  and rec.get("us_side") else None),
         amount_decimals=None if rec.get("runner") == "us" else amount_decimals(rec.get("tick_size")))
 
 
@@ -667,10 +723,14 @@ def signals_by_source(records: list[dict], cfg: Config) -> dict[str, list[Signal
 
 def load_marks(db: Any) -> Marks:
     try:
-        return Marks((r["token_id"], r["ts"], r["best_bid"]) for r in db.query(
-            "SELECT token_id, ts, best_bid FROM position_marks"))
-    except Exception:  # noqa: BLE001 - a database older than the table
-        return Marks()
+        return Marks((r["token_id"], r["ts"], r["best_bid"], r["bids_json"]) for r in db.query(
+            "SELECT token_id, ts, best_bid, bids_json FROM position_marks"))
+    except Exception:  # noqa: BLE001 - a database older than the table or the column
+        try:
+            return Marks((r["token_id"], r["ts"], r["best_bid"]) for r in db.query(
+                "SELECT token_id, ts, best_bid FROM position_marks"))
+        except Exception:  # noqa: BLE001
+            return Marks()
 
 
 # -- runs: when a wallet begins and ends ------------------------------------------------------------
@@ -840,7 +900,8 @@ def result_line(res: Result) -> str:
     s = res.summary()
     skips = ", ".join(f"{k} {v}" for k, v in sorted(s["skipped"].items(), key=lambda kv: -kv[1]))
     skipped = sum(s["skipped"].values())
-    return (f"equity {_usd(s['equity'])} ({s['total_return']:+.1%}) | max drawdown {_usd(s['max_drawdown_usd'])} "
+    return (f"equity {_usd(s['equity'])} ({s['total_return']:+.1%}), {_usd(s['conservative_equity'])} if every open "
+            f"position were sold into the bids | max drawdown {_usd(s['max_drawdown_usd'])} "
             f"({s['max_drawdown_pct']:.1%}) | taken {s['taken']} of {s['signals']} signals, skipped {skipped}"
             f"{f' ({skips})' if skips else ''}, missed {s['missed']} | {s['settled']} settled, {s['open']} open | "
             f"fees {_usd(s['fees'])}")

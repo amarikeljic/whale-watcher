@@ -1096,6 +1096,8 @@ def wallet_tiles(res: Any) -> str:
     skipped = sum(s["skipped"].values())
     return ('<div class="tiles">'
             + v.tile("Equity", v.money(s["equity"], signed=False), f"cash {v.money(s['cash'], signed=False)} free")
+            + v.tile("Conservative equity", v.money(s["conservative_equity"], signed=False),
+                     "every open position sold into the bids, after the fee")
             + v.tile("Total return", v.pct(s["total_return"]), f"on ${s['amount']:,.2f} put in",
                      v.tone(s["total_return"]))
             + v.tile("Max drawdown", v.money(s["max_drawdown_usd"], signed=False),

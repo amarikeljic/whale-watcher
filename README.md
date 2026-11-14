@@ -208,6 +208,13 @@ small wallet's stakes are whole cents, and its smallest order is rounded up to
 the cent so it always buys the market's minimum. The effect is a cent or less a
 trade: $10 at 0.44 buys 22.72 shares for $9.9968 instead of 22.727 for $10.
 
+*Conservative equity* (v2.1 Part 4 #8). Every mark of an open position also keeps
+the bids behind it. Beside its equity (each share at the best bid) the small
+wallet shows a conservative equity: each open position sold, all of it, down the
+recorded bids after the taker fee, with nothing for what the bids cannot absorb.
+Polymarket US positions are marked from the US book (`us:<slug>:<side>`), a short
+at 1 minus the offer. Before this they borrowed the international market's marks.
+
 *The book a second later* (v2.1 Part 4 #6). After each decision the runner reads
 the order book again (`bot.recheck_seconds`, 1 s) and records what the same
 order would have done on it: the best ask, the fill price or a miss. `stats` and

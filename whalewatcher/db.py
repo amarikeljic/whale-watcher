@@ -620,6 +620,9 @@ ADDED_COLUMNS += (
     (11, "poly_markets", "uma_statuses", "TEXT"),    # Gamma's umaResolutionStatuses: the UMA history, JSON list
     # Part 4 #7: the tick size of the book a signal was decided on: it sets the amount precision
     (11, "bot_trades", "tick_size", "REAL"),
+    # Part 4 #8: the bids behind a mark, [[price, shares], ...] best first, so a position can be
+    # valued at what selling ALL of it would fetch. US positions are keyed us:<slug>:<side>.
+    (11, "position_marks", "bids_json", "TEXT"),
 )
 
 
