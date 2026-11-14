@@ -55,6 +55,8 @@ from .fees import polymarket_taker_fee, rate_for, taker_fee
 from .horizon import close_skip
 from .polymarket import MarketInfo
 from .timeutil import iso
+from .version import MODEL_VERSION
+from .version import label as model_label
 
 DEFAULT_AMOUNT = 100.0
 MAX_AMOUNT = 100_000.0
@@ -125,6 +127,7 @@ class Params:
     min_history: int = 100
     confidence_z: float = 1.96
     no_edge_stake: str = "none"                # auto, while no edge is shown: none | smallest
+    model_version: int | None = None           # the model whose trades the run follows (None: before tagging)
 
     @classmethod
     def of(cls, cfg: Config, amount: float, *, cutoff: bool = True, stake_mode: str | None = None,
@@ -139,7 +142,7 @@ class Params:
                    skip_if_no_end_date=cfg.filters.skip_if_no_end_date if cutoff else False,
                    stake_mode=stake_mode or b.stake_mode, kelly_fraction=b.kelly_fraction,
                    min_history=b.auto_min_history, confidence_z=b.auto_confidence_z,
-                   no_edge_stake=no_edge_stake or b.auto_no_edge_stake)
+                   no_edge_stake=no_edge_stake or b.auto_no_edge_stake, model_version=MODEL_VERSION)
 
     @property
     def stake_fraction(self) -> float:
@@ -154,11 +157,12 @@ class Params:
 
     @property
     def fingerprint(self) -> str:
-        """What makes a run a different run: the amount and the bankroll settings."""
+        """What makes a run a different run: the amount, the bankroll settings and the
+        model version of the trades it follows (a new model version starts a new run)."""
         sizing = (f"auto|{self.kelly_fraction:g}|{self.min_history}|{self.confidence_z:g}|{self.no_edge_stake}"
                   if self.stake_mode == "auto" else "fixed")
         return (f"{self.amount:.2f}|{self.onramp_cost_pct:g}|{self.deploy_fraction:g}|{self.max_open_positions}|"
-                f"{self.min_order_usd:g}|{self.max_per_event_fraction:g}|{sizing}")
+                f"{self.min_order_usd:g}|{self.max_per_event_fraction:g}|{sizing}|m{self.model_version}")
 
     def describe(self) -> str:
         before = "no order" if self.no_edge_stake == "none" else "the smallest order"
@@ -675,19 +679,26 @@ def sync_runs(app: Any, runners: list[str], signals: dict[str, list[Signal]] | N
     now = int(app.clock())
     params = Params.of(app.cfg, wallet_amount(app.db))
     changes = []
+    by_model: dict[int | None, dict[str, list[Signal]]] = {}
+    if signals is not None:             # the caller's signals are the current model's
+        by_model[params.model_version] = signals
     for runner in runners:
         current = open_run(app.db, runner)
         if current is not None and current["fingerprint"] == params.fingerprint:
             continue
         if current is not None:
             old = run_params(current, app.cfg)
-            if signals is None:             # read the ledger only now that a run has to be closed
-                from .stats import load_bot_trades
-                signals = signals_by_source(load_bot_trades(app), app.cfg)
-            sigs = signals.get(f"bot:{runner}", [])
+            if old.model_version not in by_model:   # read the ledger only now that a run has to be closed
+                from .stats import Scope, load_bot_trades, scope_rows
+                scope = Scope("before" if old.model_version is None else str(old.model_version))
+                by_model[old.model_version] = signals_by_source(scope_rows(app, load_bot_trades(app), scope).rows,
+                                                                app.cfg)
+            sigs = by_model[old.model_version].get(f"bot:{runner}", [])
             frozen = run(sigs, old, marks=load_marks(app.db), start=current["started_at"], as_of=now)
             why = (f"wallet amount changed from ${old.amount:,.2f} to ${params.amount:,.2f}"
-                   if abs(old.amount - params.amount) > 1e-9 else "bankroll settings changed")
+                   if abs(old.amount - params.amount) > 1e-9 else
+                   f"model version changed from {model_label(old.model_version)} to {model_label(params.model_version)}"
+                   if old.model_version != params.model_version else "bankroll settings changed")
             app.db.execute("UPDATE bankroll_runs SET ended_at = ?, end_reason = ?, summary_json = ? "
                            "WHERE id = ? AND ended_at IS NULL", (now, why, json.dumps(frozen.summary()), current["id"]))
             changes.append(f"{runner}: ended run #{current['id']} ({why})")

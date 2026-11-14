@@ -353,9 +353,9 @@ async def _consensus(args, cfg) -> int:
 async def _wallet(args, cfg) -> int:
     """`wallet show` and `wallet set <amount>`: the simulated small wallet."""
     from . import bankroll
-    from .stats import load_bot_trades, load_trades
+    from .stats import Scope, load_bot_trades, load_trades, scope_rows
     async with open_app(cfg) as app:
-        records = load_bot_trades(app) + load_trades(app)
+        records = scope_rows(app, load_bot_trades(app) + load_trades(app), Scope()).rows
         if args.action == "set":
             try:
                 amount = bankroll.parse_amount(args.amount)
@@ -508,6 +508,8 @@ def build_parser() -> argparse.ArgumentParser:
                                        "--no-detector)"),
                            ("settle", "settle open paper trades once"),
                            ("stats", "print paper-trading statistics"),
+                           ("version", "the model version and code commit new rows are stamped with, and what "
+                                       "each model version changed"),
                            ("export", "write all paper trades to CSV"),
                            ("health", "exit 0 if the monitor loop has run recently (Docker healthcheck)")):
         sp = sub.add_parser(name, help=helptext)
@@ -520,6 +522,11 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--detector", action="store_true", help="check the detector's heartbeat instead")
         if name == "stats":
             sp.add_argument("--brief", action="store_true", help="the short daily summary instead of the full report")
+            sp.add_argument("--model", default="current",
+                            help="which bot rows count: current (the default), before (rows from before model "
+                                 "versions were recorded), all (mixed: for looking only), or a version number")
+            sp.add_argument("--include-outages", action="store_true",
+                            help="count signals made inside recorded outage windows (left out by default)")
         if name == "export":
             sp.add_argument("--csv", default="exports/paper_trades.csv")
     return p
@@ -562,6 +569,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_wallet(args, cfg))
     if args.command == "us":
         return asyncio.run(_us(args, cfg))
+    if args.command == "stats":
+        from .stats import Scope
+        try:
+            Scope.parse(args.model, args.include_outages)       # before anything opens the database
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    if args.command == "version":
+        from . import version
+        print("\n".join(version.describe()))
+        print(f"settings fingerprint of {args.config}: {version.settings_hash(cfg)}")
+        return 0
     if args.command == "dashboard":
         from .dashboard import serve
         serve(cfg, host=args.host, port=args.port, in_container=args.in_container)

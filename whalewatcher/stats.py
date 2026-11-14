@@ -14,6 +14,9 @@ Rules this module keeps:
 * Simulated trades written by ``backtest`` (strategy ``backtest:*``) are shown
   in their own section, labelled SIMULATED, and never mixed into the live
   numbers or the live warning.
+* The bot headline counts one model version (version.py), the current one by
+  default, and leaves out signals inside outage windows unless asked. Rows of
+  other versions, "before tagging" included, are shown as their own groups.
 """
 
 from __future__ import annotations
@@ -30,6 +33,8 @@ from .horizon import DAY, NO_END_DATE, TOO_LONG, days_to_close, held_days, sched
 from .horizon import bucket as horizon_bucket
 from .stats_util import max_drawdown, mean, median, two_way_bootstrap_mean_ci
 from .timeutil import iso
+from .version import BEFORE_TAGGING, MODEL_VERSION
+from .version import label as model_label
 
 PRICE_BUCKETS = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0)]
 BACKTEST_PREFIX = "backtest:"
@@ -146,6 +151,114 @@ def load_bot_trades(app: App) -> list[dict]:
     return out
 
 
+# -- which rows a report counts (v2.1 Part 4 #1 and #15) ---------------------------------------
+
+
+@dataclass(frozen=True)
+class Scope:
+    """Which bot rows a report counts. The default is the headline: the current model
+    version, with signals inside outage windows left out."""
+    model: str = "current"          # current | before | all | a model version number
+    include_outages: bool = False
+
+    @classmethod
+    def parse(cls, model: str | None, include_outages: bool = False) -> Scope:
+        model = (model or "current").strip().lower()
+        if model not in ("current", "before", "all") and not model.isdigit():
+            raise ValueError(f"model must be current, before, all or a version number, not {model!r}")
+        return cls(model, include_outages)
+
+    def wants_model(self, version: int | None) -> bool:
+        if self.model == "all":
+            return True
+        if self.model == "before":
+            return version is None
+        return version == (MODEL_VERSION if self.model == "current" else int(self.model))
+
+    @property
+    def label(self) -> str:
+        if self.model == "all":
+            return "every model version mixed (for looking only: not a result)"
+        if self.model == "before":
+            return f"{BEFORE_TAGGING} (rows made before model versions were recorded)"
+        n = MODEL_VERSION if self.model == "current" else int(self.model)
+        return f"model {n}" + (" (current)" if n == MODEL_VERSION else "")
+
+    @property
+    def short(self) -> str:
+        if self.model in ("all", "before"):
+            return "all model versions" if self.model == "all" else BEFORE_TAGGING
+        return f"model {MODEL_VERSION if self.model == 'current' else int(self.model)}"
+
+
+@dataclass
+class Scoped:
+    rows: list[dict]
+    other_models: dict[int | None, int] = field(default_factory=dict)   # signals of other versions left out
+    in_outages: int = 0                                                 # signals left out for an outage
+    windows: int = 0
+    settings: dict[str, int] = field(default_factory=dict)              # settings hash -> signals counted
+    commits: dict[str, int] = field(default_factory=dict)
+
+
+def outage_windows(app: App) -> list[tuple[int, int]]:
+    """(start, end) of every recorded outage; an open one runs to now."""
+    try:
+        rows = app.db.query("SELECT start_ts, end_ts FROM outage_windows ORDER BY start_ts")
+    except Exception:  # noqa: BLE001 - a database older than the table: no windows known
+        return []
+    now = int(app.clock())
+    return [(r["start_ts"], r["end_ts"] or now) for r in rows]
+
+
+def in_window(ts: float | None, windows: list[tuple[int, int]]) -> bool:
+    return ts is not None and any(a <= ts < b for a, b in windows)
+
+
+def scope_rows(app: App, rows: list[dict], scope: Scope, *, windows: list[tuple[int, int]] | None = None) -> Scoped:
+    """The bot rows ``scope`` counts, and what it left out. Rows without a runner (the
+    old rule, simulated replays) are separate sources and pass through untouched."""
+    windows = outage_windows(app) if windows is None else windows
+    out = Scoped([], windows=len(windows))
+    other: dict[int | None, int] = defaultdict(int)
+    settings: dict[str, int] = defaultdict(int)
+    commits: dict[str, int] = defaultdict(int)
+    for r in rows:
+        if "runner" not in r:
+            out.rows.append(r)
+            continue
+        if not scope.wants_model(r.get("model_version")):
+            other[r.get("model_version")] += 1
+            continue
+        if not scope.include_outages and in_window(r.get("signal_ts"), windows):
+            out.in_outages += 1
+            continue
+        out.rows.append(r)
+        if r.get("model_version") is not None:
+            settings[r.get("settings_hash") or "unknown"] += 1
+            commits[r.get("code_commit") or "unknown"] += 1
+    out.other_models, out.settings, out.commits = dict(other), dict(settings), dict(commits)
+    return out
+
+
+def scope_lines(sc: Scoped, scope: Scope) -> list[str]:
+    lines = [f"  counting {scope.label}" + (" | code commits: " + ", ".join(
+        f"{c} ({n})" for c, n in sorted(sc.commits.items(), key=lambda kv: -kv[1])) if sc.commits else "")]
+    if len(sc.settings) > 1:
+        lines.append(f"  ⚠ these rows were made under {len(sc.settings)} different settings (config.yaml changed): "
+                     + ", ".join(f"{h} ({n})" for h, n in sorted(sc.settings.items(), key=lambda kv: -kv[1]))
+                     + ". They are pooled here; a change that alters decisions should also change the model version.")
+    if sc.other_models:
+        kept = ", ".join(f"{n} signals from {model_label(v)}" for v, n in sorted(
+            sc.other_models.items(), key=lambda kv: (kv[0] is None, -(kv[0] or 0))))
+        lines.append(f"  kept apart, never added in: {kept} (`stats --model before` or a version number "
+                     "shows them)")
+    if sc.in_outages:
+        lines.append(f"  left out: {sc.in_outages} signals inside {sc.windows} outage window(s) "
+                     "(`stats --include-outages` counts them)")
+    return lines
+
+
 def _quantile(values: list[float], q: float) -> float | None:
     if not values:
         return None
@@ -197,7 +310,7 @@ def _paired(a: list[dict], b: list[dict], samples: int) -> tuple[int, float | No
 
 
 def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], threshold: int, samples: int,
-                        *, brief: bool) -> list[str]:
+                        *, brief: bool, group: str | None = None) -> list[str]:
     from .bot import Bot
     traded = [t for t in rows if t["status"] != "SKIPPED"]
     skipped = [t for t in rows if t["status"] == "SKIPPED"]
@@ -205,7 +318,8 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
     acct = Bot(app, runner).account(strategy)
     if brief and strategy != BOT_HEADLINE:
         head = _brief_summary(s, threshold)
-        head[0] += f" | bankroll ${acct.equity:,.2f}"
+        if group is None:
+            head[0] += f" | bankroll ${acct.equity:,.2f}"
         return head
     note = {"flat_hold": "bot fill at detection, held to resolution; the headline",
             "flat_mirror": "bot fill, sold when the whale sells",
@@ -213,7 +327,7 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
             "placebo_late": "the control: same outcome at a random later time"}.get(strategy, "")
     if runner == US_RUNNER:
         note = "the same signals on the Polymarket US book, at US fees: row A"
-    lines = [f"== {runner} / {strategy} ({note}) =="]
+    lines = [f"== {runner} / {strategy} ({note})" + (f", {group}" if group else "") + " =="]
     if s.settled < threshold:
         lines.append(f"  ⚠ only {s.settled} closed trades: not enough to draw conclusions (need {threshold})")
     lines.append(f"  signals {len(rows)} | filled {s.filled} | missed {s.missed} | skipped {len(skipped)} | "
@@ -225,9 +339,10 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
         for t in skipped:
             why[(t["reason"] or "unknown").split(":")[0]] += 1
         lines.append("  skipped: " + ", ".join(f"{k} {v}" for k, v in sorted(why.items())))
-    if runner != US_RUNNER:     # row A prices every signal: it has no bankroll and no risk limits
+    if runner != US_RUNNER and group is None:   # row A prices every signal: it has no bankroll and no limits
         lines.append(f"  paper bankroll ${acct.equity:,.2f} (started ${acct.starting:,.2f}) | open at cost "
-                     f"${acct.open_cost:,.2f} | free ${acct.cash:,.2f} | closed today {_money(acct.today)}")
+                     f"${acct.open_cost:,.2f} | free ${acct.cash:,.2f} | closed today {_money(acct.today)} "
+                     "(the bot's operating account: every model version, as its risk limits see it)")
     if s.settled:
         lines.append(f"  total P&L {_money(s.total_pnl)} on ${s.total_cost:,.2f} staked (n={s.settled} closed) | "
                      f"ROI {_pct(s.roi)} | win rate {s.win_rate:.0%}")
@@ -274,12 +389,19 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
     return lines
 
 
-def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_breakdowns: bool) -> list[str]:
+def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_breakdowns: bool,
+              scope: Scope = Scope(), everything: list[dict] | None = None) -> list[str]:
     from .config import BOT_STRATEGIES
-    trades = load_bot_trades(app)
-    if not trades:
+    everything = load_bot_trades(app) if everything is None else everything
+    if not everything:
         return []
+    windows = outage_windows(app)
+    sc = scope_rows(app, everything, scope, windows=windows)
+    trades = sc.rows
     lines = ["BOT PAPER TRADES: a bot that buys the moment a whale fill is detected (paper only)"]
+    lines += scope_lines(sc, scope)
+    if not trades:
+        lines.append(f"  no signals from {scope.label} yet.")
     by: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for t in trades:
         by[(t["runner"], t["strategy"])].append(t)
@@ -311,6 +433,26 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
             lines += _breakdown_lines(headline, f" ({BOT_HEADLINE})",
                                       ("watchlist status", "month", "category", "days to close when entered",
                                        "holding time", "entry price", "wallet"))
+    if scope.model == "current":
+        lines += _other_model_lines(app, everything, sc, scope, threshold, samples, windows)
+    return lines
+
+
+def _other_model_lines(app: App, everything: list[dict], sc: Scoped, scope: Scope, threshold: int, samples: int,
+                       windows: list[tuple[int, int]]) -> list[str]:
+    """Each other model version's headline, briefly, as its own group."""
+    lines: list[str] = []
+    for version in sorted(sc.other_models, key=lambda v: (v is None, -(v or 0))):
+        group = model_label(version)
+        rows = scope_rows(app, everything, Scope("before" if version is None else str(version),
+                                                 scope.include_outages), windows=windows).rows
+        rows = [t for t in rows if "runner" in t and t["strategy"] == BOT_HEADLINE]
+        if not rows:
+            continue
+        lines += ["", f"BOT PAPER TRADES, {group.upper()}: kept apart, never added to the headline above"]
+        for runner in sorted({t["runner"] for t in rows}, key=lambda r: (r == US_RUNNER, r)):
+            lines += _bot_strategy_lines(app, runner, BOT_HEADLINE, [t for t in rows if t["runner"] == runner],
+                                         threshold, samples, brief=True, group=group)
     return lines
 
 
@@ -666,18 +808,21 @@ def _backtest_header(app: App) -> list[str]:
     return lines
 
 
-def render(app: App, *, with_breakdowns: bool = True, brief_backtest: bool = False) -> str:
+def render(app: App, *, with_breakdowns: bool = True, brief_backtest: bool = False, scope: Scope = Scope()) -> str:
     trades = load_trades(app)
     threshold = app.cfg.stats.min_settled_for_conclusions
     samples = app.cfg.stats.bootstrap_samples
     live = [t for t in trades if not is_backtest(t)]
     simulated = [t for t in trades if is_backtest(t)]
     lines: list[str] = []
-    bot = bot_lines(app, threshold=threshold, samples=samples, brief=brief_backtest, with_breakdowns=with_breakdowns)
+    everything = load_bot_trades(app)
+    bot = bot_lines(app, threshold=threshold, samples=samples, brief=brief_backtest, with_breakdowns=with_breakdowns,
+                    scope=scope, everything=everything)
     if bot:
-        headline = app.db.one("SELECT COUNT(*) n FROM bot_trades WHERE strategy = ? AND status = 'FILLED' "
-                              "AND closed_at IS NOT NULL AND runner != ?", (BOT_HEADLINE, US_RUNNER))["n"]
-        label = "closed bot paper trades (flat_hold)"
+        counted = scope_rows(app, everything, scope).rows
+        headline = sum(1 for t in counted if t["strategy"] == BOT_HEADLINE and t["status"] == "FILLED"
+                       and t["closed_at"] is not None and t["runner"] != US_RUNNER)
+        label = f"closed bot paper trades (flat_hold, {scope.short})"
     else:
         headline = sum(1 for t in live if t["status"] == "FILLED" and t["settled_at"] is not None)
         label = "settled live paper trades"
@@ -825,22 +970,25 @@ def export_bot_csv(app: App, path: str) -> int:
     return len(trades)
 
 
-def daily_summary(app: App) -> str:
+def daily_summary(app: App, scope: Scope = Scope()) -> str:
     """The short version: what `stats --brief` prints and what the runner writes to
     its log once a day. Per runner: net P&L with its n and interval, where the money
     went, what the time-to-close cutoff skipped, and the small wallet. Kept under
     2,000 characters so it stays one screen. The full report is ``stats`` and the
     dashboard."""
     from . import bankroll
-    bots = load_bot_trades(app)
-    if not bots:        # only old-rule or simulated trades: the old short report
-        text = render(app, with_breakdowns=False, brief_backtest=True)
+    everything = load_bot_trades(app)
+    if not everything:        # only old-rule or simulated trades: the old short report
+        text = render(app, with_breakdowns=False, brief_backtest=True, scope=scope)
         return text if len(text) <= 1900 else text[:1890] + "\n…"
+    windows = outage_windows(app)
+    sc = scope_rows(app, everything, scope, windows=windows)
+    bots = sc.rows
     threshold, samples = app.cfg.stats.min_settled_for_conclusions, min(app.cfg.stats.bootstrap_samples, 2000)
     by: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for t in bots:
         by[(t["runner"], t["strategy"])].append(t)
-    lines: list[str] = []
+    lines: list[str] = scope_lines(sc, scope)
     for runner in sorted({r for r, _ in by}):
         rows = by.get((runner, BOT_HEADLINE), [])
         traded = [t for t in rows if t["status"] != "SKIPPED"]
@@ -872,6 +1020,15 @@ def daily_summary(app: App) -> str:
         if n:
             ci = "-" if lo is None else f"[{_pct(lo)}, {_pct(hi)}]"
             lines.append(f"  against the control (same outcome, later), n={n}: {_pct(m)} ROI per trade, 95% CI {ci}")
+    if scope.model == "current":
+        for version in sorted(sc.other_models, key=lambda v: (v is None, -(v or 0))):
+            rows = [t for t in scope_rows(app, everything, Scope("before" if version is None else str(version),
+                                                                 scope.include_outages), windows=windows).rows
+                    if "runner" in t and t["runner"] == "single" and t["strategy"] == BOT_HEADLINE]
+            s = summarise("single", [t for t in rows if t["status"] != "SKIPPED"], samples=samples)
+            if rows:
+                lines.append(f"single / {BOT_HEADLINE}, {model_label(version)} (kept apart): net {_money(s.total_pnl)}, "
+                             f"n={s.settled} closed, 95% CI {_ci_text(s)}")
     lines += detection_lines(app)[:1]
     lines.append("Full report: `python -m whalewatcher stats`, or the dashboard.")
     text = "\n".join(lines)

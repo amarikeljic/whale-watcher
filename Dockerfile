@@ -9,6 +9,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY whalewatcher ./whalewatcher
 COPY config.yaml ./config.yaml
 
+# Which commit this image was built from, stamped on every row the service writes
+# (whalewatcher/version.py). The image has no .git, so it is passed in at build time:
+#   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build
+# Without it the rows say "unknown"; the model version is still recorded.
+ARG GIT_COMMIT=unknown
+ENV WHALEWATCHER_COMMIT=$GIT_COMMIT
+
 # The database belongs on the mounted volume, or the next `docker rm` takes the
 # paper-trading history with it.
 ENV WHALEWATCHER_DB=/app/data/whalewatcher.sqlite3 \

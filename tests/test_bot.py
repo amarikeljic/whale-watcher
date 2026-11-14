@@ -407,7 +407,7 @@ async def test_stats_put_the_bot_first_and_keep_the_old_rule_as_its_own_section(
 
     text = render(live_app)
     assert text.index("BOT PAPER TRADES") < text.index("OLD RULE, LIVE")
-    assert "NOT ENOUGH DATA TO DRAW CONCLUSIONS YET: 1 closed bot paper trades (flat_hold)" in text
+    assert "NOT ENOUGH DATA TO DRAW CONCLUSIONS YET: 1 closed bot paper trades (flat_hold, model 1)" in text
     assert "== single / flat_hold (bot fill at detection, held to resolution; the headline) ==" in text
     assert "signals 1 | filled 1 | missed 0 | skipped 0 | waiting 0 | closed 1 | open 0" in text
     assert "paper bankroll $1,012.73 (started $1,000.00)" in text

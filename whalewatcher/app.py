@@ -79,6 +79,10 @@ async def open_app(cfg: Config, *, http: HttpClient | None = None, db: Database 
                           max_concurrency=cfg.api.max_concurrency, rate_limits=cfg.api.rate_limits)
     own_db = db is None
     db = db or Database(cfg.database_path)
+    if not getattr(db, "read_only", False):
+        from . import version
+        db.stamp_new_rows(commit=version.code_commit(), model_version=version.MODEL_VERSION,
+                          settings=version.settings_hash(cfg))
     await http.start()
     fees.configure(cfg.fees)
     data = DataApi(http, cfg.api.data_api)

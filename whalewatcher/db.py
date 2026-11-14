@@ -31,8 +31,9 @@ log = logging.getLogger(__name__)
 # ask levels each signal saw). 9: v2.1 Part 3b, row A: which Polymarket US market and
 # side a `us` row was priced on, and the gap between the two venues' best asks. 10: the
 # US market's own resolution rules, deadline and best bid on each `us` row (Part 3b's
-# rules side by side, and the spread).
-SCHEMA_VERSION = 10
+# rules side by side, and the spread). 11: v2.1 Part 4, which code made each row (code
+# commit, model version, settings hash) and the Part 4 measurements.
+SCHEMA_VERSION = 11
 BUSY_TIMEOUT_MS = 60_000
 SLOW_STATEMENT_SECONDS = 2.0
 
@@ -569,11 +570,18 @@ ADDED_COLUMNS = (
     (10, "bot_trades", "us_best_bid", "REAL"),     # best bid for the side bought (a short's is 1 - the best offer)
 )
 
+# v2.1 Part 4 #1: which code made a row (version.py). NULL on every row from before
+# stamping: shown as "before tagging", never filled in afterwards.
+STAMPED_TABLES = ("alerts", "bot_trades", "paper_trades", "bankroll_runs", "score_runs")
+STAMP_COLUMNS = (("code_commit", "TEXT"), ("model_version", "INTEGER"), ("settings_hash", "TEXT"))
+ADDED_COLUMNS += tuple((11, table, column, decl) for table in STAMPED_TABLES for column, decl in STAMP_COLUMNS)
+
 
 class Database:
     def __init__(self, path: str) -> None:
         self.path = path
         self.backup_path: str | None = None     # set when opening took a pre-migration backup
+        self.read_only = False
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
@@ -632,12 +640,29 @@ class Database:
         """A connection that cannot write: the file is opened read-only and the
         connection is set query-only. No schema is created and nothing is migrated."""
         db = cls.__new__(cls)
-        db.path, db.backup_path = path, None
+        db.path, db.backup_path, db.read_only = path, None, True
         db.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None, check_same_thread=False)
         db.conn.row_factory = sqlite3.Row
         db.conn.execute("PRAGMA query_only = ON")
         db.conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         return db
+
+    def stamp_new_rows(self, *, commit: str, model_version: int, settings: str) -> None:
+        """Stamp every row this connection inserts into a STAMPED_TABLES table with the code
+        that made it, unless the insert set ``model_version`` itself.
+
+        Temporary triggers: they live on this connection only, so the database file is
+        unchanged, another tool opening it is unaffected, and no insert anywhere in the
+        code can be missed. An upsert that updates an existing row keeps that row's stamp."""
+        for value in (commit, settings):
+            if not all(ch.isalnum() or ch == "-" for ch in value):
+                raise ValueError(f"not a stamp: {value!r}")
+        for table in STAMPED_TABLES:
+            self.conn.execute(f"DROP TRIGGER IF EXISTS temp.stamp_{table}")
+            self.conn.execute(
+                f"CREATE TEMP TRIGGER stamp_{table} AFTER INSERT ON main.{table} WHEN NEW.model_version IS NULL "
+                f"BEGIN UPDATE {table} SET code_commit = '{commit}', model_version = {int(model_version)}, "
+                f"settings_hash = '{settings}' WHERE rowid = NEW.rowid; END")
 
     @property
     def schema_version(self) -> int:

@@ -16,9 +16,12 @@ alerts there (`backtest --kalshi`), with public market data and no key.
 ## Quick start (home server)
 
 ```bash
-docker compose up -d --build
+GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build
 docker compose logs -f
 ```
+
+`GIT_COMMIT` puts the commit on every row the service writes (see "Which code
+made a row" below). Without it the rows say `unknown`, and nothing else changes.
 
 That starts three containers from one image: `whale-watcher-detector` (watches
 trades), `whale-watcher` (alerts, the paper bot, the nightly review) and
@@ -61,6 +64,9 @@ python -m whalewatcher detector                     # watch trades, publish trac
 python -m whalewatcher monitor [--cycles N] [--no-detector]   # the runner: alerts + the paper bot
 python -m whalewatcher settle
 python -m whalewatcher stats [--brief]              # the full report, or the short daily summary
+python -m whalewatcher stats --model before         # ...for the rows made before model versions (also: all, or a number)
+python -m whalewatcher stats --include-outages      # ...counting signals made inside outage windows
+python -m whalewatcher version                      # the model version and commit new rows get, and what each version changed
 python -m whalewatcher export --csv exports/paper_trades.csv
 python -m whalewatcher health                        # Docker healthcheck
 ```
@@ -220,6 +226,39 @@ adds is the breakdown and the audit trail:
 
 On the trades checked so far fees cost about 1.5% of every dollar staked. That
 is the hurdle a copy strategy has to clear before anything else.
+
+### Which code made a row (v2.1 Part 4)
+
+Every new alert, bot trade, paper trade, wallet run and score run records three
+things (`whalewatcher/version.py`):
+
+* **Model version**, a number raised by hand whenever code that decides whether
+  to copy, prices a fill, sizes a stake, or settles or marks a trade changes.
+  The headline (stats and dashboard) counts **one model version: the current one**.
+  A deploy that only changes documents, the dashboard or the reports keeps the
+  number, so the sample keeps growing. Counting one commit instead would restart
+  the sample at every deploy and never reach the 100 trades the decision rule needs.
+* **Code commit**, passed in when the image is built (`GIT_COMMIT`, above).
+* **Settings fingerprint** of the loaded `config.yaml`. `stats` warns when one
+  model version's rows were made under more than one.
+
+Rows from before this existed have none of the three. They are labelled
+**before tagging**, shown as their own group (`stats` prints them after the
+headline, the dashboard has them under Version), and never deleted, relabelled
+or added to a headline. On the first deploy of model 1 the headline therefore
+starts from zero; everything before it is under "before tagging".
+
+A new model version also ends the simulated wallet's run and starts a new one,
+so a wallet never follows two models. The bot's own paper bankroll, which its
+risk limits read, spans every version: it is operating state, not a result.
+
+`tests/test_version.py` fails when decision code changes and nobody decided
+whether that is a new model version: fixing it means either raising the number
+or recording that the change cannot alter a decision. Comments and docstrings
+do not count. It is a reminder, not a proof.
+
+The dashboard and `stats` also leave out signals made inside recorded outage
+windows unless asked (`Include outage windows`, `stats --include-outages`).
 
 ### Time-to-close cutoff (v2.1)
 

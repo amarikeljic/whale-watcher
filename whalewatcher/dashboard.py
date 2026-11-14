@@ -39,10 +39,12 @@ from .db import SCHEMA_VERSION, Database
 from .horizon import BUCKETS as CLOSE_BUCKETS
 from .horizon import UNKNOWN as NO_END
 from .horizon import bucket as horizon_bucket
-from .stats import (bucket, cutoff_report, event_key, in_play, load_bot_trades, load_trades, summarise,
-                    us_comparison)
+from .stats import (Scope, Scoped, bucket, cutoff_report, event_key, in_play, load_bot_trades, load_trades,
+                    outage_windows, scope_rows, summarise, us_comparison)
 from .stats_util import mean, median
 from .timeutil import iso, now_ts, parse_as_of, start_of_day
+from .version import MODEL_VERSION
+from .version import label as model_label
 
 log = logging.getLogger(__name__)
 
@@ -92,12 +94,7 @@ def load_records(app: Any) -> list[dict]:
 
 
 def outages(app: Any) -> list[tuple[int, int]]:
-    try:
-        rows = app.db.query("SELECT start_ts, end_ts FROM outage_windows ORDER BY start_ts")
-    except Exception:  # noqa: BLE001 - a database older than the table: no windows known
-        return []
-    now = app.clock()
-    return [(r["start_ts"], r["end_ts"] or now) for r in rows]
+    return outage_windows(app)
 
 
 # Query value -> the band of horizon.bucket() it selects.
@@ -114,7 +111,8 @@ class Filters:
     strategy: str = DEFAULT_STRATEGY
     venue: str = "all"
     wallet: str = "all"
-    no_outages: bool = False
+    no_outages: bool = True          # signals inside outage windows are left out unless asked (Part 4 #15)
+    model: str = "current"           # which model version's bot rows count (Part 4 #1)
     close: str = "all"               # days to the scheduled close when the trade was entered
     since: str = ""
     until: str = ""
@@ -125,7 +123,9 @@ class Filters:
         f.group = "week" if q.get("group") == "week" else "day"
         f.venue = q.get("venue") or "all"
         f.wallet = (q.get("wallet") or "all").lower()
-        f.no_outages = q.get("outages") == "exclude"
+        f.no_outages = q.get("outages") != "include"
+        want_model = (q.get("model") or "current").lower()
+        f.model = want_model if want_model in ("current", "before", "all") or want_model.isdigit() else "current"
         f.close = q.get("close") if q.get("close") in CLOSE_FILTERS else "all"
         want = q.get("strategy") or ""
         f.strategy = want if want in strategies else (
@@ -156,8 +156,10 @@ class Filters:
             p["venue"] = self.venue
         if self.wallet != "all":
             p["wallet"] = self.wallet
-        if self.no_outages:
-            p["outages"] = "exclude"
+        if not self.no_outages:
+            p["outages"] = "include"
+        if self.model != "current":
+            p["model"] = self.model
         if self.close != "all":
             p["close"] = self.close
         p.update(change)
@@ -187,6 +189,8 @@ class Ctx:
     threshold: int
     path: str = "/"
     notes: list[str] = field(default_factory=list)
+    scoped: Scoped | None = None
+    models: list[int | None] = field(default_factory=list)   # model versions present in the bot rows
 
     def scope(self, *, strategy: bool = True, wallet: bool = True) -> list[dict]:
         f = self.f
@@ -273,6 +277,9 @@ def filters_html(c: Ctx) -> str:
                   '<button type="submit">Apply</button>')
     wallets = [("all", "All wallets")] + [(w, f"{w[:6]}…{w[-4:]}") for w in c.wallets]
     closes = [(k, "Any" if band is None else band.capitalize()) for k, band in CLOSE_FILTERS.items()]
+    models = [("current", f"Model {MODEL_VERSION} (current)")]
+    models += [(str(m), f"Model {m}") for m in c.models if m is not None and m != MODEL_VERSION]
+    models += [("before", "Before tagging"), ("all", "All, mixed (not a result)")]
     return (f'<form class="filters" method="get" action="{c.path}">'
             f'<label>Range<span class="presets">{presets}'
             f'<a href="{c.path}?{f.qs(range="custom")}" class="{"on" if f.preset == "custom" else ""}">Custom</a></span></label>'
@@ -282,8 +289,28 @@ def filters_html(c: Ctx) -> str:
             f'<label>Venue{select("venue", [("all", "All venues"), ("polymarket", "Polymarket"), ("polymarket_us", "Polymarket US")], f.venue)}</label>'
             f'<label>Wallet{select("wallet", wallets, f.wallet)}</label>'
             f'<label>Days to close{select("close", closes, f.close)}</label>'
-            f'<label class="check"><input type="checkbox" name="outages" value="exclude"'
-            f'{" checked" if f.no_outages else ""}>Exclude outage windows</label></form>')
+            f'<label>Version{select("model", models, f.model)}</label>'
+            f'<label class="check"><input type="checkbox" name="outages" value="include"'
+            f'{"" if f.no_outages else " checked"}>Include outage windows</label></form>' + scope_note(c))
+
+
+def scope_note(c: Ctx) -> str:
+    """What the bot numbers on this page count, and what they leave out."""
+    sc, f = c.scoped, c.f
+    if sc is None:
+        return ""
+    scope = Scope(f.model, not f.no_outages)
+    parts = [f"Bot numbers count {scope.label}."]
+    if sc.other_models and f.model != "all":
+        kept = ", ".join(f"{n} signals from {model_label(m)}" for m, n in sorted(
+            sc.other_models.items(), key=lambda kv: (kv[0] is None, -(kv[0] or 0))))
+        parts.append(f"Kept apart: {kept} (pick them under Version).")
+    if sc.in_outages:
+        parts.append(f"Left out: {sc.in_outages} signals inside outage windows (tick the box to count them).")
+    if len(sc.settings) > 1:
+        parts.append(f"These rows were made under {len(sc.settings)} different settings.")
+    cls = "card-note warn" if f.model == "all" else "card-note"
+    return f'<p class="{cls}">{v.esc(" ".join(parts))}</p>'
 
 
 def size_banner(c: Ctx, settled: int) -> str:
@@ -965,7 +992,7 @@ def bankroll_page(c: Ctx, query: Any) -> tuple[str, str]:
     src = query.get("src") if query.get("src") in keys else (keys[0] if keys else "")
     view = next((w for w in all_views if w.key == src), None)
     title = f"${amount:,.2f} wallet"
-    body = wallet_form(amount, query.get("saved") or "", (query.get("error") or "")[:200])
+    body = wallet_form(amount, query.get("saved") or "", (query.get("error") or "")[:200]) + scope_note(c)
     params = bankroll.Params.of(app.cfg, amount)
     body += (f'<p class="card-note">{v.esc(params.describe())}. The fee is inside the stake and a stake is never '
              "more than the cash. Open positions are valued at their last recorded best bid, or at the price paid "
@@ -1220,8 +1247,13 @@ def build_ctx(cfg: Config, db: Database, query: Any, path: str, now: int | None 
     strategies = [k for k in LABELS if k in present] + sorted(k for k in present if k not in LABELS)
     f = Filters.parse(query, now, strategies)
     live_wallets = sorted({r["wallet"] for r in records if not r["simulated"] and r["wallet"]})
-    return Ctx(app, records, outages(app), f, strategies or [DEFAULT_STRATEGY], live_wallets, now,
-               cfg.stats.min_settled_for_conclusions, path)
+    models = sorted({r.get("model_version") for r in records if "runner" in r}, key=lambda m: (m is None, m or 0))
+    windows = outages(app)
+    # Every page, the wallet pages included, sees only the bot rows of the chosen model
+    # version, without the signals inside outage windows unless asked.
+    sc = scope_rows(app, records, Scope(f.model, not f.no_outages), windows=windows)
+    return Ctx(app, sc.rows, windows, f, strategies or [DEFAULT_STRATEGY], live_wallets, now,
+               cfg.stats.min_settled_for_conclusions, path, scoped=sc, models=models)
 
 
 def render(cfg: Config, db_path: str, path: str, query: Any, *, now: int | None = None) -> tuple[str, str]:

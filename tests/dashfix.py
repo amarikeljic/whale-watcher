@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from whalewatcher.db import Database
+from whalewatcher.version import MODEL_VERSION
 
 DAY = 86_400
 A, B = "0xaaaa000000000000000000000000000000000001", "0xbbbb000000000000000000000000000000000002"
@@ -149,6 +150,8 @@ def small(path: str, now: int) -> Fixture:
     late. The open trade is 30 days out (entered before the cutoff existed) and one signal was
     skipped as too long."""
     fx = Fixture(Database(path), now)
+    # Like the service: every row written now is the current model's (version.py).
+    fx.db.stamp_new_rows(commit="abc1234", model_version=MODEL_VERSION, settings="0123456789ab")
     one = fx.trade(A, 6, pnl=12.5, closing=0.55, markout=0.52, detect=3.0, zero_pnl=14.0, human_pnl=9.0,
                    category="sports", end_days=0.5)
     two = fx.trade(A, 5, pnl=-10.0, closing=0.47, markout=0.49, detect=4.0, zero_pnl=-10.0, human_pnl=-10.0,

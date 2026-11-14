@@ -25,6 +25,10 @@ def site(tmp_path):
     cfg.bankroll.stake_mode = "fixed"       # the hand calculations below are for a fixed 8% stake
 
     def get(url: str, **query) -> str:
+        # The hand calculations below count the trade inside the outage window. Leaving
+        # outages out is the default; its own tests pass outages=None to get the default.
+        query.setdefault("outages", "include")
+        query = {k: val for k, val in query.items() if val is not None}
         return dash.render(cfg, path, url, query, now=NOW)[1]
 
     get.cfg, get.path = cfg, path
@@ -44,10 +48,15 @@ def test_overview_shows_the_hand_checked_totals_each_with_its_n(site):
     assert "Old rule: human delay n=1" in html, "the old paper trades are their own line"
 
 
-def test_excluding_the_outage_window_drops_the_trade_made_inside_it(site):
-    html = site("/", outages="exclude")
+def test_by_default_the_trade_made_inside_the_outage_window_is_left_out(site):
+    html = site("/", outages=None)
     assert "+$12.50" in html and "n=4 closed" in html and "75%" in html
     assert "+31.2%" in html, "12.50 on 40"
+    assert "Left out: 1 signals inside outage windows (tick the box to count them)." in html
+    assert 'name="outages" value="include">Include outage windows' in html, "the box is not ticked"
+    included = site("/", outages="include")
+    assert "n=5 closed" in included and 'value="include" checked>Include outage windows' in included
+    assert "outages=include" in included, "the choice is carried to the other pages"
 
 
 def test_the_date_range_and_wallet_filters_scope_every_number(site):

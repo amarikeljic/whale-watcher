@@ -334,7 +334,9 @@ async def run_command(args, cfg: Config) -> int:
             print(f"settled {n} old-rule paper trades and {m} bot trades")
             return 0
         if args.command == "stats":
-            print(daily_summary(app) if args.brief else render(app))
+            from .stats import Scope
+            scope = Scope.parse(args.model, args.include_outages)     # checked by cli.main before opening
+            print(daily_summary(app, scope) if args.brief else render(app, scope=scope))
             return 0
         if args.command == "export":
             n = export_csv(app, args.csv)

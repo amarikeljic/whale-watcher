@@ -10,7 +10,12 @@
 # GET requests to Polymarket's public read-only APIs. They send nothing and nothing listens.
 # The dashboard is the only thing that listens, and only on this machine's 127.0.0.1.
 x-common: &common
-  build: .
+  # GIT_COMMIT names the commit on every row the service writes. Build and start with:
+  #   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build
+  build:
+    context: .
+    args:
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
   image: whale-watcher
   restart: unless-stopped
   volumes:
