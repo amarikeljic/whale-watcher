@@ -197,6 +197,17 @@ fills. A price stamped before our fill (a quiet market's last trade) is not
 counted. The price series moves in one-minute steps, so the 1-minute figure is
 rough.
 
+*Exchange precision* (v2.1 Part 4 #7, `precision.py`). Paper fills use the
+amounts the venues accept. On Polymarket shares come in 0.01 steps at every tick
+size and the dollar amount is rounded the way the order docs say (up to 4 more
+decimals, then down to 3 to 6 depending on the tick). A buy never spends more
+than its stake: the shares rounded off come from the worst level. On Polymarket
+US contracts come in steps of the market's minimum (0.01, or whole contracts
+where the minimum is 1; the docs allow decimals only below a minimum of 1). The
+small wallet's stakes are whole cents, and its smallest order is rounded up to
+the cent so it always buys the market's minimum. The effect is a cent or less a
+trade: $10 at 0.44 buys 22.72 shares for $9.9968 instead of 22.727 for $10.
+
 *The book a second later* (v2.1 Part 4 #6). After each decision the runner reads
 the order book again (`bot.recheck_seconds`, 1 s) and records what the same
 order would have done on it: the best ask, the fill price or a miss. `stats` and

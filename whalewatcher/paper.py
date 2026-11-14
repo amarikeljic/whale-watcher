@@ -29,6 +29,7 @@ import logging
 from dataclasses import dataclass
 
 from .app import App
+from .precision import DEFAULT_AMOUNT_DECIMALS, SHARE_STEP, exact_ratio, floor_step, round_fills
 from .fees import fee_model
 from .polymarket import Book, MarketInfo
 
@@ -67,13 +68,29 @@ def walk_asks(book: Book, stake_usd: float, *, limit_price: float | None = None)
     return Walk(stake_usd / contracts, contracts, fills, len(fills))
 
 
+def rounded(walk: Walk | None, *, step: float = SHARE_STEP, decimals: int | None = DEFAULT_AMOUNT_DECIMALS,
+            ) -> Walk | None:
+    """``walk`` in the amounts the venue accepts (precision.py): whole steps of shares,
+    the dollar amount at its precision. None when less than one step is left."""
+    if walk is None:
+        return None
+    done = round_fills(walk.fills, step=step, decimals=decimals)
+    if done is None:
+        return None
+    fills, shares, amount = done
+    return Walk(exact_ratio(amount, shares), shares, fills, len(fills))
+
+
 def shadow_fill(price: float | None, stake: float, market: MarketInfo) -> tuple[float, float, float, float] | None:
-    """(price, contracts, fees, cost) for a hypothetical fill at one price."""
+    """(price, contracts, fees, cost) for a hypothetical fill at one price, in whole
+    0.01-share steps like a real one."""
     if price is None or not 0 < price < 1:
         return None
-    contracts = stake / price
+    contracts = floor_step(stake / price, SHARE_STEP)
+    if contracts <= 0:
+        return None
     fees = fee_model(VENUE)([(price, contracts)], market)
-    return price, contracts, fees, stake + fees
+    return price, contracts, fees, price * contracts + fees
 
 
 class PaperEngine:

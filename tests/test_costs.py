@@ -99,7 +99,7 @@ async def test_a_fill_records_its_rate_its_source_and_what_it_paid_beyond_the_be
     world.trade(WHALE, NOW - 3, COND, size=1300, price=0.50, usdc=650, feed=True)
     await monitor.poll_once()
     t = one(live_app)
-    second = 5 / 0.52                                           # $5 at 0.50, then $5 at 0.52
+    second = 9.61               # $5 at 0.50, then $5 at 0.52 = 9.615 shares, rounded down to a 0.01 step
     assert (t["fee_rate"], t["fee_source"]) == (0.05, "market")
     assert t["fees"] == pytest.approx(10 * 0.05 * 0.25 + round(second * 0.05 * 0.52 * 0.48, 5))
     assert t["slippage_cost"] == pytest.approx((t["fill_price"] - 0.50) * t["contracts"]), "paid beyond the best ask"
@@ -118,8 +118,8 @@ async def test_a_closed_trade_splits_into_gross_fees_slippage_and_net(live_app, 
 
     t = one(live_app)
     assert (t["fees"], t["cost"], t["pnl"]) == (before["fees"], before["cost"], before["pnl"]), "originals untouched"
-    shares = 10 + 5 / 0.52
-    assert t["pnl"] == pytest.approx(shares - 10 - t["fees"]), "net: payout minus stake minus fee"
+    shares = 10 + 9.61          # 19.615 shares, in 0.01 steps
+    assert t["pnl"] == pytest.approx(shares - (5 + 0.52 * 9.61) - t["fees"]), "net: payout minus cost minus fee"
     assert t["gross_pnl"] == pytest.approx(shares - shares * 0.50), "gross: the same shares bought at the best ask, no fee"
     assert t["gross_pnl"] == pytest.approx(t["pnl"] + t["fees"] + t["slippage_cost"])
     assert t["fees_recalc"] == pytest.approx(t["fees"]), "same rate: the recalculation is the fee charged, exactly"
@@ -128,8 +128,9 @@ async def test_a_closed_trade_splits_into_gross_fees_slippage_and_net(live_app, 
     c = costs.breakdown(live_app.db.query("SELECT * FROM bot_trades WHERE strategy = 'flat_hold'"))
     assert c.n == 1 and c.net == pytest.approx(c.gross - c.fees - c.slippage)
     text = render(live_app, with_breakdowns=False)
-    # 19.615 shares: gross 19.615 x (1 - 0.50) = 9.81; fees 0.245; slippage 9.615 x 0.02 = 0.19; net 9.37
-    assert "costs (n=1 closed): gross +$9.81 | fees -$0.24 | slippage -$0.19 | net +$9.37" in text
+    # 19.61 shares (19.615 in 0.01 steps): gross 19.61 x (1 - 0.50) = 9.805, printed 9.80; fees 0.24493;
+    # slippage 9.61 x 0.02 = 0.1922; net 9.805 - 0.24493 - 0.1922 = 9.36787
+    assert "costs (n=1 closed): gross +$9.80 | fees -$0.24 | slippage -$0.19 | net +$9.37" in text
     assert "are all net" in text
     assert costs.recalculate(live_app) == {"bot_trades": 0, "paper_trades": 0}, "nothing left to do the second time"
 

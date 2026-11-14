@@ -205,17 +205,18 @@ async def test_a_signal_is_filled_on_the_us_book_at_us_fees_beside_the_internati
     t = us_row(live_app)
     assert (t["status"], t["strategy"], t["us_slug"], t["us_side"], t["us_rule"]) == (
         "FILLED", "flat_hold", US_SLUG, "long", "game_winner")
-    shares = 10 + (10 - 4.4) / 0.45                                  # $4.40 at 0.44, the other $5.60 at 0.45
-    assert t["contracts"] == pytest.approx(shares) and t["fill_price"] == pytest.approx(10 / shares)
-    fee = round(0.095 * (10 * 0.44 * 0.56 + (5.6 / 0.45) * 0.45 * 0.55), 2)      # 0.095 x (2.464 + 3.08)
-    assert t["fees"] == fee == 0.53 and t["cost"] == pytest.approx(10 + fee)
+    # $4.40 at 0.44, the other $5.60 at 0.45 = 12.444 contracts: 22.44 in 0.01 steps (precision.py)
+    shares, spent = 22.44, 4.4 + 12.44 * 0.45
+    assert t["contracts"] == pytest.approx(shares) and t["fill_price"] == pytest.approx(spent / shares)
+    fee = round(0.095 * (10 * 0.44 * 0.56 + 12.44 * 0.45 * 0.55), 2)      # 0.095 x (2.464 + 3.079)
+    assert t["fees"] == fee == 0.53 and t["cost"] == pytest.approx(spent + fee)
     assert (t["fee_rate"], t["fee_source"]) == (0.095, "us")
     assert (t["best_ask"], t["intl_best_ask"]) == (0.44, 0.44) and t["price_gap"] == pytest.approx(0.0)
     assert t["limit_price"] == pytest.approx(0.45) and t["min_order_size"] == 0.01
     assert json.loads(t["asks_json"]) == [[0.44, 10.0], [0.45, 500.0]]
     base = live_app.db.one("SELECT * FROM bot_trades WHERE runner = 'single' AND strategy = 'flat_hold'")
     assert base["status"] == "FILLED" and base["fill_price"] == 0.44 and base["fees"] == pytest.approx(
-        0.05 * (10 / 0.44) * 0.44 * 0.56), "the international fill is untouched, and costs a third of the US fee"
+        round(0.05 * 22.72 * 0.44 * 0.56, 5)), "the international fill is untouched, and costs a third of the US fee"
     assert live_app.db.one("SELECT COUNT(*) n FROM bot_trades WHERE runner = 'us'")["n"] == 1, "one row a signal"
 
 
@@ -225,7 +226,8 @@ async def test_the_other_team_is_bought_as_a_short_against_the_bids(live_app, fa
     t = us_row(live_app)
     assert (t["status"], t["us_side"]) == ("FILLED", "short")
     assert t["fill_price"] == pytest.approx(0.56), "a bid of 0.44 on the Jaguars is 0.56 for the Titans"
-    assert t["contracts"] == pytest.approx(10 / 0.56) and t["fees"] == round(0.095 * (10 / 0.56) * 0.56 * 0.44, 2)
+    assert t["contracts"] == pytest.approx(17.85) and t["fees"] == round(0.095 * 17.85 * 0.56 * 0.44, 2), \
+        "10 / 0.56 = 17.857 contracts, in 0.01 steps"
 
 
 async def test_what_is_not_on_the_us_venue_is_skipped_and_counted(live_app, fake_http, clock):

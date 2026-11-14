@@ -468,7 +468,8 @@ class UsRowA:
 
     async def enter(self, alert: dict, market: MarketInfo | None, *, detected_at: float) -> str:
         """One ``us`` row for this signal. Returns its status."""
-        from .paper import walk_asks        # here, not at the top: paper imports app, which imports this module
+        from .paper import rounded, walk_asks   # here, not at the top: paper imports app, which imports this module
+        from .precision import SHARE_STEP
         app, bot = self.app, self.app.cfg.bot
         base = app.db.one("SELECT * FROM bot_trades WHERE runner = 'single' AND strategy = ? AND alert_id = ?",
                           (STRATEGY, alert["id"]))
@@ -521,6 +522,11 @@ class UsRowA:
                 return self._insert(alert, "MISSED", f"book too thin for ${stake:g}", **common)
             return self._insert(alert, "MISSED", f"price ran: filling ${stake:g} costs {free.vwap:.3f} a share, "
                                 f"limit {limit:.3f}", would_pay=free.vwap, **common)
+        # Contracts in steps of the market's minimum (precision.py); no amount rounding is documented.
+        walk = rounded(walk, step=us.min_qty or SHARE_STEP, decimals=None)
+        if walk is None:
+            return self._insert(alert, "MISSED", f"below the minimum order size ({us.min_qty or SHARE_STEP:g} "
+                                "contracts)", **common)
         if us.min_qty and walk.contracts < us.min_qty - 1e-9:
             return self._insert(alert, "MISSED", f"below the minimum order size ({walk.contracts:.2f} of "
                                 f"{us.min_qty:g} contracts)", **common)
@@ -545,8 +551,8 @@ class UsRowA:
             "status, reason, signal_ts, detected_at, decided_at, stake_usd, whale_price, best_ask, fill_price, "
             "contracts, fees, cost, levels, human_done, whale_shares, updated_at, fee_rate, fee_source, "
             "slippage_cost, skip_code, scheduled_end, days_to_close, asks_json, limit_price, min_order_size, "
-            "us_slug, us_side, us_rule, intl_best_ask, price_gap, us_rules, us_end_date, us_best_bid) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "us_slug, us_side, us_rule, intl_best_ask, price_gap, us_rules, us_end_date, us_best_bid, tick_size) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (RUNNER, STRATEGY, alert["id"], alert["wallet"], alert["condition_id"], alert["token_id"],
              self._event_key(alert), status, reason, signal_ts, detected_at, decided_at,
              min(bot.flat_hold.stake_usd, bot.flat_hold.max_stake_usd), whale, best,
@@ -558,7 +564,7 @@ class UsRowA:
              whale + bot.max_slippage if whale is not None else None, us.min_qty if us else None,
              us.slug if us else None, None if long is None else ("long" if long else "short"), rule, intl_ask,
              best - intl_ask if best is not None and intl_ask is not None else None,
-             us.description or None if us else None, us.end_date if us else None, us_bid))
+             us.description or None if us else None, us.end_date if us else None, us_bid, us.tick if us else None))
         return status
 
     def _event_key(self, alert: dict) -> str:

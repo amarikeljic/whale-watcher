@@ -48,7 +48,8 @@ from .bankroll import HEADLINE
 from .config import BOT_STRATEGIES, StrategyConfig
 from .fees import rate_for, taker_fee
 from .horizon import close_skip, days_to_close, resolution_type, scheduled_end
-from .paper import Walk, result_label, shadow_fill, walk_asks
+from .paper import Walk, result_label, rounded, shadow_fill, walk_asks
+from .precision import SHARE_STEP, amount_decimals, floor_step
 from .polymarket import Book, MarketInfo
 from .timeutil import start_of_day
 
@@ -198,6 +199,10 @@ class Bot:
                 return Decision("MISSED", f"book too thin for ${stake:g}")
             return Decision("MISSED", f"price ran: filling ${stake:g} costs {free.vwap:.3f} a share, "
                                       f"limit {limit_price:.3f}", would_pay=free.vwap)
+        # In the amounts Polymarket accepts: shares in 0.01 steps, the amount at its precision.
+        walk = rounded(walk, decimals=amount_decimals(book.tick_size))
+        if walk is None:
+            return Decision("MISSED", f"below the minimum order size (less than {SHARE_STEP:g} share)")
         if book.min_order_size and walk.contracts < book.min_order_size - 1e-9:
             return Decision("MISSED", f"below the minimum order size ({walk.contracts:.1f} of "
                                       f"{book.min_order_size:g} shares)")
@@ -268,8 +273,8 @@ class Bot:
             "status, reason, signal_ts, detected_at, decided_at, due_at, stake_usd, whale_price, best_ask, "
             "fill_price, contracts, fees, cost, levels, zero_price, zero_contracts, zero_cost, human_due, "
             "human_done, whale_shares, updated_at, fee_rate, fee_source, slippage_cost, skip_code, "
-            "scheduled_end, days_to_close, asks_json, limit_price, min_order_size) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "scheduled_end, days_to_close, asks_json, limit_price, min_order_size, tick_size) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.runner, strategy, alert["id"], alert["wallet"], alert["condition_id"], alert["token_id"], event_key,
              status, reason, signal_ts, detected_at, decided_at, due_at, stake, whale_price,
              book.best_ask if book else None,
@@ -283,7 +288,7 @@ class Bot:
              # The asks as they were, so an order of any size can be priced later (bankroll.py).
              json.dumps([[lv.price, lv.size] for lv in book.asks[:BOOK_LEVELS_KEPT]]) if book and book.asks else None,
              whale_price + self.cfg.max_slippage if strategy != "placebo_late" and whale_price is not None else None,
-             book.min_order_size if book else None))
+             book.min_order_size if book else None, book.tick_size if book else None))
 
     def set_whale_position(self, alert_id: int, shares: float | None) -> None:
         """What the whale held in the outcome when we entered: the base for mirror exits."""
@@ -322,7 +327,9 @@ class Bot:
                     log.warning("exit book for %s failed: %s", t["token_id"], exc)
                     continue
             book = books[t["token_id"]]
-            walk = walk_bids(book, t["contracts"]) if book is not None else None
+            # Only whole 0.01-share steps can be sold; a fraction below that (under a cent) is dropped.
+            walk = (rounded(walk_bids(book, floor_step(t["contracts"], SHARE_STEP)),
+                            decimals=amount_decimals(book.tick_size)) if book is not None else None)
             if walk is None:
                 # No book (the market closed) or bids too thin for the whole position:
                 # keep trying; if it resolves first it settles like a held position.
@@ -459,7 +466,8 @@ class Bot:
             book = books[t["token_id"]]
             price = contracts = cost = None
             open_market = market is not None and not (market.closed or market.resolved or market.accepting_orders is False)
-            walk = walk_asks(book, t["stake_usd"]) if book is not None and open_market else None
+            walk = (rounded(walk_asks(book, t["stake_usd"]), decimals=amount_decimals(book.tick_size))
+                    if book is not None and open_market else None)
             if walk is not None and not (t["best_ask"] is not None
                                          and walk.vwap - t["best_ask"] > app.cfg.paper.max_slippage + 1e-9):
                 fees = taker_fee(walk.fills, rate_for(market, app.clock())[0], market.fee_exponent or 1.0)

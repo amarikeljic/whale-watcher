@@ -141,22 +141,26 @@ def test_the_wallet_page_replays_the_fixture_to_the_hand_checked_equity(site):
     (table rates: sports 0.05, politics 0.04, crypto 0.07; a share costs 0.5125 / 0.51 / 0.5175).
     An open position is worth its shares at the price paid, so the fee is gone at once.
 
-      start                                                        cash  98.5000
-      6 days ago  sports, wins     stake 7.8800  15.3756 shares -> cash 105.9956
-      5 days ago  sports, loses    stake 8.4796                 -> cash  97.5160
-      4 days ago  politics         stake 7.8013  15.2966 shares    equity 97.3630 (fee 0.1530 gone)
-      4 days ago  politics         stake 7.7890  15.2726 shares    equity 97.2103
-      3 days ago  crypto, loses    stake 7.7768                 -> equity 89.4334 (the low)
+    Stakes are whole cents and shares come in 0.01 steps (precision.py); the fee is
+    rounded to 5 decimals. "Spent" is the shares at 0.50 plus the fee.
+
+      start                                                                  cash  98.50000
+      6 days ago  sports, wins     stake 7.88  15.37 shares, spent 7.87713 -> cash 105.99287
+      5 days ago  sports, loses    stake 8.47  16.52 shares, spent 8.46650 -> cash  97.52637
+      4 days ago  politics         stake 7.80  15.29 shares, spent 7.79790    equity 97.37347 (fee 0.1529 gone)
+      4 days ago  politics         stake 7.78  15.25 shares, spent 7.77750    equity 97.22097
+      3 days ago  crypto, loses    stake 7.77  15.01 shares, spent 7.76768 -> equity 89.45329 (the low)
       2 days ago  30 days to close: skipped (too_long). Another did not fill.
-      1 day ago   both politics win, +30.5692                   -> cash 104.7181
-      1 day ago   a signal the $10 strategy skipped: taken at the best ask, stake 8.3774, 16.3462 shares
+      1 day ago   both politics win, +30.54                                -> cash 104.72329
+      1 day ago   a signal the $10 strategy skipped: taken at the best ask, stake 8.37, 16.33 shares,
+                  spent 8.36913
       1 day ago   40 days to close: skipped (too_long)
-      now         cash 96.3406 + 16.3462 shares at 0.50 = equity 104.5137
+      now         cash 96.35416 + 16.33 shares at 0.50 = equity 104.51916
     """
     html = site("/bankroll")
     assert "$100.00 wallet" in html and "Replay of every signal" in html
-    assert "$104.51" in html and "cash $96.34 free" in html and "+4.5%" in html
-    assert "$16.56" in html and "15.6% below the high before it" in html, "from 105.9956 down to 89.4334"
+    assert "$104.52" in html and "cash $96.35 free" in html and "+4.5%" in html
+    assert "$16.54" in html and "15.6% below the high before it" in html, "from 105.99287 down to 89.45329"
     assert "6 / 2" in html and "of 9 signals · 1 did not fill" in html
     assert "3 won · 1 open" in html
     assert "Not enough data: 5 settled wallet trades (need at least 30)" in html
@@ -186,7 +190,8 @@ def test_the_wallet_page_follows_the_saved_amount_and_shows_runs(site):
     bankroll.save_amount(db, 1000, "cli", NOW - 60)
     db.close()
     html = site("/bankroll")
-    assert "$1,000.00 wallet" in html and "$1,045.14" in html, "ten times the wallet, the same path"
+    assert "$1,000.00 wallet" in html and "$1,045.15" in html, \
+        "ten times the wallet, nearly the same path: whole cents and 0.01-share steps do not scale"
     assert "6 of 6 fills are priced from a smaller order" in html, "$80 stakes priced at what $10 paid"
     assert "Live wallet" in html and "Run #1: $100.00 from" in html
     assert "The amount was changed: the runner will end this run shortly." in html

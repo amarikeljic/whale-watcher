@@ -85,7 +85,8 @@ async def test_a_whale_buy_is_filled_from_the_book_at_detection(live_app, fake_h
     t = one(live_app, "flat_hold")
     assert t["status"] == "FILLED" and t["runner"] == "single" and t["wallet"] == WHALE
     assert (t["fill_price"], t["stake_usd"], t["levels"]) == (0.44, 10.0, 1)
-    assert t["contracts"] == pytest.approx(10 / 0.44) and t["cost"] == pytest.approx(10.0)
+    # Shares come in 0.01 steps (precision.py): 10 / 0.44 = 22.727 buys 22.72 shares for $9.9968.
+    assert t["contracts"] == 22.72 and t["cost"] == pytest.approx(0.44 * 22.72)
     assert (t["signal_ts"], t["detected_at"], t["decided_at"]) == (NOW - 3, float(NOW), float(NOW))
     assert (t["whale_price"], t["best_ask"]) == (0.42, 0.44)
     alert = live_app.db.one("SELECT * FROM alerts")
@@ -101,10 +102,10 @@ async def test_fees_are_charged_per_level_on_the_way_in(live_app, fake_http, clo
     world.trade(WHALE, NOW - 3, COND, size=1300, price=0.50, usdc=650, feed=True)
     await monitor.poll_once()
     t = one(live_app, "flat_hold")
-    second = (10 - 5) / 0.52
+    second = 9.61          # (10 - 5) / 0.52 = 9.615 shares, rounded down to a 0.01 step
     expected = round(10 * 0.05 * 0.5 * 0.5, 5) + round(second * 0.05 * 0.52 * 0.48, 5)
     assert t["levels"] == 2 and t["fees"] == pytest.approx(expected)
-    assert t["cost"] == pytest.approx(10 + expected), "cost = stake + taker fees"
+    assert t["cost"] == pytest.approx(5 + 0.52 * second + expected), "cost = the shares bought + taker fees"
 
 
 # -- missed -------------------------------------------------------------------------------
@@ -157,8 +158,8 @@ async def test_market_exposure_is_capped_and_the_skip_is_recorded_with_its_reaso
         await buy(world, monitor, clock)
     statuses = [(t["status"], t["reason"]) for t in trades(live_app, "flat_hold")]
     assert statuses[:2] == [("FILLED", None), ("FILLED", None)]
-    assert statuses[2] == ("SKIPPED", "market exposure: $20.00 open in this market, limit $25")
-    assert bot.exposure("flat_hold", "condition_id", COND) == pytest.approx(20)
+    assert statuses[2] == ("SKIPPED", "market exposure: $19.99 open in this market, limit $25")
+    assert bot.exposure("flat_hold", "condition_id", COND) == pytest.approx(2 * 0.44 * 22.72), "two $9.9968 fills"
 
 
 async def test_event_exposure_counts_every_market_of_the_event(live_app, fake_http, clock):
@@ -183,9 +184,9 @@ async def test_the_bankroll_runs_out_and_each_strategy_has_its_own(live_app, fak
     first, second = trades(live_app, "flat_hold")
     assert (second["status"], second["reason"]) == ("SKIPPED", "bankroll: $5.00 free, stake $10.00")
     acct = bot.account("flat_hold")
-    assert (acct.starting, acct.open_cost, acct.cash) == (15, pytest.approx(10), pytest.approx(5))
+    assert (acct.starting, acct.open_cost, acct.cash) == (15, pytest.approx(9.9968), pytest.approx(5.0032))
     mirror = bot.account("flat_mirror")
-    assert mirror.cash == pytest.approx(1000 - 20), "flat_mirror's account is untouched by flat_hold's"
+    assert mirror.cash == pytest.approx(1000 - 2 * 9.9968), "flat_mirror's account is untouched by flat_hold's"
     assert [t["status"] for t in trades(live_app, "flat_mirror")] == ["FILLED", "FILLED"]
 
 
@@ -195,7 +196,7 @@ async def test_a_daily_loss_pauses_new_entries_until_the_next_utc_day(live_app, 
     await buy(world, monitor, clock)
     world.markets[COND].resolved_at, world.markets[COND].payouts = clock.now + 60, [0.0, 1.0]     # YES loses
     clock.advance(700)
-    assert await bot.settle() >= 1 and bot.account("flat_hold").today == pytest.approx(-10)
+    assert await bot.settle() >= 1 and bot.account("flat_hold").today == pytest.approx(-9.9968)
 
     world.add_market(FakeMarket("0xn", end_date=NOW + 30 * DAY))
     world.set_book("0xn-t0", [(0.44, 1000)], [(0.42, 500)])
@@ -286,7 +287,7 @@ async def test_zero_latency_and_the_old_human_delay_rule_ride_along_as_columns(l
     world.trade(WHALE, NOW - 3, COND, size=1500, price=0.42, usdc=630, feed=True)
     await monitor.poll_once()
     t = one(live_app, "flat_hold")
-    assert t["zero_price"] == 0.42 and t["zero_contracts"] == pytest.approx(10 / 0.42)
+    assert t["zero_price"] == 0.42 and t["zero_contracts"] == pytest.approx(23.80), "10 / 0.42 in 0.01 steps"
     assert t["human_due"] == NOW + 60 and t["human_done"] == 0 and t["human_price"] is None
 
     world.set_book(YES, [(0.46, 1000)], [(0.44, 500)])          # a minute later the ask has moved
@@ -294,15 +295,15 @@ async def test_zero_latency_and_the_old_human_delay_rule_ride_along_as_columns(l
     await monitor.poll_once()
     t = one(live_app, "flat_hold")
     assert t["human_done"] == 1 and t["human_price"] == pytest.approx(0.46)
-    assert t["human_contracts"] == pytest.approx(10 / 0.46)
+    assert t["human_contracts"] == pytest.approx(21.73), "10 / 0.46 = 21.739, in 0.01 steps"
 
     world.markets[COND].resolved_at, world.markets[COND].payouts = clock.now + 60, [1.0, 0.0]
     clock.advance(700)
     await bot.settle()
     t = one(live_app, "flat_hold")
     assert t["result"] == "WIN" and t["payout_per_share"] == 1.0 and t["closed_at"] == clock.now
-    assert t["pnl"] == pytest.approx(10 / 0.44 - 10)
-    assert t["zero_pnl"] == pytest.approx(10 / 0.42 - 10) and t["human_pnl"] == pytest.approx(10 / 0.46 - 10)
+    assert t["pnl"] == pytest.approx(22.72 - 0.44 * 22.72)
+    assert t["zero_pnl"] == pytest.approx(23.80 - 0.42 * 23.80) and t["human_pnl"] == pytest.approx(21.73 - 0.46 * 21.73)
     assert t["zero_pnl"] > t["pnl"] > t["human_pnl"], "the whale's price beats the bot's, which beats a minute later"
     assert bot.account("flat_hold").realized == pytest.approx(t["pnl"])
     assert one(live_app, "flat_mirror")["zero_pnl"] is None, "comparison columns are for the hold strategies"
@@ -319,7 +320,7 @@ async def test_a_missed_signal_still_settles_its_comparisons_and_counts_as_zero(
     await bot.settle()
     t = one(live_app, "flat_hold")
     assert t["status"] == "MISSED" and t["pnl"] == 0.0 and t["result"] is None
-    assert t["zero_pnl"] == pytest.approx(10 / 0.42 - 10) and t["human_pnl"] == pytest.approx(10 / 0.50 - 10)
+    assert t["zero_pnl"] == pytest.approx(23.80 - 0.42 * 23.80) and t["human_pnl"] == pytest.approx(10 / 0.50 - 10)
 
 
 # -- the placebo -------------------------------------------------------------------------------
@@ -342,7 +343,7 @@ async def test_the_placebo_enters_the_same_outcome_later_at_whatever_the_book_sa
     p = one(live_app, "placebo_late")
     assert p["status"] == "FILLED" and p["fill_price"] == 0.60 and p["decided_at"] == float(clock.now)
     assert p["token_id"] == YES and p["stake_usd"] == one(live_app, "flat_hold")["stake_usd"]
-    assert bot.account("placebo_late").open_cost == pytest.approx(10)
+    assert bot.account("placebo_late").open_cost == pytest.approx(0.60 * 16.66), "10 / 0.60 in 0.01 steps"
 
 
 # -- restarts, and the old paper trades ------------------------------------------------------------
@@ -410,9 +411,9 @@ async def test_stats_put_the_bot_first_and_keep_the_old_rule_as_its_own_section(
     assert "NOT ENOUGH DATA TO DRAW CONCLUSIONS YET: 1 closed bot paper trades (flat_hold, model 1)" in text
     assert "== single / flat_hold (bot fill at detection, held to resolution; the headline) ==" in text
     assert "signals 1 | filled 1 | missed 0 | skipped 0 | waiting 0 | closed 1 | open 0" in text
-    assert "paper bankroll $1,012.73 (started $1,000.00)" in text
+    assert "paper bankroll $1,012.72 (started $1,000.00)" in text, "22.72 shares paid $1 for $9.9968"
     assert "n=1 closed" in text and "95% CI" in text, "no profit figure without its n and interval"
-    assert "same 1 closed signals, same stake, a miss counted as $0: bot +$12.73 | zero latency" in text
+    assert "same 1 closed signals, same stake, a miss counted as $0: bot +$12.72 | zero latency" in text
     assert "DETECTION DELAY (whale's fill -> our detector saw it), n=1 alerts: median 3.0s" in text
     assert "1 from the global feed, 0 that only the per-wallet backstop saw" in text
     assert "polymarket / hold_to_resolution" in text and "By watchlist status (flat_hold):" in text

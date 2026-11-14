@@ -54,6 +54,8 @@ from .config import BankrollConfig, Config, FiltersConfig
 from .fees import polymarket_taker_fee, rate_for, taker_fee
 from .horizon import close_skip
 from .polymarket import MarketInfo
+from .precision import (DEFAULT_AMOUNT_DECIMALS, SHARE_STEP, amount_decimals, ceil_cents, exact_ratio, floor_cents,
+                        floor_step, round_fills)
 from .timeutil import iso
 from .version import MODEL_VERSION
 from .version import label as model_label
@@ -200,6 +202,10 @@ class Signal:
     wallet: str | None = None
     question: str = ""
     venue_skip: str | None = None    # the market is not on this venue at all (Polymarket US rows): not_on_us, ...
+    # Part 4 #7, the venue's precision (precision.py): shares in steps of share_step, the
+    # amount at amount_decimals (None: not rounded, Polymarket US documents no rule).
+    share_step: float = SHARE_STEP
+    amount_decimals: int | None = DEFAULT_AMOUNT_DECIMALS
 
 
 # Skips that say the bet does not exist on the venue (polymarket_us.py). A wallet on that
@@ -370,9 +376,12 @@ def price_order(sig: Signal, budget: float) -> tuple[float, float, float, bool] 
             if deep + 1e-9 >= budget and limit is not None:
                 return f"price ran: ${budget:,.2f} does not fill at or below the limit {limit:.3f}"
             return f"book too thin for ${budget:,.2f}"
-        contracts = sum(s for _, s in fills)
+        done = round_fills(fills, step=sig.share_step, decimals=sig.amount_decimals)
+        if done is None:        # less than one step of shares: the minimum-order check skips it
+            return fills[0][0], 0.0, 0.0, False
+        fills, contracts, amount = done
         fee = taker_fee(fills, rate, exp)
-        return sum(p * s for p, s in fills) / contracts, contracts, fee, False
+        return exact_ratio(amount, contracts), contracts, fee, False
     if sig.base_status == "MISSED":
         return sig.base_reason or "the fixed-stake order did not fill"
     price = sig.price
@@ -380,7 +389,7 @@ def price_order(sig: Signal, budget: float) -> tuple[float, float, float, bool] 
         return "no price was recorded for this signal"
     if limit is not None and price > limit + 1e-12:
         return f"price ran: {price:.3f} against the limit {limit:.3f}"
-    contracts = budget / (price + _fee_per_share(price, rate, exp))
+    contracts = floor_step(budget / (price + _fee_per_share(price, rate, exp)), sig.share_step)
     fee = polymarket_taker_fee(contracts, price, rate, exp)
     # A $10 order paid this price. A smaller one would pay it or less. A larger one, or
     # an order where no fill was ever made, may not have found the depth.
@@ -455,9 +464,9 @@ class Evidence:
             why = (f"edge {edge:+.1%} a dollar after {self.n} settled signals: {p.kelly_fraction:g} of Kelly "
                    f"({kelly:.1%}) is {fraction:.1%} of equity")
         stake = min(equity * fraction, ceiling)
-        # The smallest order the venue takes: the market's minimum shares, a hair over
-        # so that rounding in the fill cannot leave it short.
-        floor = max(p.min_order_usd, sig.min_shares * cost * 1.0005) if cost is not None else p.min_order_usd
+        # The smallest order the venue takes: the market's minimum shares, rounded UP to the
+        # cent, so that whole-cent stakes and 0.01-share steps cannot leave it short.
+        floor = max(p.min_order_usd, ceil_cents(sig.min_shares * cost)) if cost is not None else p.min_order_usd
         if fraction <= 0 and p.no_edge_stake == "none":
             return 0.0, f"{NO_EDGE}: {why}"
         if stake < floor:
@@ -526,9 +535,10 @@ def run(signals: list[Signal], params: Params, *, marks: Marks | None = None, st
         if cash < params.min_order_usd:
             entry.code, entry.reason = NO_CASH, f"{NO_CASH}: ${cash:,.2f} free, the smallest order is ${params.min_order_usd:g}"
             continue
-        stake = min(equity * params.stake_fraction, cash)
+        stake = floor_cents(min(equity * params.stake_fraction, cash))     # an order is in whole cents
         if evidence is not None:
             stake, entry.sizing = evidence.stake(sig, equity, cash)
+            stake = floor_cents(stake)
             if entry.sizing.startswith(NO_EDGE):
                 entry.code, entry.reason = NO_EDGE, entry.sizing
                 continue
@@ -552,9 +562,11 @@ def run(signals: list[Signal], params: Params, *, marks: Marks | None = None, st
             entry.reason = (f"{BELOW_MINIMUM}: ${stake:,.2f} buys {contracts:.2f} shares at {price:.3f}, the market's "
                             f"smallest order is {sig.min_shares:g}")
             continue
-        entry.status, entry.stake, entry.price, entry.contracts, entry.fee = TAKEN, stake, price, contracts, fee
+        # What the shares cost, which rounding can leave a cent or so under the stake.
+        spent = min(stake, price * contracts + fee)
+        entry.status, entry.stake, entry.price, entry.contracts, entry.fee = TAKEN, spent, price, contracts, fee
         entry.optimistic = optimistic
-        cash -= stake
+        cash -= spent
         open_.append(entry)
         point(sig.ts)
     end = as_of if as_of is not None else float("inf")
@@ -616,7 +628,9 @@ def signal_of(rec: dict, cfg: Config) -> Signal | None:
         min_shares=rec.get("min_order_size") or DEFAULT_MIN_SHARES, fee_rate=rate, fee_exponent=exp,
         scheduled_end=rec.get("scheduled_end"), settle_ts=settle_ts if payout is not None else None, payout=payout,
         wallet=rec.get("wallet"), question=rec.get("question") or "",
-        venue_skip=rec.get("skip_code") if rec.get("skip_code") in SIGNAL_SKIPS else None)
+        venue_skip=rec.get("skip_code") if rec.get("skip_code") in SIGNAL_SKIPS else None,
+        share_step=(rec.get("min_order_size") or SHARE_STEP) if rec.get("runner") == "us" else SHARE_STEP,
+        amount_decimals=None if rec.get("runner") == "us" else amount_decimals(rec.get("tick_size")))
 
 
 def source_key(rec: dict) -> str | None:

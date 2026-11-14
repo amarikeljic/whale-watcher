@@ -618,6 +618,8 @@ ADDED_COLUMNS += (
     # Part 4 #13: normal | fifty_fifty | delayed | disputed, for a trade settled by resolution
     (11, "bot_trades", "resolution_type", "TEXT"),
     (11, "poly_markets", "uma_statuses", "TEXT"),    # Gamma's umaResolutionStatuses: the UMA history, JSON list
+    # Part 4 #7: the tick size of the book a signal was decided on: it sets the amount precision
+    (11, "bot_trades", "tick_size", "REAL"),
 )
 
 

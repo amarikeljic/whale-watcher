@@ -62,34 +62,34 @@ def fixture() -> list[Signal]:
 
 
 def test_a_replay_matches_the_hand_calculation():
-    """$100, 1.5% on-ramp, no fees, stake = 8% of equity.
+    """$100, 1.5% on-ramp, no fees, stake = 8% of equity, rounded down to the cent.
 
       start                      cash 98.50                 equity  98.50
       t=100  buy #1 at 0.50      stake 7.88   15.76 shares  cash 90.62
       t=200  buy #2 at 0.40      stake 7.88   19.70 shares  cash 82.74
       t=1000 #1 wins             +15.76                     cash 98.50   equity 106.38
-      t=1100 buy #3 at 0.50      stake 8.5104 (8% of 106.38) cash 89.9896
-      t=1500 #2 loses            +0                         cash 89.9896 equity  98.50
-      t=1600 buy #4 at 0.50      stake 7.88   (8% of 98.50) cash 82.1096
-      t=2000 #3 wins             +17.0208                   cash 99.1304 equity 107.0104
+      t=1100 buy #3 at 0.50      stake 8.51   (8% of 106.38 = 8.5104, to the cent) 17.02 shares  cash 89.99
+      t=1500 #2 loses            +0                         cash 89.99   equity  98.50
+      t=1600 buy #4 at 0.50      stake 7.88   (8% of 98.50) cash 82.11
+      t=2000 #3 wins             +17.02                     cash 99.13   equity 107.01
     """
     res = run(fixture(), Params(amount=100.0, onramp_cost_pct=1.5), as_of=3000)
     one, two, three, four = res.entries
     assert [e.status for e in res.entries] == ["TAKEN"] * 4
     assert (one.stake, one.contracts) == (pytest.approx(7.88), pytest.approx(15.76))
     assert (two.stake, two.contracts) == (pytest.approx(7.88), pytest.approx(19.70))
-    assert three.equity == pytest.approx(106.38) and three.stake == pytest.approx(8.5104), "a win makes the next stake bigger"
+    assert three.equity == pytest.approx(106.38) and three.stake == pytest.approx(8.51), "a win makes the next stake bigger"
     assert four.equity == pytest.approx(98.50) and four.stake == pytest.approx(7.88), "a loss makes it smaller"
     assert (one.proceeds, two.proceeds, three.proceeds, four.proceeds) == (
-        pytest.approx(15.76), 0.0, pytest.approx(17.0208), None)
-    assert (one.pnl, two.pnl, three.pnl) == (pytest.approx(7.88), pytest.approx(-7.88), pytest.approx(8.5104))
-    assert res.cash == pytest.approx(99.1304) and res.equity == pytest.approx(107.0104)
-    assert res.total_return == pytest.approx(0.070104)
+        pytest.approx(15.76), 0.0, pytest.approx(17.02), None)
+    assert (one.pnl, two.pnl, three.pnl) == (pytest.approx(7.88), pytest.approx(-7.88), pytest.approx(8.51))
+    assert res.cash == pytest.approx(99.13) and res.equity == pytest.approx(107.01)
+    assert res.total_return == pytest.approx(0.0701)
     dd, dd_pct = res.drawdown()
     assert dd == pytest.approx(7.88) and dd_pct == pytest.approx(7.88 / 106.38), "from 106.38 to 98.50 when #2 lost"
     s = res.summary()
     assert (s["taken"], s["settled"], s["wins"], s["open"], s["missed"], s["skipped"]) == (4, 3, 2, 1, 0, {})
-    assert [round(p.equity, 4) for p in res.curve] == [98.5, 98.5, 98.5, 106.38, 106.38, 98.5, 98.5, 107.0104, 107.0104]
+    assert [round(p.equity, 4) for p in res.curve] == [98.5, 98.5, 98.5, 106.38, 106.38, 98.5, 98.5, 107.01, 107.01]
     assert res.curve[-1].tied == pytest.approx(7.88), "the open position is the money tied up"
 
 
@@ -118,17 +118,18 @@ def test_a_run_counts_only_signals_from_its_start():
 # -- fees ---------------------------------------------------------------------------------------------
 
 
-def test_the_fee_comes_out_of_the_stake_so_cash_falls_by_exactly_the_stake():
+def test_the_fee_comes_out_of_the_stake_so_cash_falls_by_what_was_spent():
     """8.00 all-in at 0.50 with a 0.05 rate: a share costs 0.50 + 0.05 x 0.25 = 0.5125,
-    so 15.6098 shares, of which the fee is 15.6098 x 0.0125 = 0.19512."""
+    so 15.6098 shares, 15.60 in 0.01 steps (precision.py). They cost 7.80 and the fee is
+    15.60 x 0.0125 = 0.195: 7.995 spent, half a cent of the stake left in cash."""
     res = run([sig(1, 100, 0.50, settle=500, payout=1.0, fee_rate=0.05)], PLAIN, as_of=600)
     (e,) = res.entries
-    assert e.stake == pytest.approx(8.0) and e.contracts == pytest.approx(8 / 0.5125)
-    assert e.fee == pytest.approx(0.19512, abs=1e-5) and res.fees == e.fee
-    assert res.curve[1].cash == pytest.approx(92.0), "cash fell by the stake, fee included"
-    assert e.pnl == pytest.approx(8 / 0.5125 - 8.0), "the fee is why this is 7.61 and not 8.00"
+    assert e.stake == pytest.approx(7.995) and e.contracts == pytest.approx(15.60)
+    assert e.fee == pytest.approx(0.195, abs=1e-5) and res.fees == e.fee
+    assert res.curve[1].cash == pytest.approx(92.005), "cash fell by what was spent, fee included"
+    assert e.pnl == pytest.approx(15.60 - 7.995), "the fee is why this is 7.61 and not 8.00"
     free = run([sig(1, 100, 0.50, settle=500, payout=1.0)], PLAIN, as_of=600)
-    assert free.equity - res.equity == pytest.approx(16.0 - 8 / 0.5125), "the fee bought fewer shares"
+    assert free.equity - res.equity == pytest.approx((92.0 + 16.0) - (92.005 + 15.60)), "the fee bought fewer shares"
 
 
 # -- every skip reason --------------------------------------------------------------------------------
@@ -204,8 +205,8 @@ def test_with_the_book_stored_the_stake_is_walked_through_its_levels():
     book = [(0.50, 10.0), (0.52, 100.0)]
     res = run([sig(1, 100, 0.50, asks=book, limit_price=0.53)], PLAIN)
     (e,) = res.entries
-    assert e.contracts == pytest.approx(10 + 3 / 0.52), "$5 at 0.50, then the other $3 at 0.52"
-    assert e.price == pytest.approx(8 / (10 + 3 / 0.52)) and e.optimistic is False
+    assert e.contracts == pytest.approx(15.76), "$5 at 0.50, then the other $3 at 0.52: 15.769, in 0.01 steps"
+    assert e.price == pytest.approx((5 + 0.52 * 5.76) / 15.76) and e.optimistic is False
     ran = run([sig(1, 100, 0.50, asks=book, limit_price=0.51)], PLAIN).entries[0]
     assert ran.status == "MISSED" and ran.reason.startswith("price ran: $8.00 does not fill at or below the limit 0.510")
     thin = run([sig(1, 100, 0.50, asks=[(0.50, 4.0)], limit_price=0.53)], PLAIN).entries[0]
@@ -344,8 +345,9 @@ async def test_the_wallet_prices_its_own_stake_from_the_stored_book(live_app, fa
     await whale_buy(live_app, fake_http, asks=((0.44, 12), (0.45, 1000)))
     res = wallet_of(live_app)
     (e,) = res.entries
-    assert e.status == "TAKEN" and e.stake == pytest.approx(7.88) and e.optimistic is False
-    assert e.contracts == pytest.approx(12 + (7.88 - 12 * 0.44) / 0.45), "12 shares at 0.44, the rest at 0.45"
+    # 12 shares at 0.44, the rest of $7.88 at 0.45: 17.778 shares, 17.77 in 0.01 steps, for $7.8765
+    assert e.status == "TAKEN" and e.stake == pytest.approx(12 * 0.44 + 5.77 * 0.45) and e.optimistic is False
+    assert e.contracts == pytest.approx(17.77)
     big = run(br.signals_by_source(__import__("whalewatcher.stats", fromlist=["x"]).load_bot_trades(live_app),
                                    live_app.cfg)["bot:single"], Params.of(live_app.cfg, 100_000.0))
     assert big.entries[0].status == "MISSED" and big.entries[0].reason == "book too thin for $7,880.00", \
@@ -358,12 +360,12 @@ async def test_open_positions_are_marked_at_the_best_bid_every_few_minutes(live_
     assert live_app.db.one("SELECT COUNT(*) n FROM position_marks")["n"] == 1, "marked on the first tick after the fill"
     assert (await bot.tick()).get("marks") is None, "and not again until the interval has passed"
     at_cost = wallet_of(live_app)
-    shares = at_cost.entries[0].contracts
-    assert at_cost.equity == pytest.approx(98.5 - 7.88 + shares * 0.42), "worth what it would sell for: the bid, 0.42"
+    shares, spent = at_cost.entries[0].contracts, at_cost.entries[0].stake
+    assert at_cost.equity == pytest.approx(98.5 - spent + shares * 0.42), "worth what it would sell for: the bid, 0.42"
     clock.advance(301)
     world.set_book(YES, [(0.52, 1000)], [(0.50, 500)])
     assert (await bot.tick())["marks"] == 1
-    assert wallet_of(live_app).equity == pytest.approx(98.5 - 7.88 + shares * 0.50)
+    assert wallet_of(live_app).equity == pytest.approx(98.5 - spent + shares * 0.50)
     world.set_book(YES, [(0.99, 10)], [])
     clock.advance(301)
     assert (await bot.tick())["marks"] == 0, "no bids: nothing recorded, the last mark stands"
@@ -470,8 +472,8 @@ def test_with_no_edge_shown_the_automatic_stake_is_nothing():
 def test_or_the_smallest_order_the_venue_takes_when_told_to_probe():
     res = run([sig(1, T + 1, 0.50)], auto(no_edge_stake="smallest"), start=T)
     (e,) = res.entries
-    assert e.status == "TAKEN" and e.stake == pytest.approx(5 * 0.50 * 1.0005), "5 shares, a hair over"
-    assert e.contracts == pytest.approx(5.0025) and e.sizing.endswith("; the smallest order")
+    assert e.status == "TAKEN" and e.stake == pytest.approx(2.50), "5 shares at 50 cents, rounded up to the cent"
+    assert e.contracts == pytest.approx(5.0) and e.sizing.endswith("; the smallest order")
     tiny = run([sig(1, T + 1, 0.90)], auto(no_edge_stake="smallest", amount=50.0), start=T).entries[0]
     assert tiny.code == "below_minimum", "5 shares at 90 cents is $4.50: more than 8% of a $50 wallet"
 
@@ -483,14 +485,14 @@ def test_a_shown_edge_is_staked_at_a_fraction_of_kelly():
     Kelly for a share at cost c paying $1 is c x edge / (1 - c)."""
     past = history(30, 10)
     even = run(past + [sig(1, T + 1, 0.50)], auto(), start=T).entries[0]
-    assert even.status == "TAKEN" and even.stake == pytest.approx(100 * 0.1 * 0.361325, rel=1e-5), \
-        "at 50 cents Kelly is the edge itself: 36.1%, and a tenth of that is 3.61% of equity"
+    assert even.status == "TAKEN" and even.stake == pytest.approx(3.61), \
+        "at 50 cents Kelly is the edge itself: 36.1%, and a tenth of that is 3.61% of equity ($3.613, to the cent)"
     assert "edge +36.1% a dollar after 40 settled signals: 0.1 of Kelly (36.1%) is 3.6% of equity" in even.sizing
     favourite = run(past + [sig(1, T + 1, 0.80)], auto(), start=T).entries[0]
     assert favourite.stake == pytest.approx(8.0), "0.8 x 0.3613 / 0.2 = 145%: capped at the fixed 8%"
     longshot = run(past + [sig(1, T + 1, 0.20)], auto(), start=T).entries[0]
-    assert longshot.stake == pytest.approx(5 * 0.20 * 1.0005), \
-        "0.2 x 0.3613 / 0.8 = 9.0% Kelly, 0.9% of equity is 90 cents: raised to the smallest order"
+    assert longshot.stake == pytest.approx(1.00), \
+        "0.2 x 0.3613 / 0.8 = 9.0% Kelly, 0.9% of equity is 90 cents: raised to the smallest order, 5 x 0.20"
 
 
 def test_the_bar_for_an_edge_is_the_number_of_signals_and_the_standard_errors():
@@ -498,7 +500,7 @@ def test_the_bar_for_an_edge_is_the_number_of_signals_and_the_standard_errors():
     assert run(past + [sig(1, T + 1)], auto(min_history=41), start=T).entries[0].code == "no_edge"
     strict = run(past + [sig(1, T + 1)], auto(confidence_z=1.96, kelly_fraction=0.25), start=T).entries[0]
     assert "edge +22.8% a dollar" in strict.sizing, "0.5 - 1.96 x 0.138675"
-    assert strict.stake == pytest.approx(100 * 0.25 * (0.5 - 1.96 * 0.138675), rel=1e-4)
+    assert strict.stake == pytest.approx(5.70), "100 x 0.25 x (0.5 - 1.96 x 0.138675) = 5.7047, to the cent"
     assert run(history(22, 18) + [sig(1, T + 1)], auto(confidence_z=1.96), start=T).entries[0].code == "no_edge", \
         "55% winners in 40 is not distinguishable from a coin"
 
