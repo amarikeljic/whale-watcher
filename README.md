@@ -190,8 +190,20 @@ rule (a book walk 60 s later). Paper trades made before the bot model stay in
 section.
 
 *CLV.* Pre-game fills are compared with the closing line as before. Every fill,
-in-play included, also gets the price 5 minutes after it, which is the only
-honest reference for a bet placed during a game.
+in-play included, also gets the price **1, 5 and 30 minutes** after it, which is
+the only honest reference for a bet placed during a game. `stats` and the Edge
+page show each one overall, pre-game, in-play and for the wallets with the most
+fills. A price stamped before our fill (a quiet market's last trade) is not
+counted. The price series moves in one-minute steps, so the 1-minute figure is
+rough.
+
+*The book a second later* (v2.1 Part 4 #6). After each decision the runner reads
+the order book again (`bot.recheck_seconds`, 1 s) and records what the same
+order would have done on it: the best ask, the fill price or a miss. `stats` and
+the Edge page report how often the price moved and what it would have cost. It
+is one extra GET per signal, in the background, and it never changes a
+decision: the decision is always made on the first read. How long reading the
+market and the book took is stored on each alert too.
 
 **Costs** (`fees.py`, `costs.py`, v2.1 Part 1). Every P&L, ROI and interval in
 `stats`, the daily summary and the dashboard is **net**. The paper model has

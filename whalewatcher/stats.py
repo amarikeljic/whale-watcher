@@ -127,6 +127,7 @@ BOT_QUERY = """
 SELECT b.*, a.kind, a.outcome, a.whale_usd, a.probation, a.membership_id, a.detect_delay, a.trigger_fill_ts,
        a.snapshot_run_id, a.alert_best_ask, a.alert_best_bid, m.description AS market_rules,
        a.opposite_before_usd, a.opposite_after_usd, a.related_usd, a.sold_back_share, a.followed_at,
+       a.book_fetch_seconds,
        m.category, m.question, m.slug, m.event_slug, m.game_start_time,
        m.end_date AS market_end, m.resolved_at AS market_resolved_at, m.fee_rate AS market_fee_rate,
        m.fees_enabled AS market_fees_enabled, m.fee_exponent AS market_fee_exponent
@@ -260,6 +261,102 @@ def scope_lines(sc: Scoped, scope: Scope) -> list[str]:
     return lines
 
 
+# -- after the fill (Part 4 #5) and the book a second later (Part 4 #6) ---------------------------
+
+
+def markout_columns(cfg) -> tuple[tuple[str, str], ...]:
+    return (("1 min", "markout_1m"), (f"{cfg.bot.markout_seconds // 60} min", "markout_price"),
+            ("30 min", "markout_30m"))
+
+
+def markouts(rows: list[dict], column: str) -> list[float]:
+    """Price ``column`` minus our fill price, per share, for every fill that has one."""
+    return [t[column] - t["fill_price"] for t in rows if t["status"] == "FILLED" and t.get(column) is not None
+            and t.get("fill_price") is not None]
+
+
+def markout_groups(rows: list[dict]) -> list[tuple[str, list[dict]]]:
+    filled = [t for t in rows if t["status"] == "FILLED"]
+    return [("every fill", filled), ("pre-game", [t for t in filled if not in_play(t)]),
+            ("in-play", [t for t in filled if in_play(t)])]
+
+
+def markout_text(rows: list[dict], cfg) -> str:
+    def cents(x: float | None) -> str:
+        return "-" if x is None else f"{x:+.3f}"
+    return ", ".join(f"{name} {cents(mean(markouts(rows, col)))} (n={len(markouts(rows, col))})"
+                     for name, col in markout_columns(cfg))
+
+
+@dataclass
+class Recheck:
+    """The order book read a second time, ``recheck_seconds`` after the decision."""
+    n: int = 0                 # signals read twice
+    moved: int = 0             # best ask different on the second read
+    up: int = 0
+    mean_move: float | None = None
+    fills: int = 0             # our fills among them
+    lost: int = 0              # fills that would have missed on the second book
+    gained: int = 0            # misses that would have filled on it
+    extra: float | None = None # what a fill still possible would have paid more, per share
+    extra_n: int = 0
+    lag: float | None = None   # median seconds from decision to the second read
+    fetch: float | None = None  # median seconds the first read of market and book took
+    fetch_p90: float | None = None
+
+
+def recheck_report(rows: list[dict]) -> Recheck:
+    done = [t for t in rows if t.get("recheck_status") in ("FILLED", "MISSED")]
+    out = Recheck(n=len(done))
+    both = [t for t in done if t.get("recheck_best_ask") is not None and t.get("best_ask") is not None]
+    moves = [t["recheck_best_ask"] - t["best_ask"] for t in both]
+    out.moved = sum(1 for m in moves if abs(m) > 1e-9)
+    out.up = sum(1 for m in moves if m > 1e-9)
+    out.mean_move = mean(moves)
+    filled = [t for t in done if t["status"] == "FILLED"]
+    out.fills = len(filled)
+    out.lost = sum(1 for t in filled if t["recheck_status"] == "MISSED")
+    out.gained = sum(1 for t in done if t["status"] == "MISSED" and t["recheck_status"] == "FILLED")
+    extra = [t["recheck_fill_price"] - t["fill_price"] for t in filled
+             if t["recheck_status"] == "FILLED" and t.get("recheck_fill_price") is not None]
+    out.extra, out.extra_n = mean(extra), len(extra)
+    lags = [t["recheck_at"] - t["decided_at"] for t in done if t.get("recheck_at") is not None]
+    out.lag = median(lags) if lags else None
+    fetch = [t["book_fetch_seconds"] for t in rows if t.get("book_fetch_seconds") is not None]
+    out.fetch = median(fetch) if fetch else None
+    out.fetch_p90 = _quantile(fetch, 0.9) if fetch else None
+    return out
+
+
+def recheck_lines(rows: list[dict]) -> list[str]:
+    r = recheck_report(rows)
+    if not r.n:
+        return []
+
+    def cents(x: float | None) -> str:
+        return "-" if x is None else f"{x:+.3f}"
+    fetch = (f" | reading the market and book took median {r.fetch:.2f}s, p90 {r.fetch_p90:.2f}s"
+             if r.fetch is not None else "")
+    return [f"  order book read again {r.lag:.1f}s after our decision (n={r.n}): best ask moved on {r.moved} "
+            f"({r.up} up, {r.moved - r.up} down), mean change {cents(r.mean_move)} a share{fetch}",
+            f"  on the second book {r.lost} of {r.fills} fills would have missed and {r.gained} misses would have "
+            f"filled; fills still possible would have paid {cents(r.extra)} a share more (n={r.extra_n})"]
+
+
+def markout_wallet_lines(rows: list[dict], cfg, top: int = 10) -> list[str]:
+    by: dict[str, list[dict]] = defaultdict(list)
+    for t in rows:
+        if t["status"] == "FILLED" and t.get("wallet"):
+            by[t["wallet"]].append(t)
+    if not by:
+        return []
+    ranked = sorted(by.items(), key=lambda kv: -len(kv[1]))[:top]
+    lines = [f"  price after our fill by wallet (the {len(ranked)} with most fills, per share):"]
+    for w, ts in ranked:
+        lines.append(f"    {w[:6]}…{w[-4:]}: {len(ts)} fills | {markout_text(ts, cfg)}")
+    return lines
+
+
 def _quantile(values: list[float], q: float) -> float | None:
     if not values:
         return None
@@ -371,6 +468,11 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
         lines.append(f"  CLV: closing line {cents(s.avg_clv)} (n={s.clv_n}{inplay}) | price "
                      f"{app.cfg.bot.markout_seconds // 60} min after our fill {cents(mean(marks))} "
                      f"(n={len(marks)}, every fill)")
+        if strategy == BOT_HEADLINE:
+            for name, group in markout_groups(traded)[1:]:
+                if group:
+                    lines.append(f"  price after our fill, {name} ({len(group)} fills): {markout_text(group, app.cfg)}")
+            lines += recheck_lines(rows)
     # Signals we reached too late (a restart, an outage) are already counted as misses
     # above; averaging minutes-old backlog into this line would hide how fast the bot is.
     limit = app.cfg.bot.max_signal_age_seconds
@@ -425,6 +527,8 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
             lines.append(f"  {runner}: flat_hold minus placebo_late, ROI per trade on the {n} signals both filled: "
                          f"{_pct(m)}, 95% CI {ci} -> {verdict}")
         lines += cutoff_lines(app, runner, by.get((runner, BOT_HEADLINE), []))
+        if not brief:
+            lines += markout_wallet_lines(by.get((runner, BOT_HEADLINE), []), app.cfg)
     lines += wallet_lines(app, trades, brief=brief)
     if not brief:
         lines += followup_lines(app, trades, samples)

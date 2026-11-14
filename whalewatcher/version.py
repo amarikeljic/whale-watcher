@@ -51,7 +51,7 @@ MODEL_SOURCES = (
     "horizon.py", "ledger.py", "markets.py", "monitor.py", "paper.py", "polymarket.py", "polymarket_us.py",
     "scoring.py", "timeutil.py", "watchlist.py",
 )
-MODEL_SOURCE_DIGEST = "7dddaa85698cd19f"
+MODEL_SOURCE_DIGEST = "3c46ce34cb89beae"
 
 _COMMIT = re.compile(r"[0-9a-f]{4,40}(-dirty)?")
 # Sections that change nothing about a decision: where the database is, how the API

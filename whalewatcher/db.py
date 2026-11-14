@@ -583,6 +583,17 @@ ADDED_COLUMNS += (
     (11, "alerts", "related_usd", "REAL"),           # bought in other markets of the same event
     (11, "alerts", "sold_back_share", "REAL"),       # share of the alert's shares sold within 30 minutes
     (11, "alerts", "followed_at", "INTEGER"),        # when the figures needing the hour after were filled in
+    # Part 4 #5: the price 1 and 30 minutes after our fill (5 minutes is markout_price)
+    (11, "bot_trades", "markout_1m", "REAL"),
+    (11, "bot_trades", "markout_1m_done", "INTEGER NOT NULL DEFAULT 0"),
+    (11, "bot_trades", "markout_30m", "REAL"),
+    (11, "bot_trades", "markout_30m_done", "INTEGER NOT NULL DEFAULT 0"),
+    # Part 4 #6: how long reading the market and book took, and the book read again a second later
+    (11, "alerts", "book_fetch_seconds", "REAL"),
+    (11, "bot_trades", "recheck_at", "REAL"),        # when the book was read the second time
+    (11, "bot_trades", "recheck_best_ask", "REAL"),
+    (11, "bot_trades", "recheck_fill_price", "REAL"),  # what the same order would have paid on it
+    (11, "bot_trades", "recheck_status", "TEXT"),    # FILLED | MISSED on the second book, or ERROR
 )
 
 

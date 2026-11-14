@@ -70,6 +70,9 @@ bot:
   placebo_min_delay_seconds: 300  # placebo_late: the same outcome, bought at a random time this long...
   placebo_max_delay_seconds: 1800 # ...to this long after the signal. The control for "does timing matter?"
   markout_seconds: 300            # price this long after our fill: CLV that also works for in-play fills
+                                  # (1 and 30 minutes after are recorded too, Part 4 #5)
+  recheck_book: true              # read the order book again after each decision: how fast does it move?
+  recheck_seconds: 1.0            # (one extra GET per signal; it never changes a decision)
   flat_hold:                      # fixed stake, held to resolution. The headline
     starting_bankroll: 1000
     stake_usd: 10

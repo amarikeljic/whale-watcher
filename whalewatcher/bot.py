@@ -35,6 +35,7 @@ Comparison columns on the hold strategies, same stake, never in the headline:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import random
@@ -58,6 +59,9 @@ EXIT_RETRY_SECONDS = 5.0
 BOOK_LEVELS_KEPT = 25           # ask levels stored with each signal
 SKIPPED_SETTLE_SECONDS = 3600   # how often skipped signals' markets are checked for a result
 MARKOUT_SETTLE_SECONDS = 120             # let the price series catch up before reading it
+# Part 4 #5: (seconds after our fill, column, its done flag). None: bot.markout_seconds.
+MARKOUTS = ((60, "markout_1m", "markout_1m_done"), (None, "markout_price", "markout_done"),
+            (1800, "markout_30m", "markout_30m_done"))
 
 
 def walk_bids(book: Book, shares: float, *, floor_price: float | None = None) -> Walk | None:
@@ -124,6 +128,7 @@ class Bot:
         self.cfg = app.cfg.bot
         self._last_markouts = 0.0
         self._last_marks = float("-inf")             # mark on the first tick
+        self._tasks: set[asyncio.Task] = set()       # second book reads in flight (Part 4 #6)
         self._last_skipped_settle = float("-inf")    # and look at skipped signals on the first settle
 
     def strategy_cfg(self, strategy: str) -> StrategyConfig:
@@ -464,20 +469,61 @@ class Bot:
         return len(rows)
 
     async def _markouts(self, now: float) -> int:
-        app = self.app
-        horizon = self.cfg.markout_seconds
-        rows = app.db.query(
-            "SELECT id, token_id, decided_at FROM bot_trades WHERE runner = ? AND status = 'FILLED' "
-            "AND markout_done = 0 AND decided_at <= ? LIMIT 40", (self.runner, now - horizon - MARKOUT_SETTLE_SECONDS))
-        for t in rows:
-            try:
-                point = await app.prices.at(t["token_id"], int(t["decided_at"]) + horizon)
-            except Exception as exc:  # noqa: BLE001 - try again in a minute
-                log.warning("markout for %s failed: %s", t["id"], exc)
-                continue
-            app.db.execute("UPDATE bot_trades SET markout_done = 1, markout_price = ? WHERE id = ?",
-                           (point.price if point is not None else None, t["id"]))
-        return len(rows)
+        """The price 1, 5 and 30 minutes after each fill (Part 4 #5). A point from before
+        our fill (a quiet market's last trade) is no markout: recorded as none."""
+        app, done = self.app, 0
+        for seconds, column, flag in MARKOUTS:
+            horizon = self.cfg.markout_seconds if seconds is None else seconds
+            rows = app.db.query(
+                f"SELECT id, token_id, decided_at FROM bot_trades WHERE runner = ? AND status = 'FILLED' "
+                f"AND {flag} = 0 AND decided_at <= ? LIMIT 40", (self.runner, now - horizon - MARKOUT_SETTLE_SECONDS))
+            for t in rows:
+                try:
+                    point = await app.prices.at(t["token_id"], int(t["decided_at"]) + horizon)
+                except Exception as exc:  # noqa: BLE001 - try again in a minute
+                    log.warning("markout for %s failed: %s", t["id"], exc)
+                    continue
+                price = point.price if point is not None and point.ts > t["decided_at"] - 60 else None
+                app.db.execute(f"UPDATE bot_trades SET {flag} = 1, {column} = ? WHERE id = ?", (price, t["id"]))
+            done += len(rows)
+        return done
+
+    # -- the book, read again (Part 4 #6) --------------------------------------------------------
+
+    def schedule_recheck(self, alert: Any, market: MarketInfo | None) -> None:
+        """Read the book again ``recheck_seconds`` after the decision and record what the
+        headline order would have done on it. In the background: it never delays a
+        decision, and it changes none."""
+        if not self.cfg.recheck_book or market is None:
+            return
+        task = asyncio.create_task(self._recheck(int(alert["id"]), market))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def drain(self) -> None:
+        while self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+
+    async def _recheck(self, alert_id: int, market: MarketInfo) -> None:
+        await asyncio.sleep(self.cfg.recheck_seconds)
+        db = self.app.db
+        row = db.one("SELECT * FROM bot_trades WHERE runner = ? AND strategy = ? AND alert_id = ? "
+                     "AND status IN ('FILLED', 'MISSED')", (self.runner, HEADLINE, alert_id))
+        if row is None:          # skipped by a rule before the book mattered
+            return
+        try:
+            book = await self.app.clob.book(row["token_id"])
+        except Exception as exc:  # noqa: BLE001 - a measurement, never in the way
+            log.warning("second book read for alert %s failed: %s", alert_id, exc)
+            db.execute("UPDATE bot_trades SET recheck_at = ?, recheck_status = 'ERROR' WHERE id = ?",
+                       (self.app.wall(), row["id"]))
+            return
+        at = self.app.wall()
+        decision = self.decide_buy(book, row["stake_usd"], market, limit_price=row["limit_price"])
+        db.execute("UPDATE bot_trades SET recheck_at = ?, recheck_best_ask = ?, recheck_fill_price = ?, "
+                   "recheck_status = ? WHERE id = ?",
+                   (at, book.best_ask if book else None, decision.walk.vwap if decision.walk else None,
+                    decision.status, row["id"]))
 
     # -- settlement -------------------------------------------------------------------------------
 

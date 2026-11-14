@@ -169,6 +169,8 @@ class BotConfig:
     placebo_min_delay_seconds: int = 300    # placebo_late enters the same outcome at a random later time
     placebo_max_delay_seconds: int = 1800
     markout_seconds: int = 300              # price this long after our fill, for CLV on every fill
+    recheck_book: bool = True               # Part 4 #6: read the book again after each decision (measurement only)
+    recheck_seconds: float = 1.0            # ... this long after it
     flat_hold: StrategyConfig = field(default_factory=StrategyConfig)
     flat_mirror: StrategyConfig = field(default_factory=StrategyConfig)
     scaled_hold: StrategyConfig = field(default_factory=_scaled)

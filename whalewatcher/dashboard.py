@@ -40,7 +40,8 @@ from .horizon import BUCKETS as CLOSE_BUCKETS
 from .horizon import UNKNOWN as NO_END
 from .horizon import bucket as horizon_bucket
 from .stats import (Scope, Scoped, bucket, cutoff_report, event_key, in_play, load_bot_trades, load_trades,
-                    outage_windows, scope_rows, summarise, us_comparison)
+                    markout_columns, markout_groups, markouts, outage_windows, recheck_report, scope_rows,
+                    summarise, us_comparison)
 from .stats_util import mean, median
 from .timeutil import iso, now_ts, parse_as_of, start_of_day
 from .version import MODEL_VERSION
@@ -460,6 +461,7 @@ def edge(c: Ctx) -> str:
                            table_headers=["Move from", "Fills"], table_rows=[[b["label"], str(b["v"])] for b in bars])
                    if marks else '<p class="empty">No fills old enough to have a 5-minute price yet.</p>',
                    note=f"Works for in-play fills too. n={len(marks)}.")
+    body += after_fill_card(c, rows) + recheck_card(rows)
 
     by_p: dict[int, dict[str, list[float]]] = defaultdict(lambda: {"clv": [], "mark": []})
     for r in rows:
@@ -514,6 +516,52 @@ def edge(c: Ctx) -> str:
     body += v.card("Latency cost", '<dl class="kv">' + "".join(
         f"<dt>{v.esc(k)}</dt><dd>{v.esc(val)}</dd>" for k, val in kv) + "</dl>")
     return body + "</div>"
+
+
+def after_fill_card(c: Ctx, rows: list[dict]) -> str:
+    """Part 4 #5: the price 1, 5 and 30 minutes after our fill, overall, pre-game and
+    in-play, and for the wallets with the most fills."""
+    cols = markout_columns(c.app.cfg)
+
+    def cells(group: list[dict]) -> list[Any]:
+        out = []
+        for _, col in cols:
+            vals = markouts(group, col)
+            out.append((f"{v.cents(mean(vals))} (n={len(vals)})", -9 if not vals else mean(vals)))
+        return out
+    table = [[name, (str(len(g)), len(g)), *cells(g)] for name, g in markout_groups(rows)]
+    by: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        if r["status"] == "FILLED" and r.get("wallet"):
+            by[r["wallet"]].append(r)
+    top = sorted(by.items(), key=lambda kv: -len(kv[1]))[:10]
+    wallet_rows = [[v.link(f"/wallet/{w}?{c.f.qs()}", f"{w[:6]}…{w[-4:]}"), (str(len(g)), len(g)), *cells(g)]
+                   for w, g in top]
+    heads = [name for name, _ in cols]
+    return v.card("Price after our fill", v.table(["Fills", "n", *heads], table, sortable=False, numeric_from=1)
+                  + v.table(["Wallet", "Fills", *heads], wallet_rows, numeric_from=1,
+                            empty="No fills yet."),
+                  note="The market's price that long after our fill, minus what we paid, in dollars a share. Up is "
+                       "good. In-play fills have no closing line, so this is their only quality check. The price "
+                       "series has one-minute steps, so the 1-minute figure is rough.", wide=True)
+
+
+def recheck_card(rows: list[dict]) -> str:
+    """Part 4 #6: the book read a second time, a second after the decision."""
+    r = recheck_report(rows)
+    if not r.n:
+        return v.card("The order book, a second later", '<p class="empty">No signal has been read twice yet. Each '
+                      "one is from now on, a second after the decision.</p>")
+    kv = [("Signals read twice", f"{r.n}, median {r.lag:.1f}s after the decision"),
+          ("Best ask moved", f"{r.moved} of {r.n} ({r.up} up, {r.moved - r.up} down), mean {v.cents(r.mean_move)}"),
+          ("Fills that would have missed", f"{r.lost} of {r.fills}"),
+          ("Misses that would have filled", str(r.gained)),
+          ("Extra a share on the second book", f"{v.cents(r.extra)} (n={r.extra_n})"),
+          ("Reading market and book took", "-" if r.fetch is None else f"median {r.fetch:.2f}s, p90 {r.fetch_p90:.2f}s")]
+    return v.card("The order book, a second later", '<dl class="kv">' + "".join(
+        f"<dt>{v.esc(k)}</dt><dd>{v.esc(val)}</dd>" for k, val in kv) + "</dl>",
+        note="How much the book moves between our read and an order that would have reached the exchange a moment "
+             "later. A measurement only: the decision is always made on the first read.")
 
 
 def memberships(app: Any) -> dict[str, Any]:

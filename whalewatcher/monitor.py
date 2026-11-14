@@ -299,6 +299,7 @@ class Monitor:
         detected_at = float(now) if detected_at is None else detected_at
         # The market's details and its order book, asked for together: every tenth of
         # a second here is price the whale's followers are taking.
+        asked = app.wall()
         markets, book = await asyncio.gather(
             app.markets.ensure([alert["condition_id"]], refresh_after=300),
             app.clob.book(alert["token_id"]), return_exceptions=True)
@@ -319,11 +320,11 @@ class Monitor:
         app.db.execute(
             "UPDATE alerts SET detected_at = ?, trigger_fill_ts = ?, alert_best_ask = ?, alert_best_bid = ?, "
             "alert_book_ts = ?, snapshot_run_id = ?, membership_id = ?, probation = ?, detect_delay = ?, "
-            "updated_at = ? WHERE id = ?",
+            "book_fetch_seconds = ?, updated_at = ? WHERE id = ?",
             (int(detected_at), fill.ts, ask, bid, book.ts if book else None, run_id,
              member["id"] if member else None,
              (1 if now < member["probation_until"] else 0) if member else None,
-             detected_at - fill.ts, now, alert["id"]))
+             detected_at - fill.ts, decided_at - asked, now, alert["id"]))
         # What the whale bought of the other side in the day before (Part 4 #11). Read
         # before the bot only when a switch needs it: otherwise it never delays a decision.
         early = app.cfg.followup.skip_hedged_alerts
@@ -333,6 +334,7 @@ class Monitor:
         tradable = not reason and market is not None
         if tradable and self.bot is not None:
             self.bot.enter(alert, market, book, detected_at=detected_at, decided_at=decided_at)
+            self.bot.schedule_recheck(alert, market)
             if self.us is not None:
                 # After the bot, and in the background: a comparison never delays a decision.
                 self.us.submit(alert, market, detected_at=detected_at)

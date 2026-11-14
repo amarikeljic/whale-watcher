@@ -171,6 +171,7 @@ class Service:
                 pass
         if self.us is not None:
             await self.us.drain()             # let any Polymarket US pricing in flight finish and be recorded
+        await self.bot.drain()                # and the second book reads (Part 4 #6)
         log.info("stopped after %d cycles", done)
 
     async def _rescore(self) -> None:

@@ -87,6 +87,9 @@ def cfg() -> Config:
     # Row A (the same signals priced on Polymarket US) has its own tests in
     # test_polymarket_us.py; everywhere else the runner makes no US requests.
     c.polymarket_us.enabled = False
+    # The second book read a second after each decision (Part 4 #6) runs in the
+    # background; test_measures.py switches it on and waits for it.
+    c.bot.recheck_book = False
     return c
 
 
