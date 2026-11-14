@@ -33,6 +33,7 @@ class FakeMarket:
     outcomes: tuple[str, str] = ("Yes", "No")
     sports_market_type: str | None = None
     event_title: str | None = None
+    uma_statuses: str | None = None     # Gamma's umaResolutionStatuses, e.g. '["proposed", "disputed"]'
 
     def gamma(self) -> dict[str, Any]:
         closed = self.resolved_at is not None or self.closed_time is not None
@@ -53,6 +54,8 @@ class FakeMarket:
             "feeSchedule": {"rate": self.fee_rate, "exponent": 1, "takerOnly": True, "rebateRate": 0.25},
             "description": f"Resolves Yes if {self.cond} happens.", "acceptingOrders": self.accepting_orders,
             "umaResolutionStatus": "resolved" if self.resolved_at else None,
+            "umaResolutionStatuses": self.uma_statuses if self.uma_statuses is not None else (
+                '["proposed", "proposed"]' if self.resolved_at else "[]"),
             "outcomePrices": json.dumps([str(p) for p in (self.payouts or [0.5, 0.5])]),
         }
 

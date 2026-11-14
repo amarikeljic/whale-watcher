@@ -509,13 +509,65 @@ def edge(c: Ctx) -> str:
     delays = [r["decided_at"] - r["signal_ts"] for r in rows if r.get("decided_at") and r.get("signal_ts")
               and r["status"] in ("FILLED", "MISSED") and 0 <= r["decided_at"] - r["signal_ts"] <= 600]
     seen = [r["detect_delay"] for r in rows if r.get("detect_delay") is not None and r["detect_delay"] <= 600]
+    exited = {r["alert_id"] for r in c.records if r.get("runner") == "single" and r["strategy"] == "flat_mirror"
+              and r.get("result") == "EXIT"}
+    hold = sum(r["pnl"] or 0.0 for r in c.records if r.get("runner") == "single" and r["strategy"] == "flat_hold"
+               and r["alert_id"] in exited and r.get("closed_at") is not None and r["status"] == "FILLED")
+    mirror = sum(r["pnl"] or 0.0 for r in c.records if r.get("runner") == "single" and r["strategy"] == "flat_mirror"
+                 and r["alert_id"] in exited and r.get("closed_at") is not None and r["status"] == "FILLED")
+    exits = (f"on {len(exited)} signals: hold {v.money(hold)}, mirror {v.money(mirror)}" if exited else
+             "the whale has not sold before resolution on any copied signal yet")
     kv = [("Whale's fill to our detector", f"median {median(seen):.1f}s (n={len(seen)})" if seen else "-"),
+          ("When the whale sold first", exits),
           ("Whale's fill to our decision", f"median {median(delays):.1f}s (n={len(delays)})" if delays else "-"),
           ("Price paid above the whale", f"{v.cents(s.avg_latency_cost)} a share on fills"),
           ("Missed", f"{s.missed} of {s.alerts}: " + (", ".join(f"{k} {n}" for k, n in sorted(s.miss_reasons.items())) or "none"))]
     body += v.card("Latency cost", '<dl class="kv">' + "".join(
         f"<dt>{v.esc(k)}</dt><dd>{v.esc(val)}</dd>" for k, val in kv) + "</dl>")
     return body + "</div>"
+
+
+def settlement_card(c: Ctx) -> str:
+    """Part 4 #9 and #13: how long payouts took to be recorded, and results by how the
+    market resolved."""
+    from .horizon import RESOLUTION_TYPES
+    closed = [r for r in c.records if r.get("runner") == "single" and r["strategy"] == "flat_hold"
+              and r["status"] == "FILLED" and r.get("closed_at") is not None and r.get("result") != "EXIT"]
+    if not closed:
+        return v.card("Settlement", '<p class="empty">No trade has settled yet.</p>')
+    lags = sorted(r["paid_at"] - r["resolved_at"] for r in closed if r.get("paid_at") and r.get("resolved_at"))
+    out = []
+    for kind in RESOLUTION_TYPES:
+        group = [r for r in closed if r.get("resolution_type") == kind]
+        s = summarise(kind, group, samples=SAMPLES)
+        out.append([kind.replace("_", "-"), (str(s.settled), s.settled),
+                    (v.money(s.total_pnl) if s.settled else "-", s.total_pnl, v.tone(s.total_pnl) if s.settled else ""),
+                    (f"{v.pct(s.mean_roi)} {ci_text(s)}" if s.settled else "-", s.mean_roi or 0)])
+    untyped = sum(1 for r in closed if not r.get("resolution_type"))
+    lag = (f"Payout recorded a median of {median(lags) / 60:.0f} min after the market resolved (n={len(lags)}). "
+           if lags else "")
+    return v.card("Settlement", v.table(["How it resolved", "Closed", "Net P&L", "Mean ROI (95%)"], out,
+                                        sortable=False, numeric_from=1),
+                  note=lag + "Normal; delayed: more than a day after its scheduled end; fifty-fifty: voided, every "
+                       "side paid $0.50; disputed: the result was challenged on UMA. The wallet counts money as back "
+                       "when the payout was recorded." + (f" {untyped} closed trades are not typed yet." if untyped
+                                                          else ""))
+
+
+def fee_changes_card(c: Ctx) -> str:
+    """Part 4 #14: every change of a published fee the service has seen."""
+    try:
+        rows = c.app.db.query("SELECT * FROM fee_changes ORDER BY seen_at DESC, id DESC LIMIT 30")
+    except Exception:  # noqa: BLE001 - a database older than the table
+        rows = []
+    return v.card("Fee changes seen", v.table(
+        ["Seen (UTC)", "Venue", "Market", "What", "From", "To"],
+        [[iso(r["seen_at"])[:16], r["venue"], (r["market"][:24], None, "wrap"), r["field"],
+          f"{r['old_value']:g}" if r["old_value"] is not None else "-",
+          f"{r['new_value']:g}" if r["new_value"] is not None else "-"] for r in rows],
+        sortable=False, numeric_from=9, empty="No published fee has changed since the service started watching."),
+        note="When a market's own fee rate, or a Polymarket US market's coefficient, differs from the last one "
+             "seen. Each trade keeps the rate it paid.")
 
 
 def after_fill_card(c: Ctx, rows: list[dict]) -> str:
@@ -1291,6 +1343,7 @@ def health(c: Ctx) -> str:
              "\"Include outage windows\" is ticked. The service records a window itself when the runner or the "
              "detector was stopped long enough to make a signal late, when the detector's heartbeat stops, and "
              "when Polymarket's data API stops answering.")
+    body += settlement_card(c) + fee_changes_card(c)
     body += v.card("What this page cannot show", '<p class="card-note">Individual failed requests are written to the '
                    "container logs (<code>docker compose logs detector</code>), not to the database, so they are not "
                    "charted here. The heartbeats above stop when either process stops succeeding.</p>")

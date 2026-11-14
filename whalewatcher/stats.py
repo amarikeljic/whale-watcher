@@ -407,6 +407,55 @@ def _paired(a: list[dict], b: list[dict], samples: int) -> tuple[int, float | No
     return len(pairs), m, lo, hi
 
 
+def exit_comparison(by: dict[tuple[str, str], list[dict]], runner: str, samples: int) -> list[str]:
+    """Part 4 #12: holding against mirroring, on only the signals where the whale sold
+    before the market resolved (where the two can differ)."""
+    mirror = by.get((runner, "flat_mirror"), [])
+    exited = {t["alert_id"] for t in mirror if t.get("result") == "EXIT"}
+    if not mirror:
+        return []
+    if not exited:
+        return [f"  {runner}: the whale has not sold before the market resolved on any copied signal yet, so holding "
+                "and mirroring cannot differ"]
+    hold = [t for t in by.get((runner, BOT_HEADLINE), []) if t["alert_id"] in exited]
+    mir = [t for t in mirror if t["alert_id"] in exited]
+    n, m, lo, hi = _paired(hold, mir, samples)
+    hold_pnl = sum(t["pnl"] or 0.0 for t in hold if t["status"] == "FILLED" and t["closed_at"] is not None)
+    mir_pnl = sum(t["pnl"] or 0.0 for t in mir if t["status"] == "FILLED" and t["closed_at"] is not None)
+    ci = "-" if lo is None else f"[{_pct(lo)}, {_pct(hi)}]"
+    return [f"  {runner}: on the {len(exited)} signals where the whale sold before resolution: hold "
+            f"{_money(hold_pnl)} | mirror (sell with it) {_money(mir_pnl)} | hold minus mirror, ROI per trade on the "
+            f"{n} both closed: {_pct(m)}, 95% CI {ci}"]
+
+
+def settlement_lines(rows: list[dict], samples: int) -> list[str]:
+    """Part 4 #9 and #13: how long the payout took to be recorded, and P&L by how the
+    market resolved."""
+    from .horizon import RESOLUTION_TYPES
+    closed = [t for t in rows if "runner" in t and t["status"] == "FILLED" and t.get("closed_at") is not None
+              and t.get("result") != "EXIT"]
+    if not closed:
+        return []
+    lags = [t["paid_at"] - t["resolved_at"] for t in closed if t.get("paid_at") and t.get("resolved_at")]
+    lines = []
+    if lags:
+        lines.append(f"  payout recorded after the market resolved: median {_secs(median(lags))}, p90 "
+                     f"{_secs(_quantile(lags, 0.9))} (n={len(lags)}). The wallet counts the money back at the payout.")
+    head = [t for t in closed if t["strategy"] == BOT_HEADLINE and t["runner"] != US_RUNNER]
+    typed = [t for t in head if t.get("resolution_type")]
+    if typed:
+        parts = []
+        for kind in RESOLUTION_TYPES:
+            group = [t for t in typed if t["resolution_type"] == kind]
+            if group:
+                s = summarise(kind, group, samples=samples)
+                parts.append(f"{kind} n={s.settled}, net {_money(s.total_pnl)}")
+        untyped = len(head) - len(typed)
+        lines.append("  how the markets resolved (flat_hold): " + " | ".join(parts)
+                     + (f" | not typed yet {untyped}" if untyped else ""))
+    return lines
+
+
 def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], threshold: int, samples: int,
                         *, brief: bool, group: str | None = None) -> list[str]:
     from .bot import Bot
@@ -527,8 +576,10 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
             lines.append(f"  {runner}: flat_hold minus placebo_late, ROI per trade on the {n} signals both filled: "
                          f"{_pct(m)}, 95% CI {ci} -> {verdict}")
         lines += cutoff_lines(app, runner, by.get((runner, BOT_HEADLINE), []))
+        lines += exit_comparison(by, runner, samples)
         if not brief:
             lines += markout_wallet_lines(by.get((runner, BOT_HEADLINE), []), app.cfg)
+            lines += settlement_lines([t for t in trades if t.get("runner") == runner], samples)
     lines += wallet_lines(app, trades, brief=brief)
     if not brief:
         lines += followup_lines(app, trades, samples)

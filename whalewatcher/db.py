@@ -418,6 +418,24 @@ CREATE TABLE IF NOT EXISTS outage_windows (
     source    TEXT NOT NULL           -- owner (reported by hand) | detected (by the service)
 );
 
+-- v2.1 Part 4 #14: every change of a published fee the service has seen. A market's
+-- own rate (poly_markets) and a Polymarket US market's coefficient (us_fee_seen) keep
+-- only the latest value; this keeps the history.
+CREATE TABLE IF NOT EXISTS fee_changes (
+    id         INTEGER PRIMARY KEY,
+    seen_at    INTEGER NOT NULL,      -- when the service saw the new value
+    venue      TEXT NOT NULL,         -- polymarket | polymarket_us
+    market     TEXT NOT NULL,         -- condition id | Polymarket US slug
+    field      TEXT NOT NULL,         -- rate | exponent | fee_coefficient
+    old_value  REAL,
+    new_value  REAL
+);
+CREATE TABLE IF NOT EXISTS us_fee_seen (
+    slug             TEXT PRIMARY KEY,
+    fee_coefficient  REAL,
+    seen_at          INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS service_state (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
@@ -594,6 +612,12 @@ ADDED_COLUMNS += (
     (11, "bot_trades", "recheck_best_ask", "REAL"),
     (11, "bot_trades", "recheck_fill_price", "REAL"),  # what the same order would have paid on it
     (11, "bot_trades", "recheck_status", "TEXT"),    # FILLED | MISSED on the second book, or ERROR
+    # Part 4 #9: when our service recorded the payout (the wallet's cash comes back then),
+    # beside resolved_at (when the market resolved). Equal to closed_at; named for clarity.
+    (11, "bot_trades", "paid_at", "INTEGER"),
+    # Part 4 #13: normal | fifty_fifty | delayed | disputed, for a trade settled by resolution
+    (11, "bot_trades", "resolution_type", "TEXT"),
+    (11, "poly_markets", "uma_statuses", "TEXT"),    # Gamma's umaResolutionStatuses: the UMA history, JSON list
 )
 
 
@@ -630,6 +654,11 @@ class Database:
             if version < SCHEMA_VERSION:
                 self.conn.executescript(SCHEMA)
                 self._add_columns()
+                if version < 11 and has_data:
+                    # Part 4 #9: the payout time under its own name. A copy of closed_at in a
+                    # new column; no existing value changes.
+                    self.conn.execute("UPDATE bot_trades SET paid_at = closed_at WHERE paid_at IS NULL "
+                                      "AND closed_at IS NOT NULL")
                 if version < 5 and has_data:
                     # The one outage known before outages were recorded: the owner's ISP
                     # was down on 2026-11-09 from 11:27 to about 16:46 UTC. Only for a

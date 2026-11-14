@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 from collections.abc import Callable, Iterable
 
 from .db import Database
-from .polymarket import DataApi, Gamma, MarketInfo, parse_resolution
+from .polymarket import DataApi, Gamma, MarketInfo, parse_resolution, uma_history
 from .timeutil import now_ts
 
 log = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ _COLUMNS = (
     "condition_id", "question", "slug", "event_slug", "event_title", "category", "tags", "outcomes",
     "token_ids", "end_date", "closed", "closed_time", "game_start_time", "sports_market_type",
     "neg_risk", "accepting_orders", "fees_enabled", "fee_rate", "fee_exponent", "fee_taker_only",
-    "description", "resolution_source", "resolved", "resolved_at", "payouts",
+    "description", "resolution_source", "resolved", "resolved_at", "payouts", "uma_statuses",
 )
 
 
@@ -42,6 +43,7 @@ def _to_row(m: MarketInfo) -> dict:
         "fee_taker_only": int(m.fee_taker_only), "description": m.description,
         "resolution_source": m.resolution_source, "resolved": int(m.resolved),
         "resolved_at": m.resolved_at, "payouts": json.dumps(m.payouts) if m.payouts is not None else None,
+        "uma_statuses": m.uma_statuses or None,
     }
 
 
@@ -60,6 +62,7 @@ def _from_row(row) -> MarketInfo:
         description=row["description"] or "", resolution_source=row["resolution_source"] or "",
         resolved=bool(row["resolved"]), resolved_at=row["resolved_at"],
         payouts=json.loads(row["payouts"]) if row["payouts"] else None,
+        uma_statuses=row["uma_statuses"] or "",
     )
 
 
@@ -150,6 +153,7 @@ class MarketStore:
                         market.resolved, market.payouts = True, fallback
                         market.resolved_at = market.closed_time
                 fresh.append(market)
+            self._fee_changes(fresh, known, now)
             self.save_many(fresh, meta_fetched_at=now)
             missing = [c for c in need_meta if c not in got]
             if missing:
@@ -201,6 +205,38 @@ class MarketStore:
                 market.resolved = True
                 market.resolved_at, market.payouts = best[cid]
         self.save_many(by_id.values(), resolution_checked_at=now)
+
+    def _fee_changes(self, fresh: list[MarketInfo], known: dict[str, Any], now: int) -> None:
+        """Part 4 #14: a published fee that differs from the one stored is logged and kept
+        in fee_changes before the new value replaces it. Trades keep the rate they paid."""
+        for m in fresh:
+            old = known.get(m.condition_id)
+            if old is None or old["question"] is None:
+                continue        # first sight of this market: nothing has changed
+            before = (old["fee_rate"] or 0.0) if old["fees_enabled"] else 0.0
+            after = m.fee_rate if m.fees_enabled else 0.0
+            for field_name, a, b in (("rate", before, after), ("exponent", old["fee_exponent"] or 1.0, m.fee_exponent)):
+                if abs((a or 0.0) - (b or 0.0)) > 1e-12:
+                    self.db.execute("INSERT INTO fee_changes (seen_at, venue, market, field, old_value, new_value) "
+                                    "VALUES (?, 'polymarket', ?, ?, ?, ?)", (now, m.condition_id, field_name, a, b))
+                    log.warning("fee change: market %s (%s) %s %s -> %s", m.condition_id[:12], m.slug, field_name,
+                                a, b)
+
+    async def refresh_uma(self, condition_ids: Iterable[str]) -> dict[str, str]:
+        """The UMA history of these markets, read fresh from Gamma and stored. Resolved
+        markets are otherwise never re-read, and a dispute can come after our last read."""
+        ids = sorted({c.lower() for c in condition_ids if c})
+        if not ids:
+            return {}
+        out = {}
+        for raw in await self.gamma.markets_by_condition(ids):
+            cid = str(raw.get("conditionId") or "").lower()
+            if cid in ids:
+                out[cid] = uma_history(raw)
+        with self.db.tx() as conn:
+            conn.executemany("UPDATE poly_markets SET uma_statuses = ? WHERE condition_id = ?",
+                             [(v, k) for k, v in out.items()])
+        return out
 
     def _rows(self, ids: list[str]):
         out = []

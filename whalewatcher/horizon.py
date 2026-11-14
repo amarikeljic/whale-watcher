@@ -28,6 +28,28 @@ from __future__ import annotations
 from .config import FiltersConfig
 
 DAY = 86400
+# Part 4 #13: how a settled trade's market resolved, the most serious first.
+DISPUTED, FIFTY_FIFTY, DELAYED, NORMAL = "disputed", "fifty_fifty", "delayed", "normal"
+RESOLUTION_TYPES = (NORMAL, DELAYED, FIFTY_FIFTY, DISPUTED)
+DELAYED_AFTER_SECONDS = 86_400
+
+
+def resolution_type(*, payouts: list[float] | None, scheduled_end: int | None, resolved_at: int | None,
+                    uma_statuses: str = "") -> str:
+    """One label per trade settled by resolution: ``disputed`` when the UMA history shows
+    a dispute (polymarket.uma_history), ``fifty_fifty`` when every outcome paid the same
+    (a void, paid at $0.50 a share), ``delayed`` when it resolved more than a day after
+    its scheduled end, else ``normal``. A market can be more than one; the first that
+    applies, in that order, is kept."""
+    if "disputed" in (uma_statuses or ""):
+        return DISPUTED
+    if payouts and len(payouts) >= 2 and 0 < payouts[0] < 1 and all(abs(p - payouts[0]) < 1e-9 for p in payouts):
+        return FIFTY_FIFTY
+    if scheduled_end is not None and resolved_at is not None and resolved_at - scheduled_end > DELAYED_AFTER_SECONDS:
+        return DELAYED
+    return NORMAL
+
+
 TOO_LONG = "too_long"
 NO_END_DATE = "no_end_date"
 BUCKETS = ("under 1 day", "1 to 7 days", "7 to 14 days", "over 14 days")

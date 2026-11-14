@@ -47,7 +47,7 @@ from .app import App
 from .bankroll import HEADLINE
 from .config import BOT_STRATEGIES, StrategyConfig
 from .fees import rate_for, taker_fee
-from .horizon import close_skip, days_to_close, scheduled_end
+from .horizon import close_skip, days_to_close, resolution_type, scheduled_end
 from .paper import Walk, result_label, shadow_fill, walk_asks
 from .polymarket import Book, MarketInfo
 from .timeutil import start_of_day
@@ -540,6 +540,14 @@ class Bot:
             return 0
         markets = await app.markets.ensure({r["condition_id"] for r in rows},
                                            refresh_after=app.cfg.paper.settle_interval_seconds)
+        # The UMA history, read fresh for the markets settling now: a dispute can come
+        # after our last read of the market (Part 4 #13).
+        due = {r["condition_id"] for r in rows if (m := markets.get(r["condition_id"])) is not None and m.resolved}
+        try:
+            uma = await app.markets.refresh_uma(due) if due else {}
+        except Exception as exc:  # noqa: BLE001 - settle anyway; the type is filled in later
+            log.warning("could not read the UMA history of %d markets: %s", len(due), exc)
+            uma = {}
         settled = 0
         for t in rows:
             market = markets.get(t["condition_id"])
@@ -562,13 +570,44 @@ class Bot:
             human = shadow(t["human_contracts"], t["human_cost"])
             if human is None and t["human_due"] is not None and t["human_done"]:
                 human = 0.0     # the old rule would have missed this one
+            kind = (resolution_type(payouts=market.payouts, scheduled_end=t["scheduled_end"],
+                                    resolved_at=market.resolved_at, uma_statuses=uma[t["condition_id"]])
+                    if t["condition_id"] in uma else None)
             app.db.execute(
                 "UPDATE bot_trades SET closed_at = ?, result = ?, payout_per_share = ?, pnl = ?, zero_pnl = ?, "
-                "human_pnl = ?, closing_price = ?, updated_at = ?, resolved_at = ? "
+                "human_pnl = ?, closing_price = ?, updated_at = ?, resolved_at = ?, paid_at = ?, resolution_type = ? "
                 "WHERE id = ? AND closed_at IS NULL",
                 (app.clock(), result_label(pps) if filled else None, pps,
                  (t["contracts"] * pps - t["cost"]) if filled else 0.0,
                  shadow(t["zero_contracts"], t["zero_cost"]), human, closing, app.clock(), market.resolved_at,
-                 t["id"]))
+                 app.clock(), kind, t["id"]))
             settled += 1
+        await self.fill_resolution_types()
         return settled
+
+    async def fill_resolution_types(self, limit: int = 100) -> int:
+        """Part 4 #13: the resolution type of trades settled without one (before it existed,
+        or when the UMA history could not be read), oldest first."""
+        app = self.app
+        rows = app.db.query(
+            "SELECT b.id, b.condition_id, b.scheduled_end, b.resolved_at, m.payouts FROM bot_trades b "
+            "LEFT JOIN poly_markets m ON m.condition_id = b.condition_id WHERE b.runner = ? AND b.closed_at IS NOT NULL "
+            "AND b.resolution_type IS NULL AND COALESCE(b.result, '') != 'EXIT' AND b.payout_per_share IS NOT NULL "
+            "ORDER BY b.id LIMIT ?", (self.runner, limit))
+        if not rows:
+            return 0
+        try:
+            uma = await app.markets.refresh_uma({r["condition_id"] for r in rows})
+        except Exception as exc:  # noqa: BLE001 - try again at the next settle
+            log.warning("could not read the UMA history to type %d settled trades: %s", len(rows), exc)
+            return 0
+        done = 0
+        for r in rows:
+            if r["condition_id"] not in uma:
+                continue
+            kind = resolution_type(payouts=json.loads(r["payouts"]) if r["payouts"] else None,
+                                   scheduled_end=r["scheduled_end"], resolved_at=r["resolved_at"],
+                                   uma_statuses=uma[r["condition_id"]])
+            app.db.execute("UPDATE bot_trades SET resolution_type = ? WHERE id = ?", (kind, r["id"]))
+            done += 1
+        return done

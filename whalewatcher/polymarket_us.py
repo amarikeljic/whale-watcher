@@ -45,7 +45,7 @@ from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any
 
 from .http import HttpClient, HttpError
-from .horizon import NO_END_DATE, TOO_LONG
+from .horizon import NO_END_DATE, TOO_LONG, resolution_type
 from .polymarket import Book, Level, MarketInfo
 from .timeutil import parse_time
 
@@ -435,6 +435,24 @@ class UsRowA:
             log.warning("Polymarket US pricing of alert %s failed: %s", alert.get("id"), exc)
             self._insert(alert, "MISSED", f"error: {type(exc).__name__}: {exc}"[:200], detected_at=detected_at)
 
+    def _fee_seen(self, m: UsMarket) -> None:
+        """Part 4 #14: a Polymarket US market's published coefficient, and its history."""
+        db, now = self.app.db, int(self.app.clock())
+        try:
+            old = db.one("SELECT fee_coefficient FROM us_fee_seen WHERE slug = ?", (m.slug,))
+            if old is not None and old["fee_coefficient"] is not None and m.fee_coefficient is not None \
+                    and abs(old["fee_coefficient"] - m.fee_coefficient) > 1e-12:
+                db.execute("INSERT INTO fee_changes (seen_at, venue, market, field, old_value, new_value) "
+                           "VALUES (?, 'polymarket_us', ?, 'fee_coefficient', ?, ?)",
+                           (now, m.slug, old["fee_coefficient"], m.fee_coefficient))
+                log.warning("fee change: Polymarket US %s coefficient %s -> %s", m.slug, old["fee_coefficient"],
+                            m.fee_coefficient)
+            db.execute("INSERT INTO us_fee_seen (slug, fee_coefficient, seen_at) VALUES (?, ?, ?) "
+                       "ON CONFLICT(slug) DO UPDATE SET fee_coefficient = excluded.fee_coefficient, "
+                       "seen_at = excluded.seen_at", (m.slug, m.fee_coefficient, now))
+        except Exception:  # noqa: BLE001 - a log of fees is never worth a missed price
+            log.exception("could not record the fee of Polymarket US market %s", m.slug)
+
     async def _lookup(self, slugs: list[str]) -> dict[str, UsMarket]:
         now = self.app.wall()
         fresh = {s: m for s, (at, m) in self._markets.items() if now - at < self.cfg.market_cache_seconds}
@@ -444,6 +462,8 @@ class UsRowA:
             for s in missing:
                 self._markets[s] = (now, got.get(s))
                 fresh[s] = got.get(s)
+                if got.get(s) is not None:
+                    self._fee_seen(got[s])
         return {s: fresh[s] for s in slugs if fresh.get(s) is not None}
 
     async def enter(self, alert: dict, market: MarketInfo | None, *, detected_at: float) -> str:
@@ -567,11 +587,14 @@ class UsRowA:
             if value is None:
                 continue
             pps = value if t["us_side"] == "long" else 1 - value
+            # Part 4 #9, #13. The US venue publishes no dispute history: disputed is never set here.
+            kind = resolution_type(payouts=[value, 1 - value], scheduled_end=t["scheduled_end"],
+                                   resolved_at=app.clock())
             app.db.execute(
                 "UPDATE bot_trades SET closed_at = ?, result = ?, payout_per_share = ?, pnl = ?, resolved_at = ?, "
-                "updated_at = ? WHERE id = ? AND closed_at IS NULL",
+                "updated_at = ?, paid_at = ?, resolution_type = ? WHERE id = ? AND closed_at IS NULL",
                 (app.clock(), result_label(pps), pps, t["contracts"] * pps - t["cost"], app.clock(), app.clock(),
-                 t["id"]))
+                 app.clock(), kind, t["id"]))
             done += 1
         return done
 

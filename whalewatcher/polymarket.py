@@ -181,6 +181,11 @@ class MarketInfo:
     resolved: bool = False
     resolved_at: int | None = None
     payouts: list[float] | None = None
+    uma_statuses: str = ""      # the UMA resolution history, a JSON list (uma_history)
+
+    @property
+    def disputed(self) -> bool:
+        return "disputed" in self.uma_statuses
 
     @property
     def is_sports(self) -> bool:
@@ -250,6 +255,7 @@ class MarketInfo:
             fee_taker_only=fee.get("takerOnly") is not False,
             description=str(raw.get("description") or ""),
             resolution_source=str(raw.get("resolutionSource") or ""),
+            uma_statuses=uma_history(raw),
         )
 
     def gamma_final_payouts(self, raw: dict[str, Any]) -> list[float] | None:
@@ -262,6 +268,20 @@ class MarketInfo:
         if abs(sum(prices) - 1) > 0.02:
             return None
         return prices
+
+
+def uma_history(raw: dict[str, Any]) -> str:
+    """Gamma's ``umaResolutionStatuses``, as a lower-case JSON list.
+
+    https://docs.polymarket.com/api-reference/markets/list-markets.md lists
+    ``umaResolutionStatus`` and ``umaResolutionStatuses`` as nullable strings and gives no
+    values. Read from live data on 2026-11-14 (500 recently closed markets): the first is
+    the state now ("resolved" on all 500), the second the history as a JSON string, such
+    as ``["proposed", "proposed"]``, or ``["proposed", "proposed", "disputed", "disputed",
+    "proposed", "proposed"]`` on the one market of the 500 whose result was disputed."""
+    value = raw.get("umaResolutionStatuses")
+    items = _json_list(value) if isinstance(value, str) else (value if isinstance(value, list) else [])
+    return json.dumps([str(x).lower() for x in items])
 
 
 @dataclass(slots=True)

@@ -295,6 +295,25 @@ only buys before the alert), `skip_both_sides_wallets` and
 `skip_sold_back_wallets` (use only alerts already followed up). Turning one on
 changes which signals are copied, so it should come with a new model version.
 
+### Settlement, exits and fee changes (v2.1 Part 4)
+
+* **Two times per settled trade.** `resolved_at` is when the market resolved,
+  `paid_at` when this service recorded the payout. The wallet counts money as
+  back at `paid_at`, never earlier. `stats` and the Health page show the gap.
+* **How each market resolved** (`resolution_type`): `normal`, `delayed` (more
+  than a day after its scheduled end), `fifty_fifty` (voided: every side paid
+  $0.50) or `disputed` (the result was challenged on UMA). Disputes come from
+  Gamma's `umaResolutionStatuses`, read fresh when a trade settles: the docs
+  name the field but not its values, so they were read from live data
+  (2026-11-14: 1 disputed market in 500 recently closed). Trades settled before
+  this existed are typed later, 100 per settle.
+* **Holding against mirroring** on only the signals where the whale sold before
+  the market resolved, the one place the two strategies can differ (`stats`, Edge).
+* **Fee changes.** When a market's published rate, or a Polymarket US market's
+  coefficient, differs from the last one seen, a row goes into `fee_changes`, a
+  warning into the log, and the Health page lists it. Each trade keeps the rate
+  it paid.
+
 ### Time-to-close cutoff (v2.1)
 
 A paper dollar in a market that settles in three months is gone for three
