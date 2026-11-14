@@ -424,9 +424,10 @@ Checked on the 6 GB live copy and against live Gamma data.
   finished step, and Docker restarts them.
 * **Not fixed: the database keeps growing.** Whale trade histories are 5.1 GB of
   6 GB (7.5 million rows, 2,195 wallets). After the first load they grew 180,000 to
-  290,000 rows a day, about 120 to 200 MB, with one 1.8 million row day when the
-  review took in many new wallets. Rough guess: 50 to 70 GB a year. Shrinking it
-  means rewriting the table or deleting old history, which needs your OK.
+  290,000 rows a day. At about 540 bytes a row with its indexes (680 before the
+  dropped index) that is 100 to 160 MB a day, plus days like the one with 1.8 million
+  rows when the review took in many new wallets. Rough guess: 40 to 60 GB a year.
+  Shrinking it means rewriting the table or deleting old history, which needs your OK.
 * **Not fixed: the Edge page and a replay's wallet tab still peak near 190 MB**
   of the dashboard's 256 MB. Fine today. A second large replay would push them over,
   and the dashboard would restart instead of showing the page.
