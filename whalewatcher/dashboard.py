@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlsplit
 
 from aiohttp import web
 
-from . import bankroll
+from . import bankroll, followup
 from . import dashview as v
 from .config import Config
 from .costs import breakdown
@@ -542,11 +542,28 @@ def wallets(c: Ctx) -> str:
     for r in rows:
         by[r["wallet"]].append(r)
     scale = max([abs(sum(x["pnl"] or 0.0 for x in closed(rs))) for rs in by.values()] + [0.01])
+    fcfg = c.app.cfg.followup
+    try:
+        follow = followup.by_wallet(c.app.db, fcfg)
+    except Exception:  # noqa: BLE001 - a database older than the columns
+        follow = {}
+
+    def habit(w: str, count: str, flagged: bool) -> Any:
+        f = follow.get(w)
+        if f is None or not f.alerts:
+            return ("-", -1)
+        n = getattr(f, count)
+        text = f"{n} of {f.alerts}"
+        if flagged:
+            return (v.Raw(f'<span class="pill warn">{v.esc(text)}</span>'), n / f.alerts)
+        return (text, n / f.alerts)
+
     out = []
     for w, rs in by.items():
         s = summarise(w, rs, samples=300)
         status, days, cls = wallet_status(members.get(w), c.now)
         clv = clv_values(rs)
+        f = follow.get(w)
         out.append([
             v.link(f"/wallet/{w}?{c.f.qs()}", f"{w[:6]}…{w[-4:]}"),
             (v.Raw(f'<span class="pill {cls}">{v.esc(status)}</span>'), status),
@@ -557,15 +574,25 @@ def wallets(c: Ctx) -> str:
             (v.hbar(s.total_pnl, scale), s.total_pnl),
             (v.pct(s.roi), -9 if s.roi is None else s.roi),
             (f"{v.cents(mean(clv))} (n={len(clv)})", -9 if not clv else mean(clv)),
+            habit(w, "both_sides", f is not None and f.both_sides_flag(fcfg)),
+            habit(w, "sold_back", f is not None and f.sold_back_flag(fcfg)),
         ])
     out.sort(key=lambda r: -r[6][1])
     total = summarise("x", rows, samples=1)
     body = size_banner(c, total.settled) + '<div class="grid">' + v.card(
         "Wallets", v.table(
             ["Wallet", "Status", "Days on list", "Signals", "Closed", "Win rate", "P&L", "", "ROI",
-             ("CLV", "Closing price minus our fill, pre-game fills")], out, numeric_from=2),
+             ("CLV", "Closing price minus our fill, pre-game fills"),
+             ("Both sides", "Alerts where the whale also bought the other side of the market, within a day "
+                            "before to an hour after"),
+             ("Sold back", "Alerts where the whale sold back half its position or more within 30 minutes")],
+            out, numeric_from=2),
         note=f"{label_of(c.f.strategy)}. P&L is what OUR paper trades on the wallet's signals made, not the "
-             "wallet's own profit. A wallet with a handful of closed trades tells you nothing yet.", wide=True)
+             "wallet's own profit. A wallet with a handful of closed trades tells you nothing yet. Highlighted: "
+             f"flagged ({fcfg.min_alerts}+ followed-up alerts, both sides on {fcfg.both_sides_share:.0%} or more, "
+             f"sold back on {fcfg.sold_back_alert_share:.0%} or more). Flags change nothing unless a followup switch "
+             "is on in config.yaml; all are off.", wide=True)
+    body += followup_card(c, rows)
     try:
         hist = c.app.db.query("SELECT * FROM watchlist_membership ORDER BY added_at DESC, id DESC")
     except Exception:  # noqa: BLE001
@@ -583,6 +610,28 @@ def wallets(c: Ctx) -> str:
          for ts, what, w, why in events[:60]], numeric_from=9, empty="No watchlist changes recorded yet."),
         note=f"{len(events)} changes in all; the newest 60 are shown. History is never deleted.", wide=True)
     return body + "</div>"
+
+
+def followup_card(c: Ctx, rows: list[dict]) -> str:
+    """Hedged, partly hedged and clean alerts, and how our copies of each did."""
+    cfg = c.app.cfg.followup
+    head = [r for r in rows if r.get("runner") == "single" and r.get("followed_at") is not None]
+    if not head:
+        return v.card("Did the whale bet, or hedge?", '<p class="empty">No alert in this range has been followed up '
+                      "yet. Each is, an hour after it fires.</p>", wide=True)
+    out = []
+    for cls, meaning in ((followup.CLEAN, "no other-side buy"), (followup.PARTIAL, "some of the other side"),
+                         (followup.HEDGED, f"other side at least {cfg.hedge_ratio:.0%} of the alert")):
+        group = [r for r in head if followup.hedge_class(r, cfg.hedge_ratio) == cls]
+        s = summarise(cls, group, samples=SAMPLES)
+        out.append([f"{cls.capitalize()}: {meaning}", (str(len(group)), len(group)), (str(s.settled), s.settled),
+                    (v.money(s.total_pnl) if s.settled else "-", s.total_pnl, v.tone(s.total_pnl) if s.settled else ""),
+                    (f"{v.pct(s.mean_roi)} {ci_text(s)}" if s.settled else "-", s.mean_roi or 0)])
+    return v.card("Did the whale bet, or hedge?", v.table(
+        ["Alert", "Signals", "Closed", "Net P&L", "Mean ROI (95%)"], out, sortable=False, numeric_from=1),
+        note="From the fills the detector stored: the whale's buys of the market's other side from a day before the "
+             "alert to an hour after. The hour after was not known when we acted, so this describes the alerts; "
+             "it is not a rule the bot could have used. A fill the detector never saw is not counted.", wide=True)
 
 
 def trade_cells(r: dict, c: Ctx, *, with_wallet: bool = True) -> list[Any]:

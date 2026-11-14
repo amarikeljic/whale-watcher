@@ -22,6 +22,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import followup
 from .app import App
 from .bot import Bot
 from .detector import Detector
@@ -323,6 +324,11 @@ class Monitor:
              member["id"] if member else None,
              (1 if now < member["probation_until"] else 0) if member else None,
              detected_at - fill.ts, now, alert["id"]))
+        # What the whale bought of the other side in the day before (Part 4 #11). Read
+        # before the bot only when a switch needs it: otherwise it never delays a decision.
+        early = app.cfg.followup.skip_hedged_alerts
+        if early:
+            self._follow(alert)
         alert = app.db.one("SELECT * FROM alerts WHERE id = ?", (alert["id"],))
         tradable = not reason and market is not None
         if tradable and self.bot is not None:
@@ -330,6 +336,8 @@ class Monitor:
             if self.us is not None:
                 # After the bot, and in the background: a comparison never delays a decision.
                 self.us.submit(alert, market, detected_at=detected_at)
+        if not early:
+            self._follow(alert)
 
         kind, held = await self._kind(alert)
         app.db.execute("UPDATE alerts SET kind = ?, whale_position = ? WHERE id = ?", (kind, held, alert["id"]))
@@ -350,6 +358,12 @@ class Monitor:
         if self.bot is None and self.paper is not None and market is not None:
             self.paper.open(alert["id"], poll_counter=counter, market=market)
         return "alert"
+
+    def _follow(self, alert) -> None:
+        try:
+            followup.at_alert_time(self.app.db, alert)
+        except Exception:  # noqa: BLE001 - a measurement must never stop an alert
+            log.exception("could not read the whale's other-side buys for alert %s", alert["id"])
 
     def _skip_reason(self, alert, fill: Activity, market: MarketInfo | None, book: Book | None, now: int) -> str | None:
         cfg = self.cfg

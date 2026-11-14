@@ -456,7 +456,8 @@ class UsRowA:
         horizon = (base["scheduled_end"], base["days_to_close"]) if base else (None, None)
         common = dict(detected_at=detected_at, intl_ask=intl_ask, horizon=horizon)
         # The gates that have nothing to do with the venue are the baseline's own.
-        if base is not None and base["skip_code"] in (TOO_LONG, NO_END_DATE):
+        from .followup import SKIP_CODES
+        if base is not None and base["skip_code"] in (TOO_LONG, NO_END_DATE, *SKIP_CODES):
             return self._insert(alert, "SKIPPED", base["reason"], skip_code=base["skip_code"], **common)
         if base is not None and base["status"] == "MISSED" and (base["reason"] or "").startswith("too late"):
             return self._insert(alert, "MISSED", base["reason"], **common)

@@ -126,6 +126,7 @@ US_RUNNER = "us"            # polymarket_us.RUNNER: the same signals priced on P
 BOT_QUERY = """
 SELECT b.*, a.kind, a.outcome, a.whale_usd, a.probation, a.membership_id, a.detect_delay, a.trigger_fill_ts,
        a.snapshot_run_id, a.alert_best_ask, a.alert_best_bid, m.description AS market_rules,
+       a.opposite_before_usd, a.opposite_after_usd, a.related_usd, a.sold_back_share, a.followed_at,
        m.category, m.question, m.slug, m.event_slug, m.game_start_time,
        m.end_date AS market_end, m.resolved_at AS market_resolved_at, m.fee_rate AS market_fee_rate,
        m.fees_enabled AS market_fees_enabled, m.fee_exponent AS market_fee_exponent
@@ -425,6 +426,8 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
                          f"{_pct(m)}, 95% CI {ci} -> {verdict}")
         lines += cutoff_lines(app, runner, by.get((runner, BOT_HEADLINE), []))
     lines += wallet_lines(app, trades, brief=brief)
+    if not brief:
+        lines += followup_lines(app, trades, samples)
     lines += detection_lines(app)
     if with_breakdowns:
         headline = [t for t in trades if t["strategy"] == BOT_HEADLINE and t["status"] != "SKIPPED"
@@ -435,6 +438,55 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
                                        "holding time", "entry price", "wallet"))
     if scope.model == "current":
         lines += _other_model_lines(app, everything, sc, scope, threshold, samples, windows)
+    return lines
+
+
+def followup_lines(app: App, rows: list[dict], samples: int) -> list[str]:
+    """Part 4 #10, #11: the whale's other-side buys and quick sales around each alert,
+    and how the copies did by class. ``rows``: the bot rows in scope."""
+    from . import followup as fu
+    cfg = app.cfg.followup
+    alerts = app.db.query("SELECT whale_usd, opposite_before_usd, opposite_after_usd, related_usd, "
+                          "sold_back_share, followed_at FROM alerts WHERE followed_at IS NOT NULL")
+    if not alerts:
+        return []
+    classes: dict[str, int] = defaultdict(int)
+    known_early = related = sold = 0
+    for a in alerts:
+        d = dict(a)
+        cls = fu.hedge_class(d, cfg.hedge_ratio)
+        classes[cls] += 1
+        known_early += cls == fu.HEDGED and (d["opposite_before_usd"] or 0) >= cfg.hedge_ratio * d["whale_usd"]
+        related += (d["related_usd"] or 0) > 0
+        sold += (d["sold_back_share"] or 0) >= cfg.sold_back_fraction
+    lines = ["", "WHALE FOLLOW-UP: what the whale did around each alert (from the fills the detector stored)",
+             f"  {len(alerts)} alerts followed up: clean {classes[fu.CLEAN]} | partial {classes[fu.PARTIAL]} "
+             f"(bought some of the other side) | hedged {classes[fu.HEDGED]} (other side at least "
+             f"{cfg.hedge_ratio:.0%} of the alert) | bought another market of the same event on {related}",
+             f"  known when we acted: on {known_early} of the {classes[fu.HEDGED]} hedged alerts the other-side buy "
+             "came before the alert. A live rule can only see those; the rest came in the hour after.",
+             f"  sold back {cfg.sold_back_fraction:.0%} or more within 30 minutes: {sold} alerts"]
+    head = [t for t in rows if "runner" in t and t["runner"] == "single" and t["strategy"] == BOT_HEADLINE
+            and t["status"] != "SKIPPED"]
+    parts = []
+    for cls in (fu.CLEAN, fu.PARTIAL, fu.HEDGED):
+        group = [t for t in head if fu.hedge_class(t, cfg.hedge_ratio) == cls]
+        s = summarise(cls, group, samples=samples)
+        parts.append(f"{cls} n={s.settled} closed, net {_money(s.total_pnl)}, mean ROI {_pct(s.mean_roi)} "
+                     f"95% CI {_ci_text(s)}" if s.settled else f"{cls} n=0 closed")
+    lines.append(f"  single / {BOT_HEADLINE} by class: " + " | ".join(parts))
+    wallets = fu.by_wallet(app.db, cfg)
+    both = sorted((w for w in wallets.values() if w.both_sides_flag(cfg)), key=lambda w: -w.both_sides / w.alerts)
+    back = sorted((w for w in wallets.values() if w.sold_back_flag(cfg)), key=lambda w: -w.sold_back / w.alerts)
+    lines.append(f"  wallets that usually buy both sides ({cfg.min_alerts}+ alerts, {cfg.both_sides_share:.0%} or "
+                 "more): " + (", ".join(f"{w.wallet[:6]}…{w.wallet[-4:]} ({w.both_sides} of {w.alerts})"
+                                       for w in both) or "none"))
+    lines.append(f"  wallets that often sell back ({cfg.min_alerts}+ alerts, {cfg.sold_back_alert_share:.0%} or "
+                 "more): " + (", ".join(f"{w.wallet[:6]}…{w.wallet[-4:]} ({w.sold_back} of {w.alerts})"
+                                       for w in back) or "none"))
+    on = [n for n in ("skip_hedged_alerts", "skip_both_sides_wallets", "skip_sold_back_wallets") if getattr(cfg, n)]
+    lines.append("  switches: " + (", ".join(on) + " ON" if on else
+                                   "all off (followup.skip_* in config.yaml): nothing is skipped for these yet"))
     return lines
 
 

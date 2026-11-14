@@ -29,7 +29,7 @@ import sys
 import time
 from collections import deque
 
-from . import bankroll, outages
+from . import bankroll, followup, outages
 from .app import App, open_app
 from .bot import Bot
 from .config import Config
@@ -245,6 +245,12 @@ class Service:
             app.db.set_state("last_settle_at", now)
             if settled or closed:
                 log.info("settled %d old-rule paper trades and %d bot trades", settled, closed)
+        if now - int(app.db.get_state("last_followup_at", 0)) >= cfg.followup.update_every_seconds:
+            app.db.set_state("last_followup_at", now)
+            try:
+                followup.update(app)         # Part 4 #10, #11: alerts whose hour has passed
+            except Exception:
+                log.exception("could not fill in the whale follow-up; trying again later")
         today = from_ts(now).strftime("%Y-%m-%d")
         dt = from_ts(now)
         if (cfg.rescore.enabled and app.db.get_state("last_rescore_day") != today
@@ -370,6 +376,14 @@ async def run_command(args, cfg: Config) -> int:
             n = await PaperEngine(app).settle()
             m = await Bot(app, Monitor.RUNNER).settle()
             print(f"settled {n} old-rule paper trades and {m} bot trades")
+            return 0
+        if args.command == "followup":
+            from .stats import Scope, followup_lines, load_bot_trades, scope_rows
+            n = followup.update(app, limit=10**9)
+            print(f"filled in {n} alerts")
+            rows = scope_rows(app, load_bot_trades(app), Scope()).rows
+            print("\n".join(followup_lines(app, rows, app.cfg.stats.bootstrap_samples)
+                            or ["no alert has been followed up yet (each needs an hour after it fired)"]))
             return 0
         if args.command == "stats":
             from .stats import Scope

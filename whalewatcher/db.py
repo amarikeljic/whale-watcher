@@ -577,6 +577,12 @@ STAMP_COLUMNS = (("code_commit", "TEXT"), ("model_version", "INTEGER"), ("settin
 ADDED_COLUMNS += tuple((11, table, column, decl) for table in STAMPED_TABLES for column, decl in STAMP_COLUMNS)
 ADDED_COLUMNS += (
     (11, "outage_windows", "kind", "TEXT"),     # runner | detector | data (outages.py); NULL: entered by hand
+    # Part 4 #10, #11: what the whale did around the alert (followup.py)
+    (11, "alerts", "opposite_before_usd", "REAL"),   # other side bought in the 24 h before: known when we acted
+    (11, "alerts", "opposite_after_usd", "REAL"),    # other side bought in the hour after
+    (11, "alerts", "related_usd", "REAL"),           # bought in other markets of the same event
+    (11, "alerts", "sold_back_share", "REAL"),       # share of the alert's shares sold within 30 minutes
+    (11, "alerts", "followed_at", "INTEGER"),        # when the figures needing the hour after were filled in
 )
 
 

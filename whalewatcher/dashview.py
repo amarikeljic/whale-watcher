@@ -250,6 +250,8 @@ tbody tr:hover{background:var(--wash)}
 .pill{display:inline-block;border-radius:99px;padding:1px 8px;font-size:11px;font-weight:600;border:1px solid var(--border);
 color:var(--ink2)}
 .pill.good{color:var(--up)}.pill.bad{color:var(--down)}
+.pill.warn{border-color:var(--warning);box-shadow:inset 0 0 0 1px var(--warning)}
+.card-note.warn{border-left:3px solid var(--warning);padding-left:8px}
 .hbar{width:120px;height:8px;display:block}.hbar .pos{fill:var(--pos)}.hbar .neg{fill:var(--neg)}
 .hbar .hbar-axis{fill:var(--axis)}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:5px 16px;font-size:14px;margin:6px 0 0}

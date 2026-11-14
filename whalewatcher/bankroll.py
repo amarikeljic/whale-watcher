@@ -205,6 +205,9 @@ class Signal:
 # Skips that say the bet does not exist on the venue (polymarket_us.py). A wallet on that
 # venue could not have taken the signal at any stake, so it is a skip, never a miss.
 VENUE_SKIPS = ("not_on_us", "not_same_bet", "us_excluded")
+# The followup switches (Part 4 #10, #11): a signal the bot was told not to copy is not
+# copied by the wallet either. Off by default, so no row carries one.
+SIGNAL_SKIPS = VENUE_SKIPS + ("hedged", "both_sides_wallet", "sold_back_wallet")
 
 
 @dataclass
@@ -613,7 +616,7 @@ def signal_of(rec: dict, cfg: Config) -> Signal | None:
         min_shares=rec.get("min_order_size") or DEFAULT_MIN_SHARES, fee_rate=rate, fee_exponent=exp,
         scheduled_end=rec.get("scheduled_end"), settle_ts=settle_ts if payout is not None else None, payout=payout,
         wallet=rec.get("wallet"), question=rec.get("question") or "",
-        venue_skip=rec.get("skip_code") if rec.get("skip_code") in VENUE_SKIPS else None)
+        venue_skip=rec.get("skip_code") if rec.get("skip_code") in SIGNAL_SKIPS else None)
 
 
 def source_key(rec: dict) -> str | None:

@@ -67,6 +67,7 @@ python -m whalewatcher stats [--brief]              # the full report, or the sh
 python -m whalewatcher stats --model before         # ...for the rows made before model versions (also: all, or a number)
 python -m whalewatcher stats --include-outages      # ...counting signals made inside outage windows
 python -m whalewatcher version                      # the model version and commit new rows get, and what each version changed
+python -m whalewatcher followup                     # what the whale did around each alert: other side, sold back, flags
 python -m whalewatcher export --csv exports/paper_trades.csv
 python -m whalewatcher health                        # Docker healthcheck
 ```
@@ -259,6 +260,28 @@ do not count. It is a reminder, not a proof.
 
 The dashboard and `stats` also leave out signals made inside recorded outage
 windows unless asked (`Include outage windows`, `stats --include-outages`).
+
+### What the whale did around each alert (v2.1 Part 4)
+
+A whale's buy is not always a bet. In the first 60 live alerts the same wallet
+also bought the other side of the market in 29 of them, always within the hour,
+and in 5 the other side was at least as large: no real position at all
+(`docs/worries.md`, 11). `followup.py` measures this on every alert, from the
+fills the detector already stored (no extra requests):
+
+* the other side bought in the **24 hours before** the alert (known when the
+  bot acted) and in the **hour after** (known only later),
+* buys in **other markets of the same event** (a draw, a spread),
+* the share of the position **sold back within 30 minutes** (bait, worry 10).
+
+Each alert is **clean**, **partial** or **hedged** (other side at least half of
+the alert). `stats`, `followup` and the Wallets page show how our copies of each
+class did, with n and the interval, and flag wallets that **usually buy both
+sides** or **often sell back** (5 or more followed-up alerts). Three switches
+can act on this, and **all three are off**: `followup.skip_hedged_alerts` (uses
+only buys before the alert), `skip_both_sides_wallets` and
+`skip_sold_back_wallets` (use only alerts already followed up). Turning one on
+changes which signals are copied, so it should come with a new model version.
 
 ### Time-to-close cutoff (v2.1)
 

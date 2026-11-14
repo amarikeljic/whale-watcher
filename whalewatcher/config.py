@@ -250,6 +250,21 @@ class PolymarketUsConfig:
     market_cache_seconds: int = 600           # how long a US market's details are reused
 
 
+@dataclass
+class FollowupConfig:
+    """v2.1 Part 4 #10 and #11: what the whale did around each alert (followup.py).
+    The three switches are off: turning one on changes which signals are copied."""
+    skip_hedged_alerts: bool = False      # do not copy an alert the whale had already hedged in the 24 h before
+    skip_both_sides_wallets: bool = False # stop copying wallets that usually buy both sides
+    skip_sold_back_wallets: bool = False  # stop copying wallets that often sell back within 30 minutes
+    hedge_ratio: float = 0.5              # other side at least this share of the alert's dollars: "hedged"
+    min_alerts: int = 5                   # followed-up alerts a wallet needs before it can be flagged
+    both_sides_share: float = 0.5         # flagged "both sides" when it bought the other side on this share of them
+    sold_back_fraction: float = 0.5       # selling back this share of the position within 30 min counts as "sold back"
+    sold_back_alert_share: float = 0.2    # flagged "sells back" when that happened on this share of its alerts
+    update_every_seconds: int = 600       # how often the runner fills in the follow-up of alerts whose hour passed
+
+
 def _fee_table() -> list[dict[str, Any]]:
     # https://docs.polymarket.com/trading/fees.md, table read 2026-11-10. `from` is the
     # day a table took effect; add a new entry when Polymarket changes its fees and
@@ -330,6 +345,7 @@ class Config:
     filters: FiltersConfig = field(default_factory=FiltersConfig)
     bankroll: BankrollConfig = field(default_factory=BankrollConfig)
     polymarket_us: PolymarketUsConfig = field(default_factory=PolymarketUsConfig)
+    followup: FollowupConfig = field(default_factory=FollowupConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
 
     def public_dict(self) -> dict[str, Any]:
@@ -357,6 +373,7 @@ _SECTIONS = {
     "filters": FiltersConfig,
     "bankroll": BankrollConfig,
     "polymarket_us": PolymarketUsConfig,
+    "followup": FollowupConfig,
     "api": ApiConfig,
 }
 
@@ -433,6 +450,12 @@ def validate(cfg: Config) -> None:
     fe = cfg.fees
     if fe.rate_source not in ("market", "table", "higher"):
         raise ConfigError("fees.rate_source must be market, table or higher")
+    fu = cfg.followup
+    for name in ("hedge_ratio", "both_sides_share", "sold_back_fraction", "sold_back_alert_share"):
+        if not 0 < getattr(fu, name) <= 1:
+            raise ConfigError(f"followup.{name} must be above 0 and at most 1")
+    if fu.min_alerts < 1 or fu.update_every_seconds < 60:
+        raise ConfigError("followup.min_alerts must be at least 1 and followup.update_every_seconds at least 60")
     us = cfg.polymarket_us
     if not isinstance(us.exclude_categories, list) or not all(isinstance(c, str) for c in us.exclude_categories):
         raise ConfigError("polymarket_us.exclude_categories must be a list of category names, such as [sports]")

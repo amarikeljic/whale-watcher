@@ -167,6 +167,22 @@ polymarket_us:
   bypass_cache: true              # ask for a fresh book. A plain request is served up to 30 s old
   market_cache_seconds: 600
 
+# What the whale did around each alert (v2.1 Part 4 #10, #11): whether it also bought
+# the other side of the market (a possible hedge) and whether it sold back within 30
+# minutes (possible bait). Worked out from the fills the detector stored; reported by
+# `stats`, `followup` and the Wallets page. The three switches are OFF: turning one on
+# changes which signals are copied, so raise the model version (whalewatcher/version.py).
+followup:
+  skip_hedged_alerts: false       # skip an alert when the whale bought the other side in the 24 h before
+  skip_both_sides_wallets: false  # stop copying wallets that usually buy both sides
+  skip_sold_back_wallets: false   # stop copying wallets that often sell back within 30 minutes
+  hedge_ratio: 0.5                # other side at least half of the alert's dollars: "hedged"
+  min_alerts: 5                   # a wallet is flagged only after this many followed-up alerts
+  both_sides_share: 0.5           # "both sides": bought the other side on half its alerts or more
+  sold_back_fraction: 0.5         # selling back half the position within 30 min counts as "sold back"
+  sold_back_alert_share: 0.2      # "sells back": that happened on 20% of its alerts or more
+  update_every_seconds: 600
+
 # Costs (v2.1). Every paper fill pays the taker fee, on the buy and on a mirror-exit
 # sell:  fee = shares x rate x price x (1 - price).  No rebate is ever counted.
 fees:

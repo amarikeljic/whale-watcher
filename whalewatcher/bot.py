@@ -41,6 +41,7 @@ import random
 from dataclasses import dataclass
 from typing import Any
 
+from . import followup
 from .app import App
 from .bankroll import HEADLINE
 from .config import BOT_STRATEGIES, StrategyConfig
@@ -216,6 +217,8 @@ class Bot:
         end = scheduled_end(market.end_date, market.game_start_time) if market else None
         horizon = (end, days_to_close(end, decided_at))
         too_far = close_skip(end, decided_at, self.app.cfg.filters) if market is not None else None
+        if too_far is None:     # Part 4 #10, #11: off unless a followup switch is on
+            too_far = followup.skip(self.app, alert)
         for strategy in self.enabled():
             stake = self.stake_for(strategy, alert["whale_usd"])
             if too_far is not None:

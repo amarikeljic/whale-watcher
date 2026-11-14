@@ -47,11 +47,11 @@ BEFORE_TAGGING = "before tagging"
 # The decision code: which wallets are watched, which fills become signals, the fill
 # price, the fees, the stake, the settlement, the marks. config.py holds the defaults.
 MODEL_SOURCES = (
-    "backtest.py", "bankroll.py", "bot.py", "config.py", "consensus.py", "costs.py", "detector.py", "fees.py",
+    "backtest.py", "bankroll.py", "bot.py", "config.py", "consensus.py", "costs.py", "detector.py", "fees.py", "followup.py",
     "horizon.py", "ledger.py", "markets.py", "monitor.py", "paper.py", "polymarket.py", "polymarket_us.py",
     "scoring.py", "timeutil.py", "watchlist.py",
 )
-MODEL_SOURCE_DIGEST = "75ea457918584cfc"
+MODEL_SOURCE_DIGEST = "7dddaa85698cd19f"
 
 _COMMIT = re.compile(r"[0-9a-f]{4,40}(-dirty)?")
 # Sections that change nothing about a decision: where the database is, how the API
