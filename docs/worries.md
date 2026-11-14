@@ -394,3 +394,16 @@ token), and the dashboard shows no configuration.
 **What is left is on your server.** The old `.env` still holds the two real
 webhook addresses. Delete it, and delete the two webhooks in Discord so the
 addresses stop working.
+
+## Parked for later
+
+Ideas the owner chose to keep for later. Nothing here is built.
+
+* **Faster detection** (question 9, parked 2026-11-14). A whale's fill shows up in
+  the public trade feed a median 3.4 s after its block (README, "Detection").
+  Reading new blocks straight from the chain, through a free key from a blockchain
+  data provider such as Alchemy or QuickNode, might save a second or two (not
+  measured). It needs a free account and key from the owner, a new outside host
+  approved by the owner, and that provider's terms read first. It is a read-only
+  data key, never a trading key. The detector would publish the same rows as now,
+  so nothing after it changes.
