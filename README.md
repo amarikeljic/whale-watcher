@@ -466,9 +466,20 @@ in and out. Two checks apply at the door as well as at review:
   is more than 30% maker rebates and liquidity rewards, or with more than 100
   fills per market, is turned away. A check that could not be read is never
   treated as a pass.
-* **Our own record of the wallet**: once our paper trades on its alerts cover 15
+* **Our own record of the wallet**: once our copies of its alerts cover 15
   settled events, a negative mean closing-line value is a failed review, and
-  keeps a removed wallet from walking straight back in.
+  keeps a removed wallet from walking straight back in. "Our copies" are the
+  bot's headline trades (`single / flat_hold`) plus the old rule's paper trades
+  from before the bot model. Until 2026-11-14 it read only the second, so it
+  had stopped being able to fire.
+
+A review can be run for a past date (`nightly(as_of=...)`). It then uses only
+what was known on that date: the leak-free candidate pool (markets that had
+closed by the date, trades before it), our own record up to the date, and no
+market-maker check, because `/v2/user-stats` gives lifetime figures as of
+today. `tests/test_hindsight.py` builds the same history twice, once with
+everything after the date deleted, and checks the pool, the scores and the
+decisions come out the same.
 
 Every stay on the list is one row of `watchlist_membership`. A wallet that
 comes back gets a new row, and the database refuses to delete history. New

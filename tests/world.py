@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from whalewatcher.timeutil import iso
+from whalewatcher.timeutil import iso, parse_time
 
 
 @dataclass
@@ -155,7 +155,18 @@ class World:
             ids = ids if isinstance(ids, list) else [ids]
             return [self.markets[c].gamma() for c in ids if c in self.markets]
         offset, limit = int(params.get("offset") or 0), min(100, int(params.get("limit") or 100))
-        return [m.gamma() for m in self.markets.values()][offset:offset + limit]
+        lo, hi = parse_time(params.get("end_date_min")), parse_time(params.get("end_date_max"))
+        want_closed = params.get("closed") in (True, "true")
+
+        def keep(m: FakeMarket) -> bool:
+            # Like Gamma: the end-date range filters on endDate and closed=true keeps closed
+            # markets. A fake market with no end date passes the date filter (older tests).
+            if want_closed and m.resolved_at is None and m.closed_time is None:
+                return False
+            if m.end_date is not None and ((lo is not None and m.end_date < lo) or (hi is not None and m.end_date > hi)):
+                return False
+            return True
+        return [m.gamma() for m in self.markets.values() if keep(m)][offset:offset + limit]
 
     def _resolutions(self, params: dict[str, Any]) -> dict[str, Any]:
         out = []

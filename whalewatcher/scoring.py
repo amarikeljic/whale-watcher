@@ -29,7 +29,7 @@ from .app import App, PriceLookup
 from .config import ScoringConfig
 from .ledger import MarketLedger, build_ledgers, entry_vwap
 from .polymarket import Activity, MarketInfo, assign_fill_keys
-from .timeutil import add_months, iso, month_key, months_in_window
+from .timeutil import add_months, iso, month_key, months_in_window, parse_time
 from .timing import Progress, Stopwatch
 
 log = logging.getLogger(__name__)
@@ -438,7 +438,7 @@ async def candidate_pool(app: App, as_of: int, *, historical: bool) -> tuple[dic
     # Large traders across diverse top markets: the historical pool's source, used
     # live too, so live scoring draws from the same kind of pool `optimize` validated.
     tag = "historical_large_trades" if historical else "top_market_large_trades"
-    conds = await _diverse_top_markets(app, as_of)
+    conds = await _diverse_top_markets(app, as_of, historical=historical)
     for i in range(0, len(conds), 20):
         trades = await app.data.trades(conditions=conds[i:i + 20], min_usd=cfg.historical_min_trade_usd,
                                        max_pages=3)
@@ -453,20 +453,31 @@ async def candidate_pool(app: App, as_of: int, *, historical: bool) -> tuple[dic
     return {w: pool[w] for w in ranked}, notes
 
 
-async def _diverse_top_markets(app: App, as_of: int) -> list[str]:
-    """Top-volume markets ending around as_of, at most historical_per_event per event."""
+async def _diverse_top_markets(app: App, as_of: int, *, historical: bool) -> list[str]:
+    """Top-volume closed markets ending around as_of, at most historical_per_event per event.
+
+    "Top volume" is each market's total volume as reported today. For a market that
+    had stopped trading by as_of that is all volume before as_of. For one still
+    trading at as_of it includes trading after it, so the historical (leak-free) pool
+    takes only markets that had closed by as_of. The live pool runs for today, where
+    there is no after, and keeps markets ending up to 14 days ahead."""
     cfg = app.cfg.candidates
     chosen: list[str] = []
     per_event: dict[str, int] = defaultdict(int)
     seen: set[str] = set()
+    end_max = as_of if historical else as_of + 14 * DAY
     for page in range(10):
         batch = await app.gamma.top_markets(end_min=_gamma_date(as_of - 90 * DAY),
-                                            end_max=_gamma_date(as_of + 14 * DAY), offset=page * 100)
+                                            end_max=_gamma_date(end_max), offset=page * 100)
         for m in batch:
             cid = str(m.get("conditionId") or "").lower()
             if not cid or cid in seen:
                 continue
             seen.add(cid)
+            if historical:
+                closed_at = parse_time(m.get("closedTime"))
+                if closed_at is None or closed_at > as_of:
+                    continue        # still trading at as_of: its volume includes the future
             events = m.get("events") or [{}]
             event = (events[0] or {}).get("slug") or m.get("slug") or cid
             if per_event[event] >= cfg.historical_per_event:

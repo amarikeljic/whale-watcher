@@ -114,19 +114,34 @@ def screen_failures(s: Screen, max_rebate_share: float, max_fills_per_market: fl
     return out
 
 
-def live_record(app: App, wallet: str) -> tuple[int, float | None]:
+def live_record(app: App, wallet: str, as_of: int | None = None) -> tuple[int, float | None]:
     """(events, mean CLV) of our own settled live paper trades of this wallet's alerts.
 
     One figure per event (a wallet's fills in one game are one bet), over fills that
     have a closing price. In-play fills have none (stats.py explains why) and are
-    left out. Simulated (backtest) trades never count."""
+    left out. Simulated (backtest) trades never count.
+
+    Two ledgers: the bot's headline strategy (``single / flat_hold``), where every
+    copy has gone since the bot model started, and the old rule's paper trades from
+    before it. Reading only the second froze this rule (found 2026-11-14).
+    ``as_of``: only trades settled by then, so a review for a past date sees only
+    what was known on that date."""
+    until = app.clock() + 1 if as_of is None else as_of
     rows = app.db.query(
         "SELECT COALESCE(m.event_slug, p.condition_id) AS event, p.closing_price - p.fill_price AS clv "
         "FROM paper_trades p JOIN alerts a ON a.id = p.alert_id "
         "LEFT JOIN poly_markets m ON m.condition_id = p.condition_id "
-        "WHERE a.wallet = ? AND p.status = 'FILLED' AND p.settled_at IS NOT NULL "
+        "WHERE a.wallet = ? AND p.status = 'FILLED' AND p.settled_at IS NOT NULL AND p.settled_at <= ? "
         "AND p.closing_price IS NOT NULL AND p.fill_price IS NOT NULL AND p.strategy NOT LIKE 'backtest:%' "
-        "AND NOT (m.game_start_time IS NOT NULL AND p.fill_ts >= m.game_start_time)", (wallet,))
+        "AND NOT (m.game_start_time IS NOT NULL AND p.fill_ts >= m.game_start_time) "
+        "UNION ALL "
+        "SELECT COALESCE(m.event_slug, b.condition_id) AS event, b.closing_price - b.fill_price AS clv "
+        "FROM bot_trades b LEFT JOIN poly_markets m ON m.condition_id = b.condition_id "
+        "WHERE b.wallet = ? AND b.runner = 'single' AND b.strategy = 'flat_hold' AND b.status = 'FILLED' "
+        "AND b.closed_at IS NOT NULL AND b.closed_at <= ? "
+        "AND b.closing_price IS NOT NULL AND b.fill_price IS NOT NULL "
+        "AND NOT (m.game_start_time IS NOT NULL AND b.decided_at >= m.game_start_time)",
+        (wallet, until, wallet, until))
     by_event: dict[str, list[float]] = defaultdict(list)
     for r in rows:
         by_event[r["event"]].append(r["clv"])
@@ -136,8 +151,8 @@ def live_record(app: App, wallet: str) -> tuple[int, float | None]:
     return len(per_event), sum(per_event) / len(per_event)
 
 
-def live_failures(app: App, wallet: str, x: WatchlistExit) -> list[str]:
-    events, clv = live_record(app, wallet)
+def live_failures(app: App, wallet: str, x: WatchlistExit, as_of: int | None = None) -> list[str]:
+    events, clv = live_record(app, wallet, as_of)
     if clv is not None and events >= x.live_min_events and clv < x.live_max_clv:
         return [f"live CLV {clv:+.3f} over {events} settled events < {x.live_max_clv:+.3f}"]
     return []
@@ -255,11 +270,19 @@ async def nightly(app: App, *, as_of: int | None = None,
     wl, x = cfg.watchlist, cfg.watchlist.exit
     seed_from_monitored(app)
     as_of = as_of if as_of is not None else start_of_day(app.clock())
+    # A review for a past date may use only what was known on that date: the leak-free
+    # pool instead of today's leaderboards, our own record up to that date, and no
+    # market-maker check (its figures are lifetime totals as of today).
+    past = as_of < start_of_day(app.clock())
+    own_until = as_of if past else None
     before = members(app)
 
     # 1. Discover. Members are always in the pool, so each one is re-scored even on a
     #    night it appears on no leaderboard.
-    pool, notes = await candidate_pool(app, as_of, historical=False)
+    pool, notes = await candidate_pool(app, as_of, historical=past)
+    if past:
+        notes.append("review for a past date: leak-free candidate pool, our own record up to that date, and no "
+                     "market-maker check (it uses lifetime figures as of today)")
     for wallet in before:
         pool.setdefault(wallet, set()).add("watchlist")
     scoring = entry_scoring(cfg)
@@ -278,8 +301,8 @@ async def nightly(app: App, *, as_of: int | None = None,
             review.decisions.append(Decision(wallet, SKIP, "could not be scored tonight (data unavailable); "
                                                            "not counted as a failed review", row["id"]))
             continue
-        fails = exit_failures(m, x, scoring) + live_failures(app, wallet, x)
-        screen = await _screen(app, wallet)
+        fails = exit_failures(m, x, scoring) + live_failures(app, wallet, x, own_until)
+        screen = None if past else await _screen(app, wallet)
         if screen is not None:
             fails += screen_failures(screen, x.max_rebate_share, x.max_fills_per_market)
         # A wallet carried over from v1 never passed the entry rules: v1 picked a nightly
@@ -321,7 +344,7 @@ async def nightly(app: App, *, as_of: int | None = None,
     newcomers = sorted((m for m in run.metrics if m.rank is not None and m.wallet not in before),
                        key=lambda m: m.rank)
     for m in newcomers:
-        blocked = exit_failures(m, x, scoring) + live_failures(app, m.wallet, x)
+        blocked = exit_failures(m, x, scoring) + live_failures(app, m.wallet, x, own_until)
         if blocked:
             review.decisions.append(Decision(m.wallet, REJECT, "passes the entry rules on its score, but: "
                                              + "; ".join(blocked)))
@@ -330,12 +353,13 @@ async def nightly(app: App, *, as_of: int | None = None,
             review.decisions.append(Decision(m.wallet, WAIT, f"qualifies, but the watchlist is full "
                                                              f"({wl.max_size}): {_describe(m, scoring.rank_by)}"))
             continue
-        screen = await _screen(app, m.wallet)
-        if screen is None:
+        screen = None if past else await _screen(app, m.wallet)
+        if screen is None and not past:
             review.decisions.append(Decision(m.wallet, WAIT, "qualifies, but the market-maker check could not "
                                                              "be read tonight; will retry at the next review"))
             continue
-        flagged = screen_failures(screen, wl.entry.max_rebate_share, wl.entry.max_fills_per_market)
+        flagged = [] if screen is None else screen_failures(screen, wl.entry.max_rebate_share,
+                                                             wl.entry.max_fills_per_market)
         if flagged:
             review.decisions.append(Decision(m.wallet, REJECT, "; ".join(flagged)))
             continue
