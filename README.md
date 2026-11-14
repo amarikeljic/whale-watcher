@@ -82,6 +82,13 @@ lookups for CLV; `scoring.clv_sample_positions` trades precision for speed.
 
 Tests (every network call mocked): `pip install -r requirements-dev.txt && pytest`.
 
+Reference: `docs/data-sources.md` (every host, its limit, our rate, and the venues'
+terms quoted), `docs/dependencies.md` (every pinned package and what it is for) and
+`docs/worries.md` (the Part 4 report). One-off, by hand on the server:
+`python3 scripts/check_block_times.py --db data/whalewatcher.sqlite3` compares the Data
+API's trade times with Polygon block times (read-only; it asks one public Polygon RPC
+for receipts and blocks, nothing else).
+
 ## How it works
 
 **Phase 1, scoring** (`scoring.py`). Candidates come from leaderboards (week,
