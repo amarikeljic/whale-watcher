@@ -342,7 +342,7 @@ def overview(c: Ctx) -> str:
         v.tile("ROI", v.pct(s.roi), f"on ${s.total_cost:,.0f} staked, {n}", v.tone(s.roi)),
         v.tile("Win rate", "-" if s.win_rate is None else f"{s.win_rate:.0%}", n),
         v.tile("Max drawdown", f"${s.max_drawdown:,.2f}" if s.settled else "-", n),
-        v.tile("Open exposure", f"${open_cost:,.2f}", f"{s.open} open positions, at cost"),
+        v.tile("Open exposure", f"${open_cost:,.2f}", f"{s.open} open position{'' if s.open == 1 else 's'}, at cost"),
         v.tile("Costs paid", f"${costs.fees + costs.slippage:,.2f}",
                f"fees ${costs.fees:,.2f} + slippage ${costs.slippage:,.2f}, n={costs.n} closed"),
         v.tile("Signals", str(len(rows)), f"{s.settled} closed · {s.open} open · {s.missed} missed · {skipped} skipped"),

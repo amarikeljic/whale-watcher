@@ -40,7 +40,7 @@ def test_overview_shows_the_hand_checked_totals_each_with_its_n(site):
     assert "+$2.50" in html and "+5.0%" in html and "60%" in html, "P&L, ROI and win rate of the five closed trades"
     assert "n=5 closed" in html and "on $50 staked" in html
     assert "9" in html and "5 closed · 1 open · 1 missed · 2 skipped" in html
-    assert "$10.00" in html and "1 open positions, at cost" in html
+    assert "$10.00" in html and "1 open position, at cost" in html
     assert "Not enough data: 5 closed trades in this range (need at least 30)" in html
     assert "The interval includes zero" in html and "95% interval" in html
     assert "Where the money went" in html and "Costs paid" in html and "Every other figure on this dashboard is net" in html
