@@ -32,7 +32,7 @@ from typing import Any
 from .app import App
 from .horizon import DAY, NO_END_DATE, TOO_LONG, days_to_close, held_days, scheduled_end
 from .horizon import bucket as horizon_bucket
-from .stats_util import max_drawdown, mean, median, two_way_bootstrap_mean_ci
+from .stats_util import max_drawdown, mean, median, plural, two_way_bootstrap_mean_ci
 from .timeutil import iso
 from .version import BEFORE_TAGGING, MODEL_VERSION
 from .version import label as model_label
@@ -557,10 +557,10 @@ def settle_check_lines(app: Any, *, brief: bool = False) -> list[str]:
     if c.stuck:
         sample = ", ".join(f"#{r['id']} {r['runner']}/{r['strategy']} on {r['slug'] or r['condition_id'][:12]}"
                            for r in c.stuck[:3])
-        out.append(f"  ! {len(c.stuck)} open fills cannot settle: their market has resolved but does not list "
-                   f"their token, so they will stay open. A bug to fix. First: {sample}")
+        out.append(f"  ! {plural(len(c.stuck), 'open fill')} cannot settle: the market has resolved but does not "
+                   f"list the token, so the trade stays open. A bug to fix. First: {sample}")
     if c.lost:
-        out.append(f"  ! {c.lost} signals in the last 7 days were missed because Gamma had no data for their "
+        out.append(f"  ! {plural(c.lost, 'signal')} missed in the last 7 days because Gamma had no data for the "
                    "market. More than a stray one or two means the market lookup is failing.")
     return out
 

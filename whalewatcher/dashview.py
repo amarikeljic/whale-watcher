@@ -263,6 +263,7 @@ font-size:14px;line-height:1.45}.review-list code{font-size:13px}
 .hbar .hbar-axis{fill:var(--axis)}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:5px 16px;font-size:14px;margin:6px 0 0}
 .kv dt{color:var(--ink2)}.kv dd{margin:0;font-variant-numeric:tabular-nums}
+.kv.stack{grid-template-columns:1fr;gap:1px 0}.kv.stack dd{margin:0 0 9px}
 .empty{color:var(--muted);font-size:14px;margin:10px 0 6px}
 .pager{display:flex;gap:12px;align-items:center;font-size:13px;color:var(--ink2);margin-top:10px}
 .tip{position:fixed;z-index:20;pointer-events:none;background:var(--ink);color:var(--plane);border-radius:8px;

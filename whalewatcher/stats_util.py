@@ -8,6 +8,11 @@ from collections import defaultdict
 from collections.abc import Hashable, Sequence
 
 
+def plural(n: int, word: str) -> str:
+    """"1 signal", "2 signals"."""
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
 def mean(values: Sequence[float]) -> float | None:
     return sum(values) / len(values) if values else None
 

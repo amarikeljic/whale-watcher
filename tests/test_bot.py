@@ -500,7 +500,7 @@ async def test_the_report_shows_what_only_the_wider_limit_caught(live_app, fake_
     from whalewatcher import dashboard as dash
     card = dash.limit_card(dash.build_ctx(live_app.cfg, live_app.db, {}, "/edge", now=clock.now))
     assert "Chase limit: the same signals, three limits" in card and "Up to 10c above the whale" in card
-    assert f"1 signals: 1 won, net +${won:.2f}" in card and f"this limit +${won:.2f} · headline +$0.00" in card
+    assert f"1 signal: 1 won, net +${won:.2f}" in card and f"this limit +${won:.2f} · headline +$0.00" in card
 
 
 def test_a_strategys_own_chase_limit_is_checked():

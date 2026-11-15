@@ -107,11 +107,11 @@ def test_a_fill_that_cannot_settle_is_shown_not_left_silent(tmp_path):
     chk = settle_check(app)
     assert len(chk.stuck) == 1 and (chk.lost, chk.signals) == (1, 2) and not chk.ok
     text = "\n".join(settle_check_lines(app, brief=True))
-    assert "open fills that cannot settle: 1" in text and "1 open fills cannot settle" in text
+    assert "open fills that cannot settle: 1" in text and "1 open fill cannot settle" in text
     db.close()
     html = dash.render(Config(database_path=path), path, "/health", {}, now=NOW)[1]
-    assert "Can every trade settle?" in html and "1 open fills cannot settle" in html
-    assert "1 signals in the last 7 days were missed because Gamma had no data" in html
+    assert "Can every trade settle?" in html and "1 open fill cannot settle" in html
+    assert "1 signal missed in the last 7 days because Gamma had no data" in html
 
 
 def test_a_quiet_check_stays_out_of_the_daily_summary(tmp_path):

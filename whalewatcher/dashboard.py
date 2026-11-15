@@ -43,7 +43,7 @@ from .stats import (ARRIVAL_ORDER, SIM_PREFIX, SUMMARY_WINDOW, Scope, Scoped, _p
                     cutoff_report, decision_rule, event_key, game_state, in_play, last_review, limit_report,
                     load_bot_trades, load_trades, markout_columns, markout_groups, markouts, outage_windows,
                     recheck_report, scope_rows, settle_check, sim_strategies, summarise, us_comparison)
-from .stats_util import mean, median
+from .stats_util import mean, median, plural
 from .timeutil import iso, now_ts, parse_as_of, start_of_day
 from .version import MODEL_VERSION
 from .version import label as model_label
@@ -632,8 +632,9 @@ def limit_card(c: Ctx) -> str:
               ("Filled", f"this limit {a.filled} · headline {a.head_filled}"),
               ("Net P&L (a miss is $0)", f"this limit {v.money(a.pnl)} · headline {v.money(a.head_pnl)}"),
               ("Headline minus this limit, per signal", f"{v.money(a.diff)}, {ci}"),
-              (f"Only the {a.wider:.0f}c limit filled", f"{a.only_n} signals: {a.only_won} won, net {v.money(a.only_pnl)}")]
-        items += (f'<li><div class="rule-head"><span>{v.esc(head)}</span></div><dl class="kv">'
+              (f"Only the {a.wider:.0f}c limit filled", f"{plural(a.only_n, 'signal')}: {a.only_won} won, net {v.money(a.only_pnl)}")]
+        # Label above value: these labels are long, and side by side they squeeze the numbers on a phone.
+        items += (f'<li><div class="rule-head"><span>{v.esc(head)}</span></div><dl class="kv stack">'
                   + "".join(f"<dt>{v.esc(k)}</dt><dd>{v.esc(val)}</dd>" for k, val in kv) + "</dl></li>")
     return v.card("Chase limit: the same signals, three limits", f'<ul class="rule-tests">{items}</ul>',
                   note="How far above the whale's price the bot will still buy. The headline stops at 3 cents. In the "
@@ -1482,11 +1483,12 @@ def health(c: Ctx) -> str:
 
     chk = settle_check(app, now)
     if chk.stuck:
-        body += v.banner(f"{len(chk.stuck)} open fills cannot settle: their market has resolved but does not list "
-                         "their token, so they will stay open and hold a wallet slot. This is a bug to fix.", "bad")
+        body += v.banner(f"{plural(len(chk.stuck), 'open fill')} cannot settle: the market has resolved but does "
+                         "not list the token, so the trade stays open and holds a wallet slot. This is a bug to fix.",
+                         "bad")
     if chk.lost:
-        body += v.banner(f"{chk.lost} signals in the last 7 days were missed because Gamma had no data for their "
-                         "market. More than a stray one or two means the market lookup is failing.", "warn")
+        body += v.banner(f"{plural(chk.lost, 'signal')} missed in the last 7 days because Gamma had no data for "
+                         "the market. More than a stray one or two means the market lookup is failing.", "warn")
     body += v.card("Can every trade settle?", v.table(
         ["Check", "Now"],
         [["Markets in Polymarket's new format (V2) seen", str(chk.v2_markets)],
