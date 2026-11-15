@@ -105,6 +105,25 @@ def load_trades(app: App, *, sims: bool = True) -> list[dict]:
     return [horizon_fields(apply_policy(dict(r)), r["fill_ts"] or r["alert_ts"]) for r in app.db.query(sql)]
 
 
+REPLAY_SLIM = """
+SELECT p.strategy, p.venue, p.status, p.settled_at, p.cost, p.pnl, p.fees, p.contracts, p.fill_price,
+       p.fees_recalc, p.net_pnl_recalc, p.alert_ts, p.condition_id, a.wallet, m.event_slug
+FROM paper_trades p
+JOIN alerts a ON a.id = p.alert_id
+LEFT JOIN poly_markets m ON m.condition_id = p.condition_id
+WHERE p.strategy LIKE 'backtest:%'
+ORDER BY p.alert_ts, p.id
+"""
+
+
+def load_replay_rows(app: App) -> list[dict]:
+    """The simulated replays with only what a total and its interval need (15 fields of
+    the 70 that load_trades reads), costed by the same fee policy. For the list of
+    variations: on the 6 GB live copy the full rows took 1.4 s and 140 MB a page."""
+    from .costs import apply_policy
+    return [apply_policy(dict(r)) for r in app.db.query(REPLAY_SLIM)]
+
+
 def sim_strategies(app: App) -> list[tuple[str, str]]:
     """(strategy, venue) of every simulated replay, without loading its rows."""
     return [(r["strategy"], r["venue"]) for r in app.db.query(
@@ -588,27 +607,80 @@ def exit_comparison(by: dict[tuple[str, str], list[dict]], runner: str, samples:
             f"{n} both closed: {_pct(m)}, 95% CI {ci}"]
 
 
+LIMIT_ARMS = ("tight_hold", "chase_hold")       # the headline's signals under another chase limit
+
+
+@dataclass
+class LimitArm:
+    """The headline against the same signals under one other chase limit."""
+    strategy: str
+    head_cents: float
+    cents: float
+    n: int = 0                       # signals both have settled (filled or missed)
+    head_pnl: float = 0.0
+    head_filled: int = 0
+    pnl: float = 0.0
+    filled: int = 0
+    diff: float | None = None        # headline minus this arm, dollars per signal
+    lo: float | None = None
+    hi: float | None = None
+    only_n: int = 0                  # signals only the wider of the two limits filled
+    only_won: int = 0
+    only_pnl: float = 0.0
+
+    @property
+    def wider(self) -> float:
+        return max(self.head_cents, self.cents)
+
+
+def limit_report(cfg: Any, by: dict[tuple[str, str], list[dict]], runner: str, samples: int) -> list[LimitArm]:
+    """Does the chase limit matter? The same signals and stake under each limit, a miss
+    counted as $0, both settled. ``tight_hold`` (the owner's question 8) stops 1 cent
+    above the whale's price. ``chase_hold`` goes to 10: in the replay the signals whose
+    price ran right after the whale's buy were the winners, and the headline's 3 cents
+    skips them. "Only the wider limit filled" is exactly those signals."""
+    head = by.get((runner, BOT_HEADLINE), [])
+    out = []
+    for arm in LIMIT_ARMS:
+        rows = by.get((runner, arm), [])
+        if not rows:
+            continue
+        own = getattr(cfg.bot, arm).max_slippage
+        r = LimitArm(arm, cfg.bot.max_slippage * 100, (cfg.bot.max_slippage if own is None else own) * 100)
+        done = {t["alert_id"]: t for t in rows if t["status"] in ("FILLED", "MISSED") and t["closed_at"] is not None}
+        pairs = [(t, done[t["alert_id"]]) for t in head if t["alert_id"] in done
+                 and t["status"] in ("FILLED", "MISSED") and t["closed_at"] is not None]
+        out.append(r)
+        if not pairs:
+            continue
+        r.n = len(pairs)
+        r.head_pnl, r.pnl = sum(x["pnl"] or 0.0 for x, _ in pairs), sum(y["pnl"] or 0.0 for _, y in pairs)
+        r.head_filled = sum(x["status"] == "FILLED" for x, _ in pairs)
+        r.filled = sum(y["status"] == "FILLED" for _, y in pairs)
+        r.diff, r.lo, r.hi = two_way_bootstrap_mean_ci(
+            [(x["pnl"] or 0.0) - (y["pnl"] or 0.0) for x, y in pairs], [x["wallet"] for x, _ in pairs],
+            [event_key(x) for x, _ in pairs], samples=samples)
+        wide_first = r.head_cents >= r.cents
+        only = [(x if wide_first else y) for x, y in pairs
+                if (x if wide_first else y)["status"] == "FILLED" and (y if wide_first else x)["status"] == "MISSED"]
+        r.only_n, r.only_pnl = len(only), sum(t["pnl"] or 0.0 for t in only)
+        r.only_won = sum((t["pnl"] or 0.0) > 0 for t in only)
+    return out
+
+
 def limit_comparison(app: App, by: dict[tuple[str, str], list[dict]], runner: str, samples: int) -> list[str]:
-    """The owner's question 8: does chasing the price up to 3 cents above the whale beat
-    stopping at 1? Same signals, same stake, a miss counted as $0, both settled."""
-    loose, tight = by.get((runner, BOT_HEADLINE), []), by.get((runner, "tight_hold"), [])
-    if not tight:
-        return []
-    done = {t["alert_id"]: t for t in tight if t["status"] in ("FILLED", "MISSED") and t["closed_at"] is not None}
-    pairs = [(t, done[t["alert_id"]]) for t in loose if t["alert_id"] in done
-             and t["status"] in ("FILLED", "MISSED") and t["closed_at"] is not None]
-    a, b = app.cfg.bot.max_slippage * 100, (app.cfg.bot.tight_hold.max_slippage or 0) * 100
-    if not pairs:
-        return [f"  {runner}: chase limit {a:.0f}c against {b:.0f}c: no signal both have settled yet"]
-    diffs = [(x["pnl"] or 0.0) - (y["pnl"] or 0.0) for x, y in pairs]
-    m, lo, hi = two_way_bootstrap_mean_ci(diffs, [x["wallet"] for x, _ in pairs], [event_key(x) for x, _ in pairs],
-                                          samples=samples)
-    ci = "-" if lo is None else f"[{_money(lo)}, {_money(hi)}]"
-    return [f"  {runner}: chase limit on the same {len(pairs)} settled signals (a miss is $0): up to {a:.0f}c "
-            f"{_money(sum(x['pnl'] or 0.0 for x, _ in pairs))} ({sum(x['status'] == 'FILLED' for x, _ in pairs)} "
-            f"filled) | up to {b:.0f}c {_money(sum(y['pnl'] or 0.0 for _, y in pairs))} "
-            f"({sum(y['status'] == 'FILLED' for _, y in pairs)} filled) | {a:.0f}c minus {b:.0f}c per signal "
-            f"{_money(m)}, 95% CI {ci}"]
+    out = []
+    for r in limit_report(app.cfg, by, runner, samples):
+        a, b = r.head_cents, r.cents
+        if not r.n:
+            out.append(f"  {runner}: chase limit {a:.0f}c against {b:.0f}c: no signal both have settled yet")
+            continue
+        ci = "-" if r.lo is None else f"[{_money(r.lo)}, {_money(r.hi)}]"
+        out.append(f"  {runner}: chase limit on the same {r.n} settled signals (a miss is $0): up to {a:.0f}c "
+                   f"{_money(r.head_pnl)} ({r.head_filled} filled) | up to {b:.0f}c {_money(r.pnl)} "
+                   f"({r.filled} filled) | {a:.0f}c minus {b:.0f}c per signal {_money(r.diff)}, 95% CI {ci} | "
+                   f"only the {r.wider:.0f}c limit filled {r.only_n}: {r.only_won} won, net {_money(r.only_pnl)}")
+    return out
 
 
 def settlement_lines(rows: list[dict], samples: int) -> list[str]:
@@ -655,6 +727,9 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
     note = {"flat_hold": "bot fill at detection, held to resolution; the headline",
             "tight_hold": f"the same, but it gives up {tight * 100:.0f}c above the whale's price instead of "
                           f"{app.cfg.bot.max_slippage * 100:.0f}c" if tight is not None else "a second chase limit",
+            "chase_hold": "the same, but it chases up to "
+                          f"{(app.cfg.bot.chase_hold.max_slippage or app.cfg.bot.max_slippage) * 100:.0f}c above the "
+                          "whale's price: does a price that has already moved still pay?",
             "flat_mirror": "bot fill, sold when the whale sells",
             "scaled_hold": "stake grows with the whale's size, capped",
             "placebo_late": "the control: same outcome at a random later time"}.get(strategy, "")
@@ -779,7 +854,8 @@ def bot_lines(app: App, *, threshold: int, samples: int, brief: bool, with_break
                     and t["runner"] != US_RUNNER]
         if headline:
             lines += _breakdown_lines(headline, f" ({BOT_HEADLINE})",
-                                      ("watchlist status", "month", "category", "days to close when entered",
+                                      ("watchlist status", "month", "category", "game state",
+                                       "price move when we arrived", "days to close when entered",
                                        "holding time", "entry price", "wallet"))
     if scope.model == "current":
         lines += _other_model_lines(app, everything, sc, scope, threshold, samples, windows)
@@ -1122,8 +1198,44 @@ def bucket(price: float | None) -> str:
     return "1.0"
 
 
+IN_PLAY, PRE_GAME, NOT_SPORTS = "in-play (game started)", "before the game", "not sports"
+
+
+def game_state(t: dict) -> str:
+    """Had the game started when the signal came? Known at that moment. In the six-month
+    replay all of the copying delay's cost sat in the in-play signals (+3.7% at the
+    whale's price, -7.1% copied 90 seconds later; elsewhere +1.0% and +0.3%)."""
+    start = t.get("game_start_time")
+    at = t.get("signal_ts") or t.get("trigger_fill_ts") or t.get("alert_ts")
+    if start and at and at >= start:
+        return IN_PLAY
+    return PRE_GAME if start or t.get("category") == "sports" else NOT_SPORTS
+
+
+ARRIVAL_BANDS = ((0.0, "at or below whale price"), (0.01, "up to 1c above"), (0.02, "1 to 2c above"),
+                 (0.03, "2 to 3c above"), (0.10, "3 to 10c above"))
+ARRIVAL_ORDER = (*(label for _, label in ARRIVAL_BANDS), "over 10c above", "no ask recorded")
+
+
+def arrival_move(t: dict) -> str:
+    """How far the best ask stood above the whale's price when we arrived. The replay's
+    sharpest split: in-play signals whose price ran 3 cents or more within 90 seconds won
+    79% (+31.9% at the whale's price), those whose price sat still lost 10.4%. The
+    headline buys up to 3 cents above, chase_hold up to 10."""
+    ask = t.get("best_ask") if t.get("best_ask") is not None else t.get("alert_ask")
+    whale = t.get("whale_price")
+    if ask is None or whale is None:
+        return "no ask recorded"
+    for top, label in ARRIVAL_BANDS:
+        if ask - whale <= top + 1e-9:
+            return label
+    return "over 10c above"
+
+
 BREAKDOWN_KEYS: dict[str, Callable[[dict], str]] = {
     "month": lambda t: iso(t["alert_ts"])[:7],
+    "game state": game_state,
+    "price move when we arrived": arrival_move,
     "wallet": lambda t: t["wallet"],
     "category": lambda t: t["category"] or "unknown",
     "days to close when entered": lambda t: horizon_bucket(t.get("days_to_close")),

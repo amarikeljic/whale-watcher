@@ -437,7 +437,8 @@ def test_replays_load_only_where_they_are_shown(tmp_path, monkeypatch):
     html, sims = page("/")
     assert sims == [False] and 'value="sim/spec/polymarket"' in html, "offered in the menu, not loaded"
     html, sims = page("/edge")
-    assert sims == [True] and "Simulated: spec on polymarket" in html
+    assert sims == [False] and "Simulated: spec on polymarket" in html, "listed from a slim read of its rows"
+    assert "n=3" in html or ">3<" in html, "all three replay trades are counted"
     html, sims = page("/bankroll")
     assert sims == [False] and "src=sim%3Aspec" in html, "the wallet page lists the replay's tab without loading it"
     html, sims = page("/bankroll", src="sim:spec")

@@ -436,9 +436,12 @@ Checked on the 6 GB live copy and against live Gamma data.
   dropped index) that is 100 to 160 MB a day, plus days like the one with 1.8 million
   rows when the review took in many new wallets. Rough guess: 40 to 60 GB a year.
   Shrinking it means rewriting the table or deleting old history, which needs your OK.
-* **Not fixed: the Edge page and a replay's wallet tab still peak near 190 MB**
-  of the dashboard's 256 MB. Fine today. A second large replay would push them over,
-  and the dashboard would restart instead of showing the page.
+* **The Edge page's memory: fixed 2026-11-15.** Its list of variations reads the
+  replays in a slim form: 1.8 s and 82 MB, from 3.2 s and 185 MB, with identical
+  numbers (checked on the live copy).
+* **Not fixed: a replay's own wallet tab still peaks near 196 MB** of the dashboard's
+  256 MB. Fine today. A much larger replay would push it over, and the dashboard
+  would restart instead of showing the page.
 
 ## Parked for later
 

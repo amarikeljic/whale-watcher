@@ -33,7 +33,8 @@ from .timeutil import iso
 log = logging.getLogger(__name__)
 
 PRIMARY, CONTROL, COMPARISON, EXPLORATORY, SIMULATED = "primary", "control", "comparison", "exploratory", "simulated"
-ROLE_OF = {"flat_hold": PRIMARY, "placebo_late": CONTROL, "flat_mirror": EXPLORATORY, "scaled_hold": EXPLORATORY}
+ROLE_OF = {"flat_hold": PRIMARY, "placebo_late": CONTROL, "tight_hold": EXPLORATORY, "chase_hold": EXPLORATORY,
+           "flat_mirror": EXPLORATORY, "scaled_hold": EXPLORATORY}
 SAMPLES = 2000
 # Draws x rows per interval at most. A replay with 13,000 trades gets 200 draws instead of
 # 2,000: with that many trades the interval barely moves between runs, and the dashboard
@@ -126,7 +127,7 @@ def _column_roi(pnl: str, cost: str):
 def build(app: Any, rows: list[dict] | None = None) -> list[Experiment]:
     """Every live variation over the bot rows in scope (the current model version,
     outages left out), plus the old rule, the simulated replays and the stake sizes."""
-    from .stats import Scope, load_bot_trades, load_trades, scope_rows
+    from .stats import Scope, load_bot_trades, load_replay_rows, load_trades, scope_rows
     if rows is None:
         rows = scope_rows(app, load_bot_trades(app), Scope()).rows
     flags = {r["key"]: r for r in _flags(app)}
@@ -163,15 +164,22 @@ def build(app: Any, rows: list[dict] | None = None) -> list[Experiment]:
             _column_roi("zero_pnl", "zero_cost"), price="zero_price")
         add("column:human", "single / flat_hold a minute later (the old rule's delay)", COMPARISON, head,
             _column_roi("human_pnl", "human_cost"), price="human_price")
-    # The old rule and the replays: from the rows given when they include them (the
-    # dashboard's records do), else read here.
-    paper = [r for r in rows if "runner" not in r] or load_trades(app)
+    # The old rule and the replays: from the rows given when they include them, else read
+    # here. The replays are read in a slim form (stats.load_replay_rows): a total and its
+    # interval need 15 of their 70 fields.
+    paper = [r for r in rows if "runner" not in r]
     old = [t for t in paper if not str(t["strategy"]).startswith("backtest:")]
+    replays = [t for t in paper if str(t["strategy"]).startswith("backtest:")]
+    if not paper:
+        old = load_trades(app, sims=False)
+    if not replays:
+        replays = load_replay_rows(app)
     if old:
         add("old:live", "Old rule, live (closed to new alerts)", COMPARISON, old, _paper_roi, live=False)
-    sims = sorted({(t["venue"], t["strategy"]) for t in paper if str(t["strategy"]).startswith("backtest:")})
-    for venue, strategy in sims:
-        group = [t for t in paper if t["venue"] == venue and t["strategy"] == strategy]
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for t in replays:
+        groups.setdefault((t["venue"], t["strategy"]), []).append(t)
+    for (venue, strategy), group in sorted(groups.items()):
         add(f"sim:{venue}/{strategy}", f"Simulated: {strategy[9:]} on {venue}", SIMULATED, group, _paper_roi,
             live=False)
     return out

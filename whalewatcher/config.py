@@ -162,6 +162,20 @@ def _tight() -> StrategyConfig:
     return StrategyConfig(max_slippage=0.01)
 
 
+def _chase() -> StrategyConfig:
+    """A wider chase limit beside the 1 and 3 cent ones (2026-11-15), because the replay's
+    clearest pattern says the 3 cent limit skips the best signals. Of 2,288 in-play replay
+    signals, the 763 whose price ran 3 cents or more within 90 seconds won 79% and
+    returned +31.9% at the whale's price (95% CI +19% to +48%), and the 1,525 whose
+    price sat still won 53% and returned -10.4% (CI -20% to -1%). Live, the bot arrives
+    about 3 seconds after the whale, when a runner has moved 3.5 to 6 cents (4 of 34
+    on-time signals), and skips it. What that cannot say: whether a price that has moved
+    at 3 seconds is the market agreeing or only the whale's own footprint. 10 cents is
+    about half the distance a replay runner goes (whale's price 0.59 on average, 79%
+    winners)."""
+    return StrategyConfig(max_slippage=0.10)
+
+
 def _scaled() -> StrategyConfig:
     return StrategyConfig(max_stake_usd=50.0, max_market_exposure_usd=100.0, max_event_exposure_usd=150.0,
                           daily_loss_limit_usd=200.0)
@@ -184,6 +198,7 @@ class BotConfig:
     recheck_seconds: float = 1.0            # ... this long after it
     flat_hold: StrategyConfig = field(default_factory=StrategyConfig)
     tight_hold: StrategyConfig = field(default_factory=_tight)
+    chase_hold: StrategyConfig = field(default_factory=_chase)
     flat_mirror: StrategyConfig = field(default_factory=StrategyConfig)
     scaled_hold: StrategyConfig = field(default_factory=_scaled)
     placebo_late: StrategyConfig = field(default_factory=StrategyConfig)
@@ -425,7 +440,7 @@ def _build(cls: type, raw: dict[str, Any], where: str, base: Any = None) -> Any:
     return dataclasses.replace(base, **values)
 
 
-BOT_STRATEGIES = ("flat_hold", "tight_hold", "flat_mirror", "scaled_hold", "placebo_late")
+BOT_STRATEGIES = ("flat_hold", "tight_hold", "chase_hold", "flat_mirror", "scaled_hold", "placebo_late")
 
 
 def validate(cfg: Config) -> None:

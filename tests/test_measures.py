@@ -107,3 +107,43 @@ def test_the_edge_page_shows_the_prices_after_the_fill_and_the_second_read(tmp_p
     html = dash.render(Config(database_path=path), path, "/edge", {"outages": "include"}, now=NOW)[1]
     assert "Price after our fill" in html and "+0.010 (n=4)" in html and "-0.020 (n=4)" in html
     assert "The order book, a second later" in html and "median 1.1s after the decision" in html
+
+
+# -- the two cuts the replay points to: had the game started, and had the price already moved -----------
+
+
+def test_game_state_reads_only_what_is_known_at_the_signal():
+    from whalewatcher.stats import IN_PLAY, NOT_SPORTS, PRE_GAME, game_state
+    assert game_state({"game_start_time": 1000, "signal_ts": 1000}) == IN_PLAY
+    assert game_state({"game_start_time": 1000, "signal_ts": 999}) == PRE_GAME
+    assert game_state({"game_start_time": None, "category": "sports", "signal_ts": 5}) == PRE_GAME
+    assert game_state({"game_start_time": None, "category": "politics", "alert_ts": 5}) == NOT_SPORTS
+    assert game_state({"game_start_time": 1000, "trigger_fill_ts": 1500}) == IN_PLAY, "an old-rule row has no signal_ts"
+
+
+def test_the_price_move_at_arrival_sorts_signals_into_what_each_limit_buys():
+    from whalewatcher.stats import ARRIVAL_ORDER, arrival_move
+
+    def move(ask: float, whale: float = 0.50) -> str:
+        return arrival_move({"best_ask": ask, "whale_price": whale})
+
+    assert move(0.49) == move(0.50) == "at or below whale price"
+    assert (move(0.51), move(0.52), move(0.53)) == ("up to 1c above", "1 to 2c above", "2 to 3c above")
+    assert move(0.531) == move(0.60) == "3 to 10c above", "past the headline's 3 cents, inside chase_hold's 10"
+    assert move(0.61) == "over 10c above"
+    assert arrival_move({"best_ask": None, "alert_ask": 0.52, "whale_price": 0.5}) == "1 to 2c above"
+    assert arrival_move({"best_ask": None, "whale_price": 0.5}) == "no ask recorded"
+    assert set(ARRIVAL_ORDER) >= {move(x) for x in (0.4, 0.51, 0.52, 0.53, 0.6, 0.9)}
+
+
+def test_the_breakdowns_page_and_the_report_carry_both_cuts(tmp_path):
+    from conftest import NOW
+    from dashfix import small
+
+    from whalewatcher import dashboard as dash
+    from whalewatcher.config import Config
+    path = str(tmp_path / "ww.sqlite3")
+    small(path, NOW).db.close()
+    html = dash.render(Config(database_path=path), path, "/breakdowns", {"outages": "include"}, now=NOW)[1]
+    assert "By game state" in html and "By price move when we arrived" in html
+    assert "1 to 2c above" in html, "the fixture's fills sit 2 cents above the whale"

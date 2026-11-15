@@ -39,11 +39,10 @@ from .db import SCHEMA_VERSION, Database
 from .horizon import BUCKETS as CLOSE_BUCKETS
 from .horizon import UNKNOWN as NO_END
 from .horizon import bucket as horizon_bucket
-from .stats import (SUMMARY_WINDOW, Scope, Scoped, _period, bucket, cutoff_report, decision_rule, event_key,
-                    in_play, last_review, load_bot_trades, load_trades, markout_columns, markout_groups, markouts,
-                    outage_windows, recheck_report, scope_rows, settle_check, sim_strategies, summarise,
-                    us_comparison)
-from .stats import SIM_PREFIX
+from .stats import (ARRIVAL_ORDER, SIM_PREFIX, SUMMARY_WINDOW, Scope, Scoped, _period, arrival_move, bucket,
+                    cutoff_report, decision_rule, event_key, game_state, in_play, last_review, limit_report,
+                    load_bot_trades, load_trades, markout_columns, markout_groups, markouts, outage_windows,
+                    recheck_report, scope_rows, settle_check, sim_strategies, summarise, us_comparison)
 from .stats_util import mean, median
 from .timeutil import iso, now_ts, parse_as_of, start_of_day
 from .version import MODEL_VERSION
@@ -59,6 +58,7 @@ BASE_KEY = "single/flat_hold"
 LABELS = {
     "single/flat_hold": "Bot: flat stake, hold",
     "single/tight_hold": "Bot: flat stake, hold, 1c limit",
+    "single/chase_hold": "Bot: flat stake, hold, 10c limit",
     "single/flat_mirror": "Bot: flat stake, mirror exits",
     "single/scaled_hold": "Bot: scaled stake, hold",
     "single/placebo_late": "Control: same outcome, later",
@@ -78,9 +78,6 @@ def label_of(key: str) -> str:
 
 
 # -- data -----------------------------------------------------------------------------------
-
-
-SIM_PAGES = ("/edge",)      # pages that show the simulated replays whatever the filters
 
 
 def sim_key(strategy: str, venue: str) -> str:
@@ -547,7 +544,7 @@ def edge(c: Ctx) -> str:
                            table_headers=["Move from", "Fills"], table_rows=[[b["label"], str(b["v"])] for b in bars])
                    if marks else '<p class="empty">No fills old enough to have a 5-minute price yet.</p>',
                    note=f"Works for in-play fills too. n={len(marks)}.")
-    body += after_fill_card(c, rows) + recheck_card(rows) + experiments_card(c)
+    body += limit_card(c) + after_fill_card(c, rows) + recheck_card(rows) + experiments_card(c)
 
     by_p: dict[int, dict[str, list[float]]] = defaultdict(lambda: {"clv": [], "mark": []})
     for r in rows:
@@ -611,6 +608,39 @@ def edge(c: Ctx) -> str:
     body += v.card("Latency cost", '<dl class="kv">' + "".join(
         f"<dt>{v.esc(k)}</dt><dd>{v.esc(val)}</dd>" for k, val in kv) + "</dl>")
     return body + "</div>"
+
+
+def limit_card(c: Ctx) -> str:
+    """The same signals under each chase limit (stats.limit_report). Stacked, not a wide
+    table: it has to fit a phone."""
+    by: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for r in c.records:
+        if r.get("runner") == "single":
+            by[("single", r["strategy"])].append(r)
+    arms = limit_report(c.app.cfg, by, "single", SAMPLES)
+    if not arms:
+        return ""
+    items = ""
+    for a in arms:
+        head = f"Up to {a.cents:.0f}c above the whale, against the headline's {a.head_cents:.0f}c"
+        if not a.n:
+            items += (f'<li><div class="rule-head"><span>{v.esc(head)}</span></div>'
+                      '<p class="empty">No signal both have settled yet.</p></li>')
+            continue
+        ci = "-" if a.lo is None else f"95% CI [{v.money(a.lo)}, {v.money(a.hi)}]"
+        kv = [("Signals both settled", str(a.n)),
+              ("Filled", f"this limit {a.filled} · headline {a.head_filled}"),
+              ("Net P&L (a miss is $0)", f"this limit {v.money(a.pnl)} · headline {v.money(a.head_pnl)}"),
+              ("Headline minus this limit, per signal", f"{v.money(a.diff)}, {ci}"),
+              (f"Only the {a.wider:.0f}c limit filled", f"{a.only_n} signals: {a.only_won} won, net {v.money(a.only_pnl)}")]
+        items += (f'<li><div class="rule-head"><span>{v.esc(head)}</span></div><dl class="kv">'
+                  + "".join(f"<dt>{v.esc(k)}</dt><dd>{v.esc(val)}</dd>" for k, val in kv) + "</dl></li>")
+    return v.card("Chase limit: the same signals, three limits", f'<ul class="rule-tests">{items}</ul>',
+                  note="How far above the whale's price the bot will still buy. The headline stops at 3 cents. In the "
+                       "six-month replay, in-play signals whose price ran 3 cents or more right after the whale's buy "
+                       "won 79% of the time, and the ones whose price sat still lost money. \"Only the wider limit "
+                       "filled\" is those runners: if they win here too, the 3-cent limit is skipping the best "
+                       "signals. Same stake for each, model and outage filters applied, date range not.", wide=True)
 
 
 def settlement_card(c: Ctx) -> str:
@@ -949,6 +979,14 @@ def breakdowns(c: Ctx) -> str:
     note = "Slicing a small sample makes smaller samples: read n before any P&L."
     body += v.card("By category", breakdown_table(c, rows, lambda r: r.get("category") or "unknown", "Category")[0],
                    note=note, wide=True)
+    body += v.card("By game state", breakdown_table(c, rows, game_state, "When the signal came")[0],
+                   note="Had the game started? In the six-month replay the whole cost of copying late sat in the "
+                        "in-play signals. " + note, wide=True)
+    body += v.card("By price move when we arrived", breakdown_table(
+        c, rows, arrival_move, "Best ask against the whale's price", order=lambda g: ARRIVAL_ORDER.index(g))[0],
+        note="How far the price had already moved when the bot got there. The headline buys up to 3 cents above the "
+             "whale, so its rows above that are misses. Pick the 10c limit under Strategy to see those signals "
+             "bought. In the replay the signals whose price ran were the winners.", wide=True)
     body += v.card("By entry price", breakdown_table(
         c, rows, lambda r: bucket(r["fill_price"] if r.get("fill_price") is not None else r.get("alert_ask")),
         "Price", order="label")[0], note="Our fill price (the best ask for a miss).", wide=True)
@@ -1528,10 +1566,10 @@ def wallet_page(c: Ctx, wallet: str) -> str:
 def build_ctx(cfg: Config, db: Database, query: Any, path: str, now: int | None = None) -> Ctx:
     now = now_ts() if now is None else now
     app = SimpleNamespace(db=db, cfg=cfg, clock=lambda: now, wall=lambda: float(now))
-    # The simulated replays are most of the rows. Only the Edge page (every variation), a
-    # replay's own view and the wallet page's replay tabs show them. Every other page
-    # leaves them out, so it skips loading them.
-    sims = (path in SIM_PAGES or str(query.get("strategy") or "").startswith("sim/")
+    # The simulated replays are most of the rows. Only a replay's own view and the wallet
+    # page's replay tabs need them in full, so every other page skips loading them. The
+    # Edge page's list of variations reads its own slim copy (experiments.build).
+    sims = (str(query.get("strategy") or "").startswith("sim/")
             or (path == "/bankroll" and str(query.get("src") or "").startswith("sim:")))
     records = load_records(app, sims=sims)
     present = {r["key"] for r in records}

@@ -88,6 +88,14 @@ bot:
     max_event_exposure_usd: 50
     daily_loss_limit_usd: 100
     max_slippage: 0.01            # this strategy's own limit: the whale's price + 1 cent
+  chase_hold:                     # the same again, chasing up to 10 cents: in the replay the signals whose
+    starting_bankroll: 1000       # price ran right after the whale's buy were the winners (79% won), and
+    stake_usd: 10                 # the 3-cent limit skips them. Is a price that has already moved at
+    max_stake_usd: 10             # 3 seconds still worth buying?
+    max_market_exposure_usd: 30
+    max_event_exposure_usd: 50
+    daily_loss_limit_usd: 100
+    max_slippage: 0.10            # this strategy's own limit: the whale's price + 10 cents
   flat_mirror:                    # fixed stake, sold when the whale sells
     starting_bankroll: 1000
     stake_usd: 10

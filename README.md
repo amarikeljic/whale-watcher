@@ -66,8 +66,8 @@ docker compose exec whale-watcher python -m whalewatcher backtest --dataset data
 6. **Still yours to do:** delete the old `.env` if it is still on the server, and
    delete the two Discord webhooks so their addresses stop working.
 
-`stats` (the full report) takes about a minute and a half on a database this size,
-mostly for the breakdowns of the simulated replays. `stats --brief` is instant.
+`stats` (the full report) takes about a minute on a database this size, mostly for
+the breakdowns of the simulated replays. `stats --brief` is instant.
 
 ## Commands
 
@@ -116,6 +116,8 @@ Tests (every network call mocked): `pip install -r requirements-dev.txt && pytes
 Reference: `docs/data-sources.md` (every host, its limit, our rate, and the venues'
 terms quoted), `docs/dependencies.md` (every pinned package and what it is for) and
 `docs/worries.md` (the Part 4 report). One-off, by hand on the server:
+`python3 scripts/replay_slices.py --db data/whalewatcher.sqlite3` cuts the simulated
+replays by things known at the signal (read-only, about 20 seconds).
 `python3 scripts/check_block_times.py --db data/whalewatcher.sqlite3` compares the Data
 API's trade times with Polygon block times (read-only; it asks one public Polygon RPC
 for receipts and blocks, nothing else).
@@ -228,14 +230,18 @@ rule (a book walk 60 s later). Paper trades made before the bot model stay in
 `paper_trades` under their old label and `stats` shows them as their own
 section.
 
-*A second chase limit* (`tight_hold`, the owner's question 8). The same signals,
-stake and book read as the headline, but it gives up 1 cent above the whale's
-price instead of 3. Most signals sit 1 to 2 cents above the whale (22 and about 10
-of 57 on the test copy), so 1 cent changes about a third of them, where a looser
-6 cents would change 4. `stats` compares the two on the same settled signals,
-counting a miss as $0, with the interval of the difference. Its own setting is
-`bot.tight_hold.max_slippage`. It is listed as an exploratory variation: it can
-only replace the headline by passing the decision rule on later signals.
+*Three chase limits.* The headline buys up to 3 cents above the whale's price.
+Two more arms take the same signals, stake and book read with another limit:
+`tight_hold` stops at 1 cent (the owner's question 8) and `chase_hold` goes to 10
+(2026-11-15). Most signals sit 1 to 2 cents above the whale when the bot arrives,
+so 1 cent changes about a third of them. The 10-cent arm exists because of the
+replay's sharpest pattern (see "Where could a copier's edge come from?"): the
+signals whose price ran right after the whale's buy were the winners, and 3 cents
+skips them. `stats` and the Edge page compare each arm with the headline on the
+same settled signals, counting a miss as $0, with the interval of the difference
+and what only the wider limit filled. The settings are `bot.tight_hold.max_slippage`
+and `bot.chase_hold.max_slippage`. Both are exploratory variations: one can only
+replace the headline by passing the decision rule on later signals.
 
 *CLV.* Pre-game fills are compared with the closing line as before. Every fill,
 in-play included, also gets the price **1, 5 and 30 minutes** after it, which is
@@ -1146,6 +1152,53 @@ Today's live pool, for comparison (`python -m whalewatcher consensus`):
 | $250k+ | 120 | 53 | 51 |
 | $500k+ | 56 | 23 | 23 |
 | top 50 by profit | 50 | 21 | 21 |
+
+## Where could a copier's edge come from? (2026-11-15)
+
+**Nowhere proven yet.** `python3 scripts/replay_slices.py` cuts the six-month replay
+(3,965 distinct signals, 39 wallets, 1,585 events) by things known at the moment of
+the signal. About 45 cuts were looked at, so one or two intervals clear zero by luck:
+read this as where to test forward. Return per signal, 95% CI resampling wallets and
+events together:
+
+| Cut | n | Won | At the whale's price | Copied 90 s later |
+|---|---|---|---|---|
+| In-play (game started) | 2,288 | 62% | +3.7% [-5%, +13%] | -7.1% [-18%, +2%] |
+| Game not started, or not sports | 1,677 | 64% | +1.0% [-13%, +13%] | +0.3% [-14%, +12%] |
+| In-play, **price ran 3c+ within 90 s** | 763 | 79% | **+31.9% [+19%, +48%]** | missed |
+| In-play, **price sat still** | 1,525 | 53% | **-10.4% [-20%, -1%]** | -7.1% [-18%, +2%] |
+| Scheduled to close in 1 to 7 days | 243 | 71% | +8.2% [-12%, +35%] | +6.6% [-15%, +35%] |
+| Scheduled to close in 7 to 14 days | 113 | 70% | +11.4% [-50%, +49%] | +12.5% [-42%, +57%] |
+| Whale paid 0.80 or more | 843 | 85% | -3.0% [-12%, +3%] | -5.0% [-15%, +2%] |
+| Whale's buy under $1,000 | 1,307 | 67% | +7.5% [-6%, +19%] | -4.3% [-18%, +8%] |
+| Whale's buy $5,000 or more | 1,041 | 57% | -1.8% | -4.4% |
+| Whale bought the other side in the 24 h before | 503 | 68% | +11.5% [-9%, +30%] | +1.9% [-25%, +29%] |
+
+What it says:
+
+* **Win rate is the wrong target.** The cut with the most winners (85%, the
+  favourites at 0.80 and up) loses money, because a favourite pays little when it
+  wins. What matters is the win rate against the price paid.
+* **The edge is in-play, and it is the signals that move.** Whether the price ran in
+  the next 90 seconds splits in-play signals into +31.9% and -10.4%, both intervals
+  clear of zero, far beyond what luck among 45 cuts gives. A copier that waits gets the
+  second kind. The bot arrives about 3 seconds after the whale. On the test copy's 34
+  on-time signals it bought the 30 whose ask was at most 2 cents above the whale
+  (in-play, their price 5 minutes later was 2.5 cents BELOW the whale's on average,
+  11 of 15 down) and skipped the 4 whose ask stood 3.5 to 6 cents above. That is the
+  wrong way round if a price that has moved at 3 seconds is the market agreeing, and
+  the right way round if it is only the whale's own footprint. The replay cannot say
+  which. `chase_hold` (10 cents) and the "price move when we arrived" breakdown measure it.
+* **Where a market takes days, the copy keeps what the whale got** (1 to 14 days, n=356:
+  about +9% at the whale's price and +8% copied), but those intervals are wide and
+  include zero. The "days to
+  close when entered" breakdown tracks it.
+* **Bigger whale buys are not better**, and a whale that bought the other side first
+  did no worse. Neither supports a filter.
+* **The fee is certain.** A buyer pays the rate times (1 - price) of the stake: 1.2% on
+  average here, 2.5% on a 50-cent sports bet, against a whale edge of about 3%.
+
+Nothing in the headline changed because of this: no cut is proof.
 
 ## Known limits
 

@@ -8,6 +8,8 @@ Strategies, all run on the same signals and each with its own paper account
 (bankroll, exposure, ledger, P&L):
 
   flat_hold     fixed stake, held to resolution. The headline.
+  tight_hold    the same with a 1-cent chase limit instead of 3, and
+  chase_hold    the same with a 10-cent one: which signals does the limit cost or save?
   flat_mirror   fixed stake, sold into the bids once the whale has sold
                 ``mirror_exit_fraction`` of what it held when we entered.
   scaled_hold   stake grows with the size of the whale's buy, up to a cap.
@@ -140,7 +142,7 @@ class Bot:
 
     def limit_for(self, strategy: str, whale_price: float) -> float:
         """The fill-or-kill limit: the whale's price plus the strategy's own chase limit,
-        or the bot's (tight_hold tests a second one)."""
+        or the bot's (tight_hold and chase_hold test a tighter and a wider one)."""
         own = self.strategy_cfg(strategy).max_slippage
         return whale_price + (self.cfg.max_slippage if own is None else own)
 

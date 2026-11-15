@@ -108,7 +108,8 @@ async def test_a_market_ending_too_far_away_is_skipped_by_every_strategy(live_ap
     assert (await signal(world, monitor)).alerts == 1, "the alert is still posted: only the paper trade is skipped"
     rows = trades(live_app)
     assert {r["strategy"]: r["status"] for r in rows} == {
-        "flat_hold": "SKIPPED", "tight_hold": "SKIPPED", "flat_mirror": "SKIPPED", "scaled_hold": "SKIPPED",
+        "flat_hold": "SKIPPED", "tight_hold": "SKIPPED", "chase_hold": "SKIPPED", "flat_mirror": "SKIPPED",
+        "scaled_hold": "SKIPPED",
         "placebo_late": "SKIPPED"}, \
         "the placebo faces the same rule as the strategies it is a control for"
     t = rows[0]
@@ -192,7 +193,7 @@ async def test_trades_made_before_the_cutoff_stay_and_are_counted_as_ones_it_wou
     live_app.cfg.filters.max_days_to_close = 14.0                        # now it does
     rep = cutoff_report(live_app, [r for r in load_bot_trades(live_app) if r["strategy"] == "flat_hold"])
     assert rep.would_skip == 1 and rep.too_long == 0
-    assert live_app.db.one("SELECT COUNT(*) n FROM bot_trades WHERE status = 'FILLED'")["n"] == 3, "nothing rewritten"
+    assert live_app.db.one("SELECT COUNT(*) n FROM bot_trades WHERE status = 'FILLED'")["n"] == 4, "nothing rewritten"
 
 
 # -- the backtests ---------------------------------------------------------------------------
