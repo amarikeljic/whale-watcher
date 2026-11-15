@@ -70,6 +70,11 @@ Spec: https://docs.polymarket.com/api-spec/gamma-openapi.yaml
   (`inactive`, `active`, `resolved`); V1 keeps `umaResolutionStatus`. Seen live on
   2026-11-14: every market carries `version: "v1"`, and 37 of 100 open ones already
   list `positionIds` as well.
+* `position_ids=<id>` finds a market by a position id (checked live 2026-11-14). A
+  position id passed as `clob_token_ids` finds nothing.
+* Combos ("A AND B") are not in `/markets` at all. In `/v2/trades` their rows have a
+  64-character `condition_id` starting `0x03`, `outcome_index: 999`, empty `slug`
+  and `outcome`, and `usdc_size: null` (seen 2026-11-15).
 * Time formats seen: `2026-11-08T04:59:59.999Z`, `2026-09-29 23:00:00+00`,
   `2026-11-06 03:30:03.883336+00`, `...+00:00:00`.
 

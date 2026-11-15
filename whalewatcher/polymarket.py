@@ -623,6 +623,19 @@ class Gamma:
         results = await asyncio.gather(*(one(g) for g in chunks(sorted(set(condition_ids)), 40)))
         return [row for rows in results for row in rows]
 
+    # GET /markets?position_ids=..: a market found by one of its Protocol V2 position ids
+    # (https://docs.polymarket.com/api-reference/markets/list-markets.md lists the filter
+    # beside clob_token_ids and condition_ids; checked live 2026-11-14: one id returns its
+    # market, and a position id passed as clob_token_ids returns nothing).
+    async def markets_by_position(self, position_ids: list[str]) -> list[dict]:
+        async def one(group: list[str]) -> list[dict]:
+            payload = await self.http.get_json(
+                f"{self.base}/markets", {"position_ids": group, "closed": "any", "limit": len(group)})
+            return payload or []
+
+        results = await asyncio.gather(*(one(g) for g in chunks(sorted(set(position_ids)), 20)))
+        return [row for rows in results for row in rows]
+
     # GET /markets ordered by volume within an end-date window (closed markets).
     # Pages hold at most 100 rows whatever `limit` asks for (checked 2026-11-07);
     # page with `offset`.

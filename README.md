@@ -99,6 +99,7 @@ python -m whalewatcher stats --include-outages      # ...counting signals made i
 python -m whalewatcher version                      # the model version and commit new rows get, and what each version changed
 python -m whalewatcher followup                     # what the whale did around each alert: other side, sold back, flags
 python -m whalewatcher experiments                  # every variation tracked, its role, n, interval and forward test
+python -m whalewatcher v2check                      # read-only: real new-format (Protocol V2) markets through our own code
 python -m whalewatcher export --csv exports/paper_trades.csv
 python -m whalewatcher health                        # Docker healthcheck
 ```
@@ -731,6 +732,22 @@ card "Can every trade settle?" and a line in `stats` count V2 markets, any fill
 that cannot settle, and signals missed for lack of market data. Still unchecked
 until a real V2 market exists: whether the Data API reports V2 trades under the
 same condition id Gamma uses. If it does not, that card shows it within a day.
+
+**`v2check`** takes real V2 markets through the service's own code in the service's
+own order: the trade feed, the market looked up on Gamma by the feed's condition id,
+the trade's token matched to an outcome, the order book, the price history, the
+resolution and payout, and the same fill in the wallet's own activity. It makes
+public GET requests only and uses a scratch in-memory database. Exit code 0 means
+every check passed on at least one V2 market, 1 that one failed (it says which
+market and what Gamma calls it), 2 that no V2 market exists yet (the answer until
+2026-11-23). On the server: `docker compose exec whale-watcher python -m whalewatcher v2check`.
+
+**Combos** (several games joined into one bet, "A AND B") already trade under the
+new format: seen in the live feed on 2026-11-15, about 1% of trades, with a
+64-character condition id and no outcome index, and Gamma's `/markets` does not list
+them. The service cannot price or settle one, so a signal on a combo is skipped with
+"market metadata unavailable". Tracked wallets' histories hold 25,809 such rows of
+7.5 million, the first from June 2026.
 
 `protocol.py` decodes a position id offline. Checked on 74 live ids: the outcome
 index inside is always right, but the market key inside is not Gamma's

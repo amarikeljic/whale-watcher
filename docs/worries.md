@@ -409,6 +409,14 @@ Checked on the 6 GB live copy and against live Gamma data.
   every trade settle?" counts V2 markets, stuck fills and signals missed for lack of
   market data. Not checkable before a real V2 market exists: whether the Data API
   names V2 trades with the same condition id as Gamma.
+* **Combos (2026-11-15).** Bets joining several games ("A AND B") already use the new
+  id format, about 1% of the trade feed. Gamma does not list them, so the service
+  skips signals on them, by design. For combos the feed's condition id IS the key
+  inside the position id. If the feed names ordinary V2 markets the same way from
+  2026-11-23, Gamma will not find them by that id (it will by `position_ids`, checked
+  live). `python -m whalewatcher v2check` tests exactly this on real markets and says
+  what Gamma calls a market the feed names differently. A run is scheduled for
+  2026-11-24.
 * **The position id decoder described the layout wrongly: corrected.** On 74 live
   ids the outcome index was right every time, but the key inside is not the market's
   `conditionId`. Nothing depended on it.

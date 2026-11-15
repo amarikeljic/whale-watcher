@@ -388,6 +388,20 @@ async def _wallet(args, cfg) -> int:
     return 0
 
 
+async def _v2check(args, cfg) -> int:
+    """Read-only. Uses a scratch in-memory database: the real one is never opened."""
+    from . import v2check
+    from .db import Database
+    db = Database(":memory:")
+    try:
+        async with open_app(cfg, db=db) as app:
+            report = await v2check.run(app, pages=args.pages, sample=args.sample)
+    finally:
+        db.close()
+    print("\n".join(report.lines()))
+    return report.exit_code
+
+
 async def _us(args, cfg) -> int:
     """`us match`: how many recent alerts have the same bet on Polymarket US (read-only)."""
     from .polymarket_us import match_report
@@ -501,6 +515,11 @@ def build_parser() -> argparse.ArgumentParser:
     us.add_argument("action", choices=("match",))
     us.add_argument("--days", type=int, default=14, help="look at the alerts of this many days (default 14)")
 
+    vc = sub.add_parser("v2check", help="read-only: take real new-format (Protocol V2) markets through the "
+                                        "service's own code and say what passes")
+    vc.add_argument("--pages", type=int, default=3, help="pages of the global trade feed to read (default 3)")
+    vc.add_argument("--sample", type=int, default=8, help="V2 markets to check in detail (default 8)")
+
     d = sub.add_parser("detector", help="watch trades and publish tracked wallets' fills (its own container)")
     d.add_argument("--cycles", type=int, help="stop after this many feed polls")
 
@@ -573,6 +592,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_wallet(args, cfg))
     if args.command == "us":
         return asyncio.run(_us(args, cfg))
+    if args.command == "v2check":
+        return asyncio.run(_v2check(args, cfg))
     if args.command == "stats":
         from .stats import Scope
         try:

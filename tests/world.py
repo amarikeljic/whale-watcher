@@ -35,10 +35,13 @@ class FakeMarket:
     event_title: str | None = None
     uma_statuses: str | None = None     # Gamma's umaResolutionStatuses, e.g. '["proposed", "disputed"]'
     version: str | None = None          # "v2": Protocol V2, traded under positionIds; None: no field, as before
+    position_ids: tuple[str, str] | None = None     # real numeric position ids, when a test needs them
 
     def token(self, index: int) -> str:
         """The id a trade on this market carries: a position id on a v2 market."""
-        return f"{self.cond}-p{index}" if self.version == "v2" else f"{self.cond}-t{index}"
+        if self.version == "v2":
+            return self.position_ids[index] if self.position_ids else f"{self.cond}-p{index}"
+        return f"{self.cond}-t{index}"
 
     def gamma(self) -> dict[str, Any]:
         closed = self.resolved_at is not None or self.closed_time is not None
@@ -171,6 +174,10 @@ class World:
         if ids is not None:
             ids = ids if isinstance(ids, list) else [ids]
             return [self.markets[c].gamma() for c in ids if c in self.markets]
+        pos = params.get("position_ids")
+        if pos is not None:
+            pos = set(pos if isinstance(pos, list) else [pos])
+            return [raw for raw in (m.gamma() for m in self.markets.values()) if pos & set(raw.get("positionIds") or [])]
         offset, limit = int(params.get("offset") or 0), min(100, int(params.get("limit") or 100))
         lo, hi = parse_time(params.get("end_date_min")), parse_time(params.get("end_date_max"))
         want_closed = params.get("closed") in (True, "true")
