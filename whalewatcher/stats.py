@@ -447,6 +447,87 @@ def recheck_lines(rows: list[dict]) -> list[str]:
             f"filled; fills still possible would have paid {cents(r.extra)} a share more (n={r.extra_n})"]
 
 
+# -- the exchange's order delay ------------------------------------------------------------------
+#
+# https://docs.polymarket.com/concepts/order-lifecycle.md ("Match or Rest"): "Sports/game
+# delay: enabled on configured sports markets around live game conditions. The order waits
+# for the market's configured delay window before matching", and cannot be cancelled
+# meanwhile. Gamma publishes the window as ``secondsDelay``. Read live on 2026-11-16, the
+# 500 busiest open markets: 1 second on all 56 in-play ones and on 64 of 97 pre-game sports
+# markets, none on the 347 others. The paper bot fills on the book it reads at the instant
+# of its decision, which no real order on those markets can do. The second read of the
+# book (bot._recheck, about a second later) is what a real order would have met.
+
+
+def delayed_pnl(t: dict) -> float | None:
+    """What this headline signal would have made had its order matched on the second
+    read of the book. None until the signal has both a second read and a result."""
+    from .fees import rate_for, taker_fee
+    from .polymarket import MarketInfo
+    from .precision import SHARE_STEP, floor_step
+    if t.get("recheck_status") not in ("FILLED", "MISSED") or t.get("closed_at") is None \
+            or t.get("payout_per_share") is None:
+        return None
+    price = t.get("recheck_fill_price")
+    if t["recheck_status"] == "MISSED" or not price or not 0 < price < 1:
+        return 0.0
+    shares = floor_step(t["stake_usd"] / price, SHARE_STEP)
+    market = MarketInfo(t["condition_id"], category=t.get("category") or "other",
+                        fees_enabled=bool(t.get("market_fees_enabled")), fee_rate=t.get("market_fee_rate") or 0.0)
+    rate, _ = rate_for(market, t.get("signal_ts"))
+    fee = taker_fee([(price, shares)], rate, t.get("market_fee_exponent") or 1.0)
+    return shares * t["payout_per_share"] - (price * shares + fee)
+
+
+@dataclass
+class DelayReport:
+    """The headline's settled signals, as filled and as a real order held for a second."""
+    n: int = 0
+    instant: float = 0.0
+    delayed: float = 0.0
+    diff: float | None = None       # instant minus delayed, dollars per signal
+    lo: float | None = None
+    hi: float | None = None
+    lost: int = 0                   # fills that would have missed
+    gained: int = 0                 # misses that would have filled
+    by_state: dict[str, tuple[int, float, float]] = field(default_factory=dict)   # n, instant, delayed
+
+
+def delay_report(rows: list[dict], samples: int) -> DelayReport:
+    out = DelayReport()
+    pairs = []
+    for t in rows:
+        later = delayed_pnl(t)
+        if later is None or t["status"] not in ("FILLED", "MISSED"):
+            continue
+        now = (t["pnl"] or 0.0) if t["status"] == "FILLED" else 0.0
+        pairs.append((t, now, later))
+        n, a, b = out.by_state.get(game_state(t), (0, 0.0, 0.0))
+        out.by_state[game_state(t)] = (n + 1, a + now, b + later)
+        out.lost += t["status"] == "FILLED" and t["recheck_status"] == "MISSED"
+        out.gained += t["status"] == "MISSED" and t["recheck_status"] == "FILLED"
+    if not pairs:
+        return out
+    out.n = len(pairs)
+    out.instant, out.delayed = sum(a for _, a, _ in pairs), sum(b for _, _, b in pairs)
+    out.diff, out.lo, out.hi = two_way_bootstrap_mean_ci(
+        [a - b for _, a, b in pairs], [t["wallet"] for t, _, _ in pairs], [event_key(t) for t, _, _ in pairs],
+        samples=samples)
+    return out
+
+
+def delay_lines(rows: list[dict], samples: int) -> list[str]:
+    r = delay_report(rows, samples)
+    if not r.n:
+        return []
+    ci = "-" if r.lo is None else f"[{_money(r.lo)}, {_money(r.hi)}]"
+    states = " | ".join(f"{k}: {_money(a)} -> {_money(b)} (n={n})" for k, (n, a, b) in sorted(r.by_state.items()))
+    return [f"  with the exchange's 1-second order hold (sports markets; our fill is instant): the same {r.n} settled "
+            f"signals made {_money(r.instant)} as filled and {_money(r.delayed)} on the book a second later | "
+            f"the hold costs {_money(r.diff)} a signal, 95% CI {ci} | {r.lost} fills lost, {r.gained} misses filled",
+            f"    by game state, as filled -> a second later: {states}"]
+
+
 def markout_wallet_lines(rows: list[dict], cfg, top: int = 10) -> list[str]:
     by: dict[str, list[dict]] = defaultdict(list)
     for t in rows:
@@ -507,8 +588,9 @@ class SettleCheck:
     v2_signals: int = 0          # headline signals on v2 markets
     v2_filled: int = 0
     stuck: list[dict] = field(default_factory=list)    # open fills on a resolved market that does not list the token
-    lost: int = 0                # headline signals missed for lack of market data, last 7 days
-    signals: int = 0             # all headline signals, last 7 days
+    lost: int = 0                # signals dropped for lack of market data, last 7 days (combos apart)
+    combos: int = 0              # ...on combos (several games in one bet): skipped by design
+    signals: int = 0             # every signal that crossed the threshold, last 7 days
 
     @property
     def ok(self) -> bool:
@@ -528,9 +610,19 @@ def settle_check(app: Any, now: int | None = None) -> SettleCheck:
     row = app.db.one(f"SELECT COUNT(*) n, SUM(b.status = 'FILLED') f FROM bot_trades b JOIN poly_markets m "
                      f"ON m.condition_id = b.condition_id WHERE {head} AND m.version = 'v2'", (BOT_HEADLINE,))
     out.v2_signals, out.v2_filled = row["n"], row["f"] or 0
-    row = app.db.one(f"SELECT COUNT(*) n, SUM(b.reason = ?) lost FROM bot_trades b WHERE {head} AND b.signal_ts >= ?",
-                     (NO_MARKET, BOT_HEADLINE, now - LOST_WINDOW))
-    out.signals, out.lost = row["n"], row["lost"] or 0
+    # A signal whose market cannot be found is dropped by the monitor before the bot sees
+    # it (monitor._trigger), so it is counted from the alerts, not from the bot's rows.
+    from .protocol import decode_v2_position_id
+    since = now - LOST_WINDOW
+    out.signals = app.db.one("SELECT COUNT(*) n FROM alerts WHERE detected_at >= ? AND status IN "
+                             "('RECORDED', 'POSTED', 'UNSENT', 'SKIPPED', 'FAILED')", (since,))["n"]
+    for a in app.db.query("SELECT token_id FROM alerts WHERE detected_at >= ? AND status = 'SKIPPED' "
+                          "AND skip_reason = ?", (since, NO_MARKET)):
+        pos = decode_v2_position_id(a["token_id"] or "")
+        if pos is not None and pos.module_id == 3:
+            out.combos += 1
+        else:
+            out.lost += 1
     # The US runner settles from the US venue's own results, not by token: left out.
     open_fills = app.db.query("SELECT b.id, b.runner, b.strategy, b.token_id, b.condition_id FROM bot_trades b "
                               "JOIN poly_markets m ON m.condition_id = b.condition_id WHERE b.status = 'FILLED' "
@@ -552,15 +644,15 @@ def settle_check_lines(app: Any, *, brief: bool = False) -> list[str]:
         return []
     out = [(f"CAN EVERY TRADE SETTLE? (Polymarket's new market format starts 2026-11-23, most sports 2026-12-01) "
             f"new-format markets seen: {c.v2_markets}, headline signals on them: {c.v2_signals} ({c.v2_filled} filled) "
-            f"| open fills that cannot settle: {len(c.stuck)} | signals missed for lack of market data, last 7 days: "
-            f"{c.lost} of {c.signals}")]
+            f"| open fills that cannot settle: {len(c.stuck)} | signals dropped for lack of market data, last 7 days: "
+            f"{c.lost} of {c.signals}" + (f" (and {plural(c.combos, 'combo')}, skipped by design)" if c.combos else ""))]
     if c.stuck:
         sample = ", ".join(f"#{r['id']} {r['runner']}/{r['strategy']} on {r['slug'] or r['condition_id'][:12]}"
                            for r in c.stuck[:3])
         out.append(f"  ! {plural(len(c.stuck), 'open fill')} cannot settle: the market has resolved but does not "
                    f"list the token, so the trade stays open. A bug to fix. First: {sample}")
     if c.lost:
-        out.append(f"  ! {plural(c.lost, 'signal')} missed in the last 7 days because Gamma had no data for the "
+        out.append(f"  ! {plural(c.lost, 'signal')} dropped in the last 7 days because Gamma had no data for the "
                    "market. More than a stray one or two means the market lookup is failing.")
     return out
 
@@ -785,6 +877,7 @@ def _bot_strategy_lines(app: App, runner: str, strategy: str, rows: list[dict], 
                 if group:
                     lines.append(f"  price after our fill, {name} ({len(group)} fills): {markout_text(group, app.cfg)}")
             lines += recheck_lines(rows)
+            lines += delay_lines(rows, samples)
     # Signals we reached too late (a restart, an outage) are already counted as misses
     # above; averaging minutes-old backlog into this line would hide how fast the bot is.
     limit = app.cfg.bot.max_signal_age_seconds

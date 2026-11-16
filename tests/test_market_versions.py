@@ -99,19 +99,28 @@ def test_a_fill_that_cannot_settle_is_shown_not_left_silent(tmp_path):
     db = Database(path)
     fx = Fixture(db, NOW)
     fx.trade(A, 2)                                                      # open
-    fx.trade(A, 3, status="MISSED", reason="market metadata unavailable")
+    # A signal whose market cannot be found is dropped at the alert, before the bot sees it.
+    # One on an ordinary market (a problem) and one on a combo (skipped by design).
+    combo = "1764229107269526617413719898682628492622161691141937249771935148617448292352"
+    for token in ("0xlost-t0", combo):
+        db.execute("INSERT INTO alerts (wallet, condition_id, token_id, kind, first_fill_ts, last_fill_ts, "
+                   "trigger_fill_ts, whale_shares, whale_usd, whale_price, fills, detected_at, status, skip_reason, "
+                   "updated_at) VALUES (?, '0xlost', ?, 'NEW', ?, ?, ?, 1000, 600, 0.5, 1, ?, 'SKIPPED', "
+                   "'market metadata unavailable', ?)", (A, token, NOW - 60, NOW - 60, NOW - 60, NOW - 50, NOW))
     (t,) = db.query("SELECT condition_id FROM bot_trades WHERE status = 'FILLED'")
     db.execute("UPDATE poly_markets SET resolved = 1, payouts = '[1.0, 0.0]', token_ids = '[\"someone-else\"]', "
                "version = 'v2' WHERE condition_id = ?", (t["condition_id"],))
     app = type("A", (), {"db": db, "clock": staticmethod(lambda: NOW), "cfg": Config(database_path=path)})()
     chk = settle_check(app)
-    assert len(chk.stuck) == 1 and (chk.lost, chk.signals) == (1, 2) and not chk.ok
+    assert len(chk.stuck) == 1 and (chk.lost, chk.combos) == (1, 1) and not chk.ok
     text = "\n".join(settle_check_lines(app, brief=True))
     assert "open fills that cannot settle: 1" in text and "1 open fill cannot settle" in text
     db.close()
     html = dash.render(Config(database_path=path), path, "/health", {}, now=NOW)[1]
     assert "Can every trade settle?" in html and "1 open fill cannot settle" in html
-    assert "1 signal missed in the last 7 days because Gamma had no data" in html
+    assert "1 signal dropped in the last 7 days because Gamma had no data" in html
+    assert "Signals on combos (several games in one bet), skipped by design" in html
+    assert "(and 1 combo, skipped by design)" in text
 
 
 def test_a_quiet_check_stays_out_of_the_daily_summary(tmp_path):

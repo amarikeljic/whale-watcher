@@ -1255,6 +1255,18 @@ Nothing in the headline changed because of this: no cut is proof.
 
 ## Known limits
 
+* **The paper fill is one second faster than a real order on sports markets.**
+  Polymarket holds a marketable order before matching it "on configured sports
+  markets around live game conditions", and it cannot be cancelled meanwhile
+  (https://docs.polymarket.com/concepts/order-lifecycle.md). Gamma publishes the
+  window as `secondsDelay`. On 2026-11-16, among the 500 busiest open markets: 1
+  second on all 56 in-play ones and on 64 of 97 pre-game sports markets, none on the
+  other 347. The bot fills on the book it reads at once. Its second read of the book,
+  about a second later, is what a real order would have met, so `stats` and the Edge
+  page ("The order book, a second later") show the same settled signals both ways,
+  with the cost of the hold per signal and its interval. The headline and the
+  decision rule still use the first read: changing that is a new model version.
+
 * Detection is the public trade feed polled once a second: a median of about
   3.5 s behind the whale, never sub-second. A websocket or mempool watcher
   would be faster (docs/v2-research.md); both were left out because the first

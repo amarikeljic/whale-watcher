@@ -147,3 +147,54 @@ def test_the_breakdowns_page_and_the_report_carry_both_cuts(tmp_path):
     html = dash.render(Config(database_path=path), path, "/breakdowns", {"outages": "include"}, now=NOW)[1]
     assert "By game state" in html and "By price move when we arrived" in html
     assert "1 to 2c above" in html, "the fixture's fills sit 2 cents above the whale"
+
+
+# -- the exchange's 1-second order hold on sports markets -----------------------------------------------
+
+
+def hold_row(**kw) -> dict:
+    row = {"status": "FILLED", "recheck_status": "FILLED", "recheck_fill_price": 0.50, "closed_at": 1, "pnl": 12.72,
+           "payout_per_share": 1.0, "stake_usd": 10.0, "condition_id": "0xc", "category": "sports", "wallet": "0xa",
+           "market_fees_enabled": 0, "market_fee_rate": 0.0, "signal_ts": 1000, "game_start_time": 500}
+    row.update(kw)
+    return row
+
+
+def test_a_signal_is_repriced_on_the_second_read_of_the_book():
+    from whalewatcher.stats import delayed_pnl
+    assert delayed_pnl(hold_row()) == pytest.approx(20.0 - 10.0), "$10 at 0.50 buys 20 shares, each pays $1"
+    assert delayed_pnl(hold_row(payout_per_share=0.0)) == pytest.approx(-10.0)
+    assert delayed_pnl(hold_row(recheck_status="MISSED", recheck_fill_price=None)) == 0.0, "the hold lost the fill"
+    assert delayed_pnl(hold_row(recheck_status="ERROR")) is None and delayed_pnl(hold_row(closed_at=None)) is None
+    fee = delayed_pnl(hold_row(market_fees_enabled=1, market_fee_rate=0.05))
+    assert fee == pytest.approx(20.0 - 10.0 - 20 * 0.05 * 0.5 * 0.5), "the buyer's fee at the later price"
+
+
+def test_the_hold_report_compares_the_same_signals_both_ways():
+    from whalewatcher.stats import IN_PLAY, PRE_GAME, delay_lines, delay_report
+    rows = [hold_row(),                                                               # filled both ways
+            hold_row(recheck_status="MISSED", recheck_fill_price=None, wallet="0xb"),   # the hold lost a winner
+            hold_row(status="MISSED", pnl=0.0, signal_ts=100, condition_id="0xd"),      # a miss the hold filled
+            hold_row(closed_at=None)]                                                   # still open: not counted
+    r = delay_report(rows, 200)
+    assert (r.n, r.lost, r.gained) == (3, 1, 1)
+    assert r.instant == pytest.approx(12.72 * 2) and r.delayed == pytest.approx(20.0)
+    assert r.by_state[IN_PLAY][0] == 2 and r.by_state[PRE_GAME] == (1, 0.0, pytest.approx(10.0))
+    text = "\n".join(delay_lines(rows, 200))
+    assert "the same 3 settled signals made +$25.44 as filled and +$20.00 on the book a second later" in text
+    assert "1 fills lost, 1 misses filled" in text
+    assert delay_lines([hold_row(closed_at=None)], 200) == []
+
+
+def test_the_edge_page_shows_the_hold(tmp_path):
+    from whalewatcher.db import Database
+    path = str(tmp_path / "ww.sqlite3")
+    small(path, NOW).db.close()
+    db = Database(path)
+    db.execute("UPDATE bot_trades SET recheck_status = 'FILLED', recheck_fill_price = fill_price + 0.01, "
+               "recheck_at = decided_at + 1.1, recheck_best_ask = best_ask + 0.01 WHERE status = 'FILLED' "
+               "AND runner = 'single' AND strategy = 'flat_hold'")
+    db.close()
+    html = dash.render(Config(database_path=path), path, "/edge", {"outages": "include"}, now=NOW)[1]
+    assert "1-second order hold" in html and "Net P&amp;L on the book a second later" in html
+    assert "What the hold costs, per signal" in html

@@ -443,6 +443,29 @@ Checked on the 6 GB live copy and against live Gamma data.
   256 MB. Fine today. A much larger replay would push it over, and the dashboard
   would restart instead of showing the page.
 
+## Found in the audit of 2026-11-16
+
+* **Sports orders are held for a second, and the paper fill is not.** See README,
+  "Known limits". Measured from data already recorded (the second book read), shown
+  beside the headline. Not yet in the headline: that is the owner's call, because it
+  starts a new model version and the 100-event count again.
+* **The dropped-signal warning could not fire.** A signal whose market cannot be found
+  is dropped at the alert, before the bot records anything, and the warning counted the
+  bot's rows. It now counts alerts, with combos apart, and the Homepage summary flags 3
+  or more in a week.
+* **Checked, nothing found:** the fee formula and per-level rounding against the fee
+  docs, the limit applied per price level, the order book's sort, settlement
+  arithmetic including 50-50 payouts, and the clustered bootstrap behind every interval.
+* **A caution, not a bug:** the decision rule says "after 100 settled events", but the
+  dashboard re-judges it on every load. Watching for the first moment the interval
+  clears zero is more looks than one, and luck passes more often that way. Judge it at
+  100, then not again before 200.
+* **Decided against for now:** resolving new-format markets by position id ahead of
+  2026-11-23. It is more than a lookup: the market would be stored under one name and
+  refreshed and settled under another, and nobody can yet see how the Data API names
+  those trades, prices and resolutions. The scheduled `v2check` run on 2026-11-24 shows
+  the real format, a week before sports move.
+
 ## Parked for later
 
 Ideas the owner chose to keep for later. Nothing here is built.

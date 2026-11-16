@@ -40,7 +40,7 @@ from .horizon import BUCKETS as CLOSE_BUCKETS
 from .horizon import UNKNOWN as NO_END
 from .horizon import bucket as horizon_bucket
 from .stats import (ARRIVAL_ORDER, SIM_PREFIX, SUMMARY_WINDOW, Scope, Scoped, _period, arrival_move, bucket,
-                    cutoff_report, decision_rule, event_key, game_state, in_play, last_review, limit_report,
+                    cutoff_report, decision_rule, delay_report, event_key, game_state, in_play, last_review, limit_report,
                     load_bot_trades, load_trades, markout_columns, markout_groups, markouts, outage_windows,
                     recheck_report, scope_rows, settle_check, sim_strategies, summarise, us_comparison)
 from .stats_util import mean, median, plural
@@ -745,10 +745,25 @@ def recheck_card(rows: list[dict]) -> str:
           ("Misses that would have filled", str(r.gained)),
           ("Extra a share on the second book", f"{v.cents(r.extra)} (n={r.extra_n})"),
           ("Reading market and book took", "-" if r.fetch is None else f"median {r.fetch:.2f}s, p90 {r.fetch_p90:.2f}s")]
+    d = delay_report(rows, SAMPLES)
+    hold = ""
+    if d.n:
+        ci = "-" if d.lo is None else f"95% CI [{v.money(d.lo)}, {v.money(d.hi)}]"
+        rows_ = [("Settled signals with a second read", str(d.n)),
+                 ("Net P&L as filled (instantly)", v.money(d.instant)),
+                 ("Net P&L on the book a second later", v.money(d.delayed)),
+                 ("What the hold costs, per signal", f"{v.money(d.diff)}, {ci}"),
+                 ("Fills lost / misses filled", f"{d.lost} / {d.gained}")]
+        rows_ += [(f"{state.capitalize()}: as filled, then a second later", f"{v.money(a)} then {v.money(b)} (n={n})")
+                  for state, (n, a, b) in sorted(d.by_state.items())]
+        hold = ('<h3 class="sub">With the exchange\'s 1-second order hold</h3><dl class="kv stack">'
+                + "".join(f"<dt>{v.esc(k)}</dt><dd>{v.esc(val)}</dd>" for k, val in rows_) + "</dl>")
     return v.card("The order book, a second later", '<dl class="kv">' + "".join(
-        f"<dt>{v.esc(k)}</dt><dd>{v.esc(val)}</dd>" for k, val in kv) + "</dl>",
-        note="How much the book moves between our read and an order that would have reached the exchange a moment "
-             "later. A measurement only: the decision is always made on the first read.")
+        f"<dt>{v.esc(k)}</dt><dd>{v.esc(val)}</dd>" for k, val in kv) + "</dl>" + hold,
+        note="Polymarket holds a marketable order for a second before matching it on sports markets (every in-play "
+             "one checked, and most pre-game ones). The paper bot fills on the book it reads at once, which a real "
+             "order there cannot. The second read, about a second later, is what a real order would have met. The "
+             "headline still uses the first read.")
 
 
 def memberships(app: Any) -> dict[str, Any]:
@@ -1487,14 +1502,15 @@ def health(c: Ctx) -> str:
                          "not list the token, so the trade stays open and holds a wallet slot. This is a bug to fix.",
                          "bad")
     if chk.lost:
-        body += v.banner(f"{plural(chk.lost, 'signal')} missed in the last 7 days because Gamma had no data for "
+        body += v.banner(f"{plural(chk.lost, 'signal')} dropped in the last 7 days because Gamma had no data for "
                          "the market. More than a stray one or two means the market lookup is failing.", "warn")
     body += v.card("Can every trade settle?", v.table(
         ["Check", "Now"],
         [["Markets in Polymarket's new format (V2) seen", str(chk.v2_markets)],
          ["Headline signals on them", f"{chk.v2_signals} ({chk.v2_filled} filled)"],
          ["Open fills that cannot settle", str(len(chk.stuck))],
-         ["Signals missed for lack of market data, last 7 days", f"{chk.lost} of {chk.signals}"]],
+         ["Signals dropped for lack of market data, last 7 days", f"{chk.lost} of {chk.signals}"],
+         ["Signals on combos (several games in one bet), skipped by design", str(chk.combos)]],
         sortable=False, numeric_from=1),
         note="Polymarket starts a new market format on 2026-11-23, and most sports move to it on 2026-12-01. Its "
              "markets use a new kind of token id. Both failures above would otherwise be silent: a fill whose token "
@@ -1652,7 +1668,7 @@ def api_summary(cfg: Config, db_path: str, *, now: int | None = None) -> dict[st
     carries its n and interval, as everywhere on this dashboard."""
     now = now_ts() if now is None else now
     blank = {"status": "not ready", "runner": "-", "detector": "-", "progress": "-", "verdict": "-",
-             "signals_24h": 0, "filled_24h": 0, "closed_24h": 0, "closed": 0, "pnl": "-", "stuck": 0,
+             "signals_24h": 0, "filled_24h": 0, "closed_24h": 0, "closed": 0, "pnl": "-", "stuck": 0, "dropped_7d": 0,
              "model": "-", "updated": iso(now)}
     try:
         db = Database.readonly(db_path)
@@ -1668,17 +1684,19 @@ def api_summary(cfg: Config, db_path: str, *, now: int | None = None) -> dict[st
         day, ever = _period(head, now - SUMMARY_WINDOW, SAMPLES), _period(head, None, SAMPLES)
         s = ever["s"]
         runner, detector = _age(now, state(c.app, "heartbeat")), _age(now, state(c.app, "detector_heartbeat"))
-        stuck = len(settle_check(c.app, now).stuck)
+        chk = settle_check(c.app, now)
+        stuck = len(chk.stuck)
         verdict = ("not decided" if not rule.enough else "edge" if rule.met else
                    "loses money" if rule.ci_below else "no edge")
         problems = [p for p, bad in (("runner " + runner, runner != "up"), ("detector " + detector, detector != "up"),
-                                     (f"{stuck} stuck", stuck > 0)) if bad]
+                                     (f"{stuck} stuck", stuck > 0),
+                                     (f"{chk.lost} signals dropped: no market data", chk.lost >= 3)) if bad]
         return {"status": ", ".join(problems) or "ok", "runner": runner, "detector": detector,
                 "progress": f"{rule.events} of {rule.need}", "verdict": verdict,
                 "signals_24h": day["filled"] + day["missed"] + day["skipped"], "filled_24h": day["filled"],
                 "closed_24h": day["s"].settled, "closed": s.settled,
                 "pnl": f"{v.money(s.total_pnl)} (n={s.settled}, 95% CI {ci_text(s)})" if s.settled else "-",
-                "stuck": stuck, "model": model_label(MODEL_VERSION), "updated": iso(now)}
+                "stuck": stuck, "dropped_7d": chk.lost, "model": model_label(MODEL_VERSION), "updated": iso(now)}
     finally:
         db.close()
 
