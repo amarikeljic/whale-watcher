@@ -447,3 +447,43 @@ def test_replays_load_only_where_they_are_shown(tmp_path, monkeypatch):
     assert sims == [True] and html.count("0xr") >= 3, "the replay's own view lists its trades"
     for route in ("/wallets", "/breakdowns", "/health", "/us"):
         assert page(route)[1] == [False], route
+
+
+# -- /api/summary: the numbers for a Homepage tile ------------------------------------------------------
+
+
+def test_the_summary_has_short_fields_and_the_money_figure_carries_its_n_and_interval(tmp_path):
+    from whalewatcher.db import Database
+    path = str(tmp_path / "ww.sqlite3")
+    small(path, NOW).db.close()
+    db = Database(path)
+    db.set_state("heartbeat", NOW - 30)
+    db.set_state("detector_heartbeat", NOW - 900)              # 15 minutes ago: down
+    db.close()
+    out = dash.api_summary(Config(database_path=path), path, now=NOW)
+    assert out["runner"] == "up" and out["detector"] == "down 15 min" and out["status"] == "detector down 15 min"
+    # Outage windows left out, as on the dashboard's default view (its Overview says 4 of 100 too).
+    assert out["progress"] == "4 of 100" and out["verdict"] == "not decided" and out["model"] == "model 1"
+    assert out["closed"] == 4 and out["pnl"].startswith("+$12.50 (n=4, 95% CI [")
+    assert all(isinstance(v, (str, int)) for v in out.values()), "a tile shows strings and whole numbers"
+
+
+def test_the_summary_before_the_database_exists_says_not_ready(tmp_path):
+    path = str(tmp_path / "missing.sqlite3")
+    out = dash.api_summary(Config(database_path=path), path, now=NOW)
+    assert out["status"] == "not ready" and out["pnl"] == "-"
+
+
+async def test_the_summary_is_served_as_json_and_only_read(tmp_path):
+    path = str(tmp_path / "ww.sqlite3")
+    small(path, NOW).db.close()
+    client = TestClient(TestServer(dash.make_app(Config(database_path=path), path)))
+    await client.start_server()
+    try:
+        resp = await client.get("/api/summary")
+        assert resp.status == 200 and resp.content_type == "application/json"
+        assert resp.headers["Cache-Control"] == "no-store"
+        assert set(await resp.json()) >= {"status", "runner", "detector", "progress", "verdict", "signals_24h", "pnl"}
+        assert (await client.post("/api/summary")).status == 405, "GET only"
+    finally:
+        await client.close()

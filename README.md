@@ -69,6 +69,59 @@ docker compose exec whale-watcher python -m whalewatcher backtest --dataset data
 `stats` (the full report) takes about a minute on a database this size, mostly for
 the breakdowns of the simulated replays. `stats --brief` is instant.
 
+## A tile on Homepage
+
+`GET /api/summary` on the dashboard returns a few figures as JSON for a dashboard
+tile such as [Homepage](https://gethomepage.dev)'s `customapi` widget: `status`
+("ok", or what is wrong), `runner` and `detector` ("up" or "down 12 min"),
+`progress` toward the decision rule ("23 of 100"), `verdict` ("not decided",
+"edge", "no edge", "loses money"), `signals_24h`, `filled_24h`, `closed_24h`,
+`closed`, `pnl` (always with its n and interval), `stuck`, `model` and `updated`.
+It is read-only, like every page, and counts what the dashboard's default view
+counts (the current model, outage windows left out).
+
+Homepage reaches it over Docker's own network on this machine: this project's
+network is named `whale-watcher`, so add it to Homepage's container (nothing is
+published). In Homepage's `docker-compose.yml`:
+
+```yaml
+services:
+  homepage:
+    # ...what is there now...
+    networks: [default, whale-watcher]
+networks:
+  whale-watcher:
+    external: true
+```
+
+In Homepage's `services.yaml` (keep your own group, `server` and icon):
+
+```yaml
+- Whale watcher:
+    icon: mdi-fish
+    href: http://homeserver:8787
+    description: Paper-trading copy bot (no real money)
+    server: my-docker            # the name of your Docker server in Homepage's docker.yaml
+    container: whale-watcher
+    widget:
+      type: customapi
+      url: http://whale-watcher-dashboard:8787/api/summary
+      refreshInterval: 60000
+      mappings:
+        - field: status
+          label: Status
+        - field: progress
+          label: Decision rule
+        - field: signals_24h
+          label: Signals 24h
+          format: number
+        - field: verdict
+          label: Verdict
+```
+
+If Homepage runs with `network_mode: host`, skip the network part and use
+`url: http://127.0.0.1:8787/api/summary`.
+
 ## Commands
 
 ```bash

@@ -29,6 +29,13 @@ x-common: &common
       max-size: "10m"
       max-file: "3"
 
+# A fixed name for this project's network, so another container on this machine (such as
+# Homepage, for its tile) can join it and read http://whale-watcher-dashboard:8787/api/summary.
+# Joining publishes nothing: the network is local to Docker on this machine.
+networks:
+  default:
+    name: whale-watcher
+
 services:
   whale-watcher:
     <<: *common

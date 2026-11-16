@@ -1634,6 +1634,55 @@ def render(cfg: Config, db_path: str, path: str, query: Any, *, now: int | None 
         db.close()
 
 
+# -- /api/summary: the numbers for a Homepage tile (https://gethomepage.dev) ----------------------------
+
+BEAT_LIMIT = 300        # a heartbeat older than this: the process is down (as on the Health page)
+
+
+def _age(now: int, ts: Any) -> str:
+    if ts is None:
+        return "never"
+    d = max(0, now - int(ts))
+    return "up" if d <= BEAT_LIMIT else f"down {d // 60} min" if d < 7200 else f"down {d // 3600} h"
+
+
+def api_summary(cfg: Config, db_path: str, *, now: int | None = None) -> dict[str, Any]:
+    """A few figures for a dashboard tile such as Homepage's customapi widget. Read-only,
+    like every page. Every field is a short string or a whole number. The one money figure
+    carries its n and interval, as everywhere on this dashboard."""
+    now = now_ts() if now is None else now
+    blank = {"status": "not ready", "runner": "-", "detector": "-", "progress": "-", "verdict": "-",
+             "signals_24h": 0, "filled_24h": 0, "closed_24h": 0, "closed": 0, "pnl": "-", "stuck": 0,
+             "model": "-", "updated": iso(now)}
+    try:
+        db = Database.readonly(db_path)
+    except Exception:  # noqa: BLE001 - no file yet
+        return blank
+    try:
+        if db.schema_version < SCHEMA_VERSION:
+            return dict(blank, status="upgrading")
+        c = build_ctx(cfg, db, {}, "/api/summary", now)
+        head = [r for r in c.records if r.get("key") == BASE_KEY]
+        rule = decision_rule(summarise("decision", [r for r in head if r["status"] != "SKIPPED"], samples=SAMPLES),
+                             cfg)
+        day, ever = _period(head, now - SUMMARY_WINDOW, SAMPLES), _period(head, None, SAMPLES)
+        s = ever["s"]
+        runner, detector = _age(now, state(c.app, "heartbeat")), _age(now, state(c.app, "detector_heartbeat"))
+        stuck = len(settle_check(c.app, now).stuck)
+        verdict = ("not decided" if not rule.enough else "edge" if rule.met else
+                   "loses money" if rule.ci_below else "no edge")
+        problems = [p for p, bad in (("runner " + runner, runner != "up"), ("detector " + detector, detector != "up"),
+                                     (f"{stuck} stuck", stuck > 0)) if bad]
+        return {"status": ", ".join(problems) or "ok", "runner": runner, "detector": detector,
+                "progress": f"{rule.events} of {rule.need}", "verdict": verdict,
+                "signals_24h": day["filled"] + day["missed"] + day["skipped"], "filled_24h": day["filled"],
+                "closed_24h": day["s"].settled, "closed": s.settled,
+                "pnl": f"{v.money(s.total_pnl)} (n={s.settled}, 95% CI {ci_text(s)})" if s.settled else "-",
+                "stuck": stuck, "model": model_label(MODEL_VERSION), "updated": iso(now)}
+    finally:
+        db.close()
+
+
 SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; "
                                "form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
@@ -1722,11 +1771,15 @@ def make_app(cfg: Config, db_path: str) -> web.Application:
     async def healthz(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
+    async def summary(_request: web.Request) -> web.Response:
+        return web.json_response(api_summary(cfg, db_path), headers=SECURITY_HEADERS)
+
     app = web.Application(client_max_size=4096)     # the one form is a few bytes
     app.router.add_post("/settings/wallet-amount", save_amount)   # the only route that is not a GET
     app.router.add_get("/assets/app.css", css)
     app.router.add_get("/assets/app.js", js)
     app.router.add_get("/healthz", healthz)
+    app.router.add_get("/api/summary", summary)     # the numbers for a Homepage tile, read-only
     for route in ("/", "/edge", "/wallets", "/trades", "/trades.csv", "/breakdowns", "/health", "/bankroll", "/us",
                   "/wallet/{address}"):
         app.router.add_get(route, handle)       # GET only: none of these can change anything
