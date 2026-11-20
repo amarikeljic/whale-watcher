@@ -47,6 +47,21 @@ multi-platform index the Docker registry served for the tag on 2026-11-14 (last
 updated 2026-11-08), so Docker picks the right image for the server's processor. A
 rebuild uses exactly this base until the digest is changed on purpose.
 
+Two things on top of it (2026-11-20, after the weekly Trivy scan reported 49 high
+issues in the image, 2 of them with a fix available):
+
+* `apt-get upgrade` at build time installs Debian's security fixes released since the
+  base was built. Checked that day: the pinned digest was still the newest
+  `python:3.12-slim` (pushed 2026-11-08), and every Python package above was at its
+  newest version on PyPI, so the fixable issues could only be operating-system packages
+  or the bundled `pip`. Docker caches this layer: `docker compose build --no-cache` to
+  pick up later fixes. Two builds a week apart can differ in Debian patch level only.
+* `pip` is removed after installing the requirements. Nothing uses it at run time.
+
+The remaining issues have no fix published anywhere yet. They sit in Debian's base
+packages, and they shrink only as Debian ships fixes or with a different, smaller base
+image.
+
 ## Rules
 
 * A version changes only on purpose, with the tests run on the new pins.

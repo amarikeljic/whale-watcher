@@ -5,9 +5,20 @@ FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb
 
 WORKDIR /app
 
-# Requirements first, so a code change does not reinstall the dependency layer.
+# Debian's security fixes released since the base image was built. The weekly scan
+# counts them as "fixable": a patched package exists, but the pinned base predates it.
+# The base stays pinned. This layer is what moves, and Docker keeps it cached, so it only
+# picks up newer fixes on `docker compose build --no-cache`.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+# Requirements first, so a code change does not reinstall the dependency layer. Then pip
+# itself goes: nothing runs it after the build, and a tool that is not there cannot carry
+# a vulnerability into the running image.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip uninstall -y pip
 
 COPY whalewatcher ./whalewatcher
 COPY config.yaml ./config.yaml
